@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote
+
+import orjson
+import pandas as pd
+import requests
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
+
+from capital_auth import CapitalAuthenticator
+from config import (
+    BridgeSettings,
+    RateLimiter,
+    assert_data_only_path,
+    safe_epic_for_filename,
+    validate_price_side,
+    validate_resolution,
+)
+from kronos_mapper import capital_prices_to_kronos_df, save_kronos_csv
+
+LOGGER = logging.getLogger(__name__)
+
+
+class CapitalApiError(RuntimeError):
+    """Raised for non-recoverable Capital.com API failures."""
+
+
+class TransientCapitalApiError(CapitalApiError):
+    """Raised for retryable Capital.com API failures."""
+
+
+def _json_default(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    raise TypeError
+
+
+def save_json(data: Any, path: str | Path) -> Path:
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(orjson.dumps(data, option=orjson.OPT_INDENT_2, default=_json_default))
+    return target
+
+
+class CapitalRestClient:
+    def __init__(
+        self,
+        settings: BridgeSettings,
+        authenticator: CapitalAuthenticator | None = None,
+        http: requests.Session | None = None,
+    ) -> None:
+        self.settings = settings
+        self.http = http or requests.Session()
+        self.authenticator = authenticator or CapitalAuthenticator(settings, self.http)
+        self._rate_limiter = RateLimiter(0.11)
+
+    def authenticate(self) -> None:
+        self.authenticator.authenticate()
+
+    @retry(
+        retry=retry_if_exception_type(TransientCapitalApiError),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=8),
+        stop=stop_after_attempt(4),
+        reraise=True,
+    )
+    def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
+        assert_data_only_path(path)
+        url = f"{self.settings.base_url}{path}"
+        self._rate_limiter.wait()
+        response = self.http.request(
+            method=method,
+            url=url,
+            params=params,
+            headers=self.authenticator.auth_headers(),
+            timeout=30,
+        )
+        if response.status_code in {401, 403}:
+            LOGGER.warning("Authenticated request returned HTTP %s; refreshing session once", response.status_code)
+            self.authenticator.refresh()
+            self._rate_limiter.wait()
+            response = self.http.request(
+                method=method,
+                url=url,
+                params=params,
+                headers=self.authenticator.auth_headers(),
+                timeout=30,
+            )
+        if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+            raise TransientCapitalApiError(f"Transient Capital.com HTTP {response.status_code}: {response.text}")
+        if response.status_code >= 400:
+            raise CapitalApiError(f"Capital.com HTTP {response.status_code} for {path}: {response.text}")
+        if not response.content:
+            return {}
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise CapitalApiError(f"Capital.com returned non-JSON response for {path}") from exc
+
+    def ping(self) -> Any:
+        return self._request("GET", "/ping")
+
+    def search_markets(self, search_term: str) -> dict[str, Any]:
+        return self._request("GET", "/markets", params={"searchTerm": search_term})
+
+    def get_market_details(self, epic: str) -> dict[str, Any]:
+        return self._request("GET", f"/markets/{quote(epic, safe='')}")
+
+    def save_market_details(self, epic: str) -> Path:
+        details = self.get_market_details(epic)
+        path = self.settings.output_dir / f"market_details_{safe_epic_for_filename(epic)}.json"
+        return save_json(details, path)
+
+    def resolve_market(self, market: str | None = None, explicit_epic: str | None = None, streaming: bool = False) -> dict[str, Any]:
+        if explicit_epic:
+            details = self.get_market_details(explicit_epic)
+            instrument = details.get("instrument", {})
+            LOGGER.info("Selected explicit epic %s (%s)", explicit_epic, instrument.get("name", "unknown instrument"))
+            return {"epic": explicit_epic, "instrumentName": instrument.get("name", ""), "details": details}
+
+        if self.settings.default_epic:
+            details = self.get_market_details(self.settings.default_epic)
+            instrument = details.get("instrument", {})
+            LOGGER.info(
+                "Selected CAPITAL_DEFAULT_EPIC %s (%s)",
+                self.settings.default_epic,
+                instrument.get("name", "unknown instrument"),
+            )
+            return {"epic": self.settings.default_epic, "instrumentName": instrument.get("name", ""), "details": details}
+
+        requested = market or self.settings.default_market_search
+        search_terms = []
+        for term in (requested, "ETHUSD", "ETH/USD", "Ethereum", "ETH"):
+            if term and term not in search_terms:
+                search_terms.append(term)
+
+        candidates: list[dict[str, Any]] = []
+        for term in search_terms:
+            result = self.search_markets(term)
+            markets = result.get("markets") or result.get("marketDetails") or []
+            if isinstance(markets, list):
+                candidates.extend(markets)
+            if candidates:
+                break
+
+        if not candidates:
+            raise CapitalApiError(f"No Capital.com markets found for {requested!r}")
+
+        selected = self._select_best_market(candidates, streaming=streaming)
+        epic = selected.get("epic")
+        if not epic:
+            raise CapitalApiError("Selected market did not include an epic")
+        name = selected.get("instrumentName") or selected.get("name") or selected.get("instrument", {}).get("name", "")
+        LOGGER.info("Selected epic %s (%s)", epic, name)
+        return {"epic": epic, "instrumentName": name, "searchResult": selected}
+
+    @staticmethod
+    def _select_best_market(candidates: list[dict[str, Any]], streaming: bool) -> dict[str, Any]:
+        keywords = ("eth/usd", "ethusd", "ethereum", "ether", "eth")
+
+        def score(market: dict[str, Any]) -> tuple[int, int, int, str]:
+            epic = str(market.get("epic", "")).lower()
+            name = str(market.get("instrumentName") or market.get("name") or "").lower()
+            status = str(market.get("marketStatus", "")).upper()
+            stream_ok = bool(market.get("streamingPricesAvailable"))
+            text = f"{epic} {name}"
+            match_score = max((20 if kw in text else 0 for kw in keywords), default=0)
+            stream_score = 10 if (not streaming or stream_ok) else 0
+            status_score = 5 if status == "TRADEABLE" else (2 if status != "CLOSED" else 0)
+            return (match_score, stream_score, status_score, epic)
+
+        sorted_candidates = sorted(candidates, key=score, reverse=True)
+        selected = sorted_candidates[0]
+        if streaming and not selected.get("streamingPricesAvailable"):
+            LOGGER.warning("Best matching market does not advertise streamingPricesAvailable=true")
+        return selected
+
+    def get_historical_prices(
+        self,
+        epic: str,
+        resolution: str,
+        max_points: int | None = 512,
+        from_utc: str | None = None,
+        to_utc: str | None = None,
+        price_side: str | None = None,
+        save_outputs: bool = True,
+        min_rows: int = 50,
+    ) -> pd.DataFrame:
+        resolution = validate_resolution(resolution)
+        side = validate_price_side(price_side or self.settings.default_price_side)
+        params: dict[str, Any] = {"resolution": resolution}
+        if max_points is not None:
+            if max_points <= 0 or max_points > 1000:
+                raise CapitalApiError("max_points must be between 1 and 1000")
+            params["max"] = max_points
+        if from_utc:
+            params["from"] = from_utc
+        if to_utc:
+            params["to"] = to_utc
+        raw = self._request("GET", f"/prices/{quote(epic, safe='')}", params=params)
+        if save_outputs:
+            save_json(raw, self.settings.output_dir / f"capital_raw_prices_{safe_epic_for_filename(epic)}_{resolution}.json")
+        df = capital_prices_to_kronos_df(raw, side, min_rows=min_rows)
+        if save_outputs:
+            save_kronos_csv(
+                df,
+                self.settings.output_dir / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}.csv",
+                min_rows=min_rows,
+            )
+        return df
+
+    def get_client_sentiment(self, epic_or_market_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/clientsentiment/{quote(epic_or_market_id, safe='')}")
+
+    def get_client_sentiment_batch(self, market_ids: list[str]) -> dict[str, Any]:
+        if not market_ids:
+            raise CapitalApiError("market_ids cannot be empty")
+        return self._request("GET", "/clientsentiment", params={"marketIds": ",".join(market_ids)})
+
+    def save_client_sentiment(self, epic_or_market_id: str) -> Path:
+        try:
+            sentiment = self.get_client_sentiment(epic_or_market_id)
+        except CapitalApiError:
+            sentiment = self.get_client_sentiment_batch([epic_or_market_id])
+        path = self.settings.output_dir / f"client_sentiment_{safe_epic_for_filename(epic_or_market_id)}.json"
+        return save_json(sentiment, path)

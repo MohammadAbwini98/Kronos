@@ -1,0 +1,22 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: capital-kronos-postgres
+    environment:
+      POSTGRES_DB: capital_kronos
+      POSTGRES_USER: capital_kronos
+      POSTGRES_PASSWORD: capital_kronos
+      TZ: UTC
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U capital_kronos -d capital_kronos"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
