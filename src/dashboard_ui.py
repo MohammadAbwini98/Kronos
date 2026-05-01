@@ -7,209 +7,191 @@ def dashboard_html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Capital Kronos Signal Console</title>
+  <title>Kronos Signal Dashboard</title>
   <style>
+    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap');
+
     :root {
-      color-scheme: dark;
-      --bg: #0b0f1a;
-      --surface: #121826;
-      --surface-2: #172033;
-      --surface-3: #1d273b;
-      --line: rgba(148, 163, 184, .18);
-      --text: #eef2ff;
-      --muted: #9aa8bd;
-      --soft: #cbd5e1;
-      --blue: #62a8ff;
-      --cyan: #27d3d8;
-      --green: #3ddc97;
-      --amber: #f5b84b;
-      --red: #ff6b6b;
-      --violet: #9b87ff;
-      --shadow: 0 22px 60px rgba(0, 0, 0, .38);
-      --radius: 8px;
+      --bg: #071018;
+      --bg-2: #0c1a25;
+      --panel: rgba(14, 26, 38, 0.86);
+      --panel-2: rgba(19, 33, 46, 0.9);
+      --line: rgba(126, 167, 199, 0.2);
+      --text: #eaf4ff;
+      --muted: #90a9bc;
+      --teal: #3fd5c5;
+      --blue: #57a4ff;
+      --amber: #f6b35b;
+      --green: #4ee38d;
+      --red: #ff7070;
+      --radius: 14px;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.35);
     }
 
     * { box-sizing: border-box; }
-    html { scroll-behavior: smooth; }
+    html, body { margin: 0; padding: 0; }
     body {
-      margin: 0;
       min-height: 100vh;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-      background:
-        radial-gradient(circle at 20% 0%, rgba(39, 211, 216, .18), transparent 28rem),
-        radial-gradient(circle at 80% 8%, rgba(155, 135, 255, .16), transparent 30rem),
-        linear-gradient(135deg, #08111e 0%, var(--bg) 45%, #11151f 100%);
+      font-family: "Space Grotesk", "IBM Plex Sans", "Segoe UI", sans-serif;
       color: var(--text);
-      letter-spacing: 0;
+      background:
+        radial-gradient(1200px 600px at 8% -10%, rgba(63, 213, 197, 0.2), transparent 60%),
+        radial-gradient(1100px 560px at 90% -15%, rgba(87, 164, 255, 0.2), transparent 60%),
+        linear-gradient(135deg, #050d14 0%, #08121c 30%, #0a1823 100%);
+      letter-spacing: 0.01em;
     }
 
-    a { color: var(--cyan); text-decoration: none; }
-    a:hover { text-decoration: underline; }
-
-    .app-shell {
-      display: grid;
-      grid-template-columns: 280px minmax(0, 1fr);
-      min-height: 100vh;
+    .ambient {
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      background-image: linear-gradient(rgba(126, 167, 199, 0.045) 1px, transparent 1px), linear-gradient(90deg, rgba(126, 167, 199, 0.045) 1px, transparent 1px);
+      background-size: 24px 24px;
+      mask-image: radial-gradient(circle at 50% 10%, rgba(0, 0, 0, 1), rgba(0, 0, 0, 0.2));
+      z-index: 0;
     }
 
-    .sidebar {
-      position: sticky;
-      top: 0;
-      height: 100vh;
+    .shell {
+      position: relative;
+      z-index: 1;
+      max-width: 1560px;
+      margin: 0 auto;
       padding: 22px;
-      border-right: 1px solid var(--line);
-      background: rgba(10, 15, 27, .82);
-      backdrop-filter: blur(16px);
-      overflow-y: auto;
-    }
-
-    .brand {
-      display: flex;
-      align-items: center;
-      gap: 12px;
-      margin-bottom: 22px;
-    }
-
-    .brand-mark {
-      width: 42px;
-      height: 42px;
-      border-radius: 8px;
-      background: linear-gradient(135deg, var(--cyan), var(--violet));
       display: grid;
-      place-items: center;
-      color: #07111f;
-      font-weight: 900;
-      box-shadow: 0 14px 34px rgba(39, 211, 216, .24);
+      gap: 16px;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      background: linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.015));
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(8px);
+      animation: rise 320ms ease both;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .topbar {
+      padding: 16px 18px;
+      display: grid;
+      grid-template-columns: minmax(280px, 1.1fr) minmax(0, 0.9fr);
+      gap: 14px;
+      align-items: stretch;
     }
 
     .brand h1 {
       margin: 0;
-      font-size: 16px;
-      line-height: 1.15;
+      font-size: clamp(24px, 3vw, 38px);
+      line-height: 1.1;
+      font-weight: 700;
     }
 
-    .brand p {
-      margin: 4px 0 0;
-      color: var(--muted);
-      font-size: 12px;
-    }
-
-    .side-card {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(255,255,255,.045);
-      padding: 14px;
-      margin-bottom: 14px;
-    }
-
-    .side-label { color: var(--muted); font-size: 12px; margin-bottom: 7px; }
-    .side-value { font-size: 15px; font-weight: 750; overflow-wrap: anywhere; }
-    .side-note { color: var(--muted); font-size: 12px; line-height: 1.5; margin-top: 10px; }
-
-    .content {
-      min-width: 0;
-      padding: 24px;
-    }
-
-    .hero {
-      display: grid;
-      grid-template-columns: minmax(0, 1.2fr) minmax(320px, .8fr);
-      gap: 18px;
-      align-items: stretch;
-      margin-bottom: 18px;
-    }
-
-    .hero-main, .control-panel, .panel {
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: linear-gradient(180deg, rgba(255,255,255,.065), rgba(255,255,255,.035));
-      box-shadow: var(--shadow);
-    }
-
-    .hero-main {
-      padding: 26px;
-      min-height: 216px;
-      display: flex;
-      flex-direction: column;
-      justify-content: space-between;
-      overflow: hidden;
-      position: relative;
-    }
-
-    .hero-main::after {
-      content: "";
-      position: absolute;
-      inset: auto -20% -45% 24%;
-      height: 220px;
-      background: linear-gradient(90deg, transparent, rgba(39,211,216,.18), rgba(155,135,255,.14), transparent);
-      transform: skewY(-7deg);
-      pointer-events: none;
-    }
-
-    .eyebrow {
-      color: var(--cyan);
-      font-size: 12px;
-      font-weight: 800;
-      text-transform: uppercase;
-      letter-spacing: .12em;
-      margin-bottom: 10px;
-    }
-
-    .hero-title {
-      margin: 0;
-      font-size: clamp(28px, 4vw, 52px);
-      line-height: 1;
-      max-width: 760px;
-    }
-
-    .hero-copy {
-      margin: 14px 0 0;
-      color: var(--soft);
-      line-height: 1.55;
-      max-width: 760px;
-    }
-
-    .hero-meta {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 18px;
-    }
-
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      gap: 7px;
-      min-height: 28px;
-      border-radius: 999px;
-      padding: 6px 10px;
-      border: 1px solid var(--line);
-      background: rgba(255,255,255,.055);
-      color: var(--soft);
-      font-size: 12px;
-      font-weight: 750;
+    .title-price {
+      margin-left: 10px;
+      font-size: clamp(14px, 1.4vw, 22px);
+      color: #95f2e4;
+      font-weight: 700;
       white-space: nowrap;
     }
 
-    .badge.good { color: #aff7d3; border-color: rgba(61,220,151,.32); background: rgba(61,220,151,.10); }
-    .badge.warn { color: #ffe0a2; border-color: rgba(245,184,75,.34); background: rgba(245,184,75,.10); }
-    .badge.bad { color: #ffc0c0; border-color: rgba(255,107,107,.34); background: rgba(255,107,107,.10); }
-    .badge.info { color: #cbdfff; border-color: rgba(98,168,255,.34); background: rgba(98,168,255,.10); }
+    .brand p {
+      margin: 10px 0 0;
+      color: var(--muted);
+      max-width: 760px;
+      font-size: 14px;
+      line-height: 1.5;
+    }
 
-    .control-panel { padding: 18px; }
-    .control-title { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
-    .control-title h2 { margin: 0; font-size: 16px; }
-
-    .control-grid {
+    .meta-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
+      height: 100%;
     }
 
-    label.field {
+    .meta-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel-2);
+      padding: 12px;
+      min-height: 72px;
       display: flex;
       flex-direction: column;
-      gap: 7px;
+      justify-content: center;
+      gap: 6px;
+    }
+
+    .meta-label {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      font-weight: 700;
+    }
+
+    .meta-value {
+      font-size: 14px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .status-strip {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255,255,255,0.05);
+      padding: 6px 10px;
+      min-height: 30px;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .chip.good { color: #b9f8d8; border-color: rgba(78,227,141,0.35); background: rgba(78,227,141,0.13); }
+    .chip.warn { color: #ffe5ba; border-color: rgba(246,179,91,0.35); background: rgba(246,179,91,0.13); }
+    .chip.bad { color: #ffc5c5; border-color: rgba(255,112,112,0.35); background: rgba(255,112,112,0.13); }
+    .chip.info { color: #d4e8ff; border-color: rgba(87,164,255,0.35); background: rgba(87,164,255,0.13); }
+
+    .control-board {
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .control-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .control-head h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
       color: var(--muted);
       font-size: 12px;
       font-weight: 700;
@@ -218,419 +200,825 @@ def dashboard_html() -> str:
     input, select {
       width: 100%;
       min-height: 40px;
-      border: 1px solid rgba(148, 163, 184, .25);
-      border-radius: 8px;
-      background: rgba(8, 13, 24, .72);
+      border: 1px solid rgba(126, 167, 199, 0.3);
+      border-radius: 10px;
+      background: rgba(8, 15, 22, 0.92);
       color: var(--text);
-      padding: 9px 11px;
+      padding: 8px 10px;
       outline: none;
-      transition: border-color .16s ease, box-shadow .16s ease, background .16s ease;
+      font: inherit;
+      transition: border-color 140ms ease, box-shadow 140ms ease;
     }
 
     input:focus, select:focus {
-      border-color: rgba(39, 211, 216, .78);
-      box-shadow: 0 0 0 3px rgba(39,211,216,.16);
+      border-color: rgba(63, 213, 197, 0.8);
+      box-shadow: 0 0 0 3px rgba(63, 213, 197, 0.16);
     }
 
     .toggle-row {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
       gap: 10px;
-      margin-top: 10px;
     }
 
-    .toggle {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 10px;
-      min-height: 42px;
+    .toggle-card {
       border: 1px solid var(--line);
-      border-radius: 8px;
-      background: rgba(255,255,255,.04);
-      padding: 9px 11px;
-      color: var(--soft);
-      font-size: 12px;
-      font-weight: 750;
+      border-radius: 10px;
+      background: var(--panel);
+      min-height: 44px;
+      padding: 8px 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
     }
 
-    .toggle input { width: 18px; min-height: 18px; accent-color: var(--cyan); }
+    .toggle-card input { width: 18px; min-height: 18px; accent-color: var(--teal); }
 
     .actions {
       display: grid;
-      grid-template-columns: repeat(2, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 10px;
-      margin-top: 14px;
     }
 
     button {
+      border: 1px solid rgba(126, 167, 199, 0.3);
+      border-radius: 10px;
       min-height: 42px;
-      border: 1px solid transparent;
-      border-radius: 8px;
-      padding: 10px 13px;
+      padding: 9px 12px;
       color: var(--text);
-      background: rgba(255,255,255,.08);
-      font-weight: 800;
+      background: rgba(255,255,255,0.07);
+      font: inherit;
+      font-weight: 700;
       cursor: pointer;
-      transition: transform .16s ease, border-color .16s ease, background .16s ease, box-shadow .16s ease;
+      transition: transform 120ms ease, border-color 120ms ease, background 120ms ease;
     }
 
-    button:hover { transform: translateY(-1px); border-color: rgba(255,255,255,.22); }
-    button:focus-visible { outline: 3px solid rgba(39,211,216,.35); outline-offset: 2px; }
-    button:disabled { opacity: .58; cursor: wait; transform: none; }
-    button.primary { background: linear-gradient(135deg, #2077ff, #27d3d8); color: #04111d; box-shadow: 0 14px 30px rgba(32,119,255,.25); }
-    button.secondary { background: rgba(98,168,255,.12); border-color: rgba(98,168,255,.24); }
-    button.warn { background: rgba(245,184,75,.14); border-color: rgba(245,184,75,.30); color: #ffe8b7; }
+    button:hover { transform: translateY(-1px); border-color: rgba(255,255,255,0.34); }
+    button:disabled { opacity: 0.6; cursor: wait; transform: none; }
 
-    .stats-grid {
+    .btn-primary {
+      background: linear-gradient(135deg, #2f85ff, #3fd5c5);
+      color: #031018;
+      border-color: rgba(63, 213, 197, 0.6);
+    }
+
+    .btn-alt { background: rgba(87,164,255,0.14); }
+    .btn-warn { background: rgba(246,179,91,0.18); color: #ffe7bf; }
+
+    .kpi-grid {
       display: grid;
-      grid-template-columns: repeat(6, minmax(150px, 1fr));
-      gap: 12px;
-      margin: 18px 0;
+      grid-template-columns: repeat(6, minmax(0, 1fr));
+      gap: 10px;
     }
 
-    .stat-card {
-      position: relative;
-      min-height: 112px;
+    .kpi {
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      padding: 15px;
-      background: rgba(255,255,255,.055);
+      border-radius: 12px;
+      background: var(--panel);
+      min-height: 108px;
+      padding: 12px;
+      position: relative;
       overflow: hidden;
     }
 
-    .stat-card::before {
+    .kpi::before {
       content: "";
       position: absolute;
-      left: 0;
-      top: 0;
+      inset: 0 auto auto 0;
       width: 100%;
       height: 3px;
-      background: linear-gradient(90deg, var(--cyan), var(--blue), var(--violet));
-      opacity: .86;
+      background: linear-gradient(90deg, var(--teal), var(--blue));
     }
 
-    .stat-label {
-      color: var(--muted);
+    .kpi-label {
       font-size: 11px;
       text-transform: uppercase;
-      letter-spacing: .08em;
-      font-weight: 850;
-      margin-bottom: 10px;
+      color: var(--muted);
+      letter-spacing: 0.08em;
+      font-weight: 700;
+      margin-bottom: 8px;
     }
 
-    .stat-value {
-      font-size: clamp(18px, 2vw, 28px);
-      font-weight: 900;
-      line-height: 1.05;
+    .kpi-value {
+      font-size: clamp(18px, 2vw, 26px);
+      font-weight: 700;
+      line-height: 1.15;
       overflow-wrap: anywhere;
     }
 
-    .stat-sub {
-      margin-top: 9px;
+    .kpi-sub {
+      margin-top: 7px;
       color: var(--muted);
       font-size: 12px;
       line-height: 1.35;
     }
 
-    .tabs {
-      display: flex;
+    .model-status-panel {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .model-status-grid {
+      display: grid;
+      grid-template-columns: minmax(260px, 0.8fr) minmax(0, 1.2fr);
+      gap: 14px;
+      align-items: center;
+    }
+
+    .model-version-title {
+      font-size: 24px;
+      line-height: 1.15;
+      font-weight: 700;
+      overflow-wrap: anywhere;
+    }
+
+    .model-progress-area {
+      display: grid;
       gap: 8px;
-      overflow-x: auto;
-      padding: 7px;
+    }
+
+    .progress-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .progress-track {
+      height: 12px;
+      border-radius: 8px;
+      border: 1px solid rgba(126, 167, 199, 0.28);
+      background: rgba(7, 16, 24, 0.9);
+      overflow: hidden;
+    }
+
+    .progress-fill {
+      height: 100%;
+      border-radius: 8px;
+      background: linear-gradient(90deg, var(--teal), var(--green));
+      transition: width 220ms ease;
+    }
+
+    .model-progress-sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .model-metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 8px;
+    }
+
+    .model-stat {
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(255,255,255,.045);
-      margin-bottom: 14px;
+      border-radius: 10px;
+      background: var(--panel);
+      min-height: 62px;
+      padding: 9px 10px;
+      display: grid;
+      align-content: center;
+      gap: 4px;
     }
 
-    .tab {
-      flex: 0 0 auto;
-      min-height: 38px;
-      color: var(--soft);
-      background: transparent;
-      border-color: transparent;
+    .model-stat-label {
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      font-weight: 700;
     }
 
-    .tab.active {
-      color: #06111e;
-      background: linear-gradient(135deg, var(--cyan), var(--blue));
-      box-shadow: 0 10px 24px rgba(39,211,216,.22);
+    .model-stat-value {
+      font-size: 13px;
+      font-weight: 700;
+      overflow-wrap: anywhere;
     }
 
-    .panel {
-      padding: 18px;
-      margin-bottom: 16px;
+    .chart-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
     }
 
-    .panel-header {
+    .chart-panel {
+      padding: 14px;
+    }
+
+    .panel-head {
       display: flex;
       justify-content: space-between;
       align-items: flex-start;
-      gap: 14px;
-      margin-bottom: 14px;
+      gap: 10px;
+      margin-bottom: 10px;
     }
 
-    .panel h2 { margin: 0; font-size: 18px; }
-    .panel p { color: var(--soft); line-height: 1.55; }
-    .hidden { display: none !important; }
-    .muted { color: var(--muted); }
+    .panel-head h3, .panel-head h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+
+    .panel-head p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }
 
     .chart-wrap {
-      position: relative;
-      min-height: 420px;
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: #0d1422;
+      border-radius: 12px;
+      background: #07121b;
+      min-height: 360px;
       overflow: hidden;
     }
 
     canvas {
-      display: block;
       width: 100%;
-      height: 420px;
+      height: 360px;
+      display: block;
     }
+
+    .tabs {
+      display: grid;
+      grid-template-columns: repeat(8, minmax(0, 1fr));
+      gap: 8px;
+      padding: 8px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+    }
+
+    .tab {
+      min-height: 36px;
+      background: rgba(255,255,255,0.03);
+      border-color: transparent;
+      color: var(--muted);
+    }
+
+    .tab.active {
+      background: linear-gradient(135deg, #3fd5c5, #57a4ff);
+      color: #031018;
+      border-color: rgba(63,213,197,0.6);
+    }
+
+    .details-panel {
+      padding: 14px;
+    }
+
+    .hidden { display: none !important; }
 
     .table-wrap {
       overflow: auto;
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: rgba(8,13,24,.46);
+      border-radius: 10px;
+      background: rgba(7, 17, 26, 0.8);
     }
 
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 760px;
+      min-width: 780px;
     }
 
     th, td {
-      padding: 11px 12px;
-      border-bottom: 1px solid rgba(148,163,184,.14);
+      border-bottom: 1px solid rgba(126, 167, 199, 0.16);
+      padding: 10px 11px;
       text-align: left;
-      font-size: 13px;
+      font-size: 12px;
       vertical-align: top;
     }
 
     th {
+      background: rgba(14, 29, 42, 0.95);
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      font-size: 10px;
       position: sticky;
       top: 0;
       z-index: 1;
-      background: #111a2b;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: .07em;
-      font-size: 11px;
     }
 
-    tr:hover td { background: rgba(255,255,255,.03); }
+    tr:hover td { background: rgba(255,255,255,0.03); }
 
     pre {
       margin: 0;
+      background: rgba(6, 12, 18, 0.95);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      color: #d8e8f6;
+      padding: 12px;
+      max-height: 380px;
+      overflow: auto;
       white-space: pre-wrap;
       overflow-wrap: anywhere;
-      background: #080d18;
-      color: #d8e1ef;
-      padding: 14px;
-      border: 1px solid var(--line);
-      border-radius: var(--radius);
-      max-height: 420px;
-      overflow: auto;
       font-size: 12px;
       line-height: 1.45;
     }
 
     iframe {
       width: 100%;
-      min-height: 780px;
+      min-height: 720px;
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      background: white;
+      border-radius: 12px;
+      background: #fff;
     }
 
+    .muted { color: var(--muted); }
+
     .empty {
-      border: 1px dashed rgba(148,163,184,.28);
-      border-radius: var(--radius);
-      padding: 28px;
-      color: var(--muted);
+      border: 1px dashed rgba(126, 167, 199, 0.3);
+      border-radius: 10px;
+      padding: 24px;
       text-align: center;
-      background: rgba(255,255,255,.025);
+      color: var(--muted);
+    }
+
+    .warning-stack {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .warning-item {
+      border: 1px solid rgba(246,179,91,0.35);
+      border-radius: 10px;
+      background: rgba(246,179,91,0.13);
+      color: #ffe2b2;
+      padding: 9px 11px;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .tiny-help {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+      margin-top: 4px;
+    }
+
+    .mini-copy {
+      min-height: 24px;
+      padding: 3px 7px;
+      font-size: 11px;
+      border-radius: 8px;
+      margin-left: 6px;
+    }
+
+    .worker-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+
+    .worker-item {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--panel);
+      padding: 8px 10px;
+      min-height: 66px;
+      display: grid;
+      align-content: center;
+      gap: 4px;
+    }
+
+    .worker-name {
+      color: var(--muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      font-weight: 700;
+    }
+
+    @media (max-width: 1280px) {
+      .worker-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .model-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 640px) {
+      .worker-grid { grid-template-columns: 1fr; }
+      .model-status-grid { grid-template-columns: 1fr; }
+      .model-metrics { grid-template-columns: 1fr; }
+    }
+
+    .loader-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 30;
+      background: rgba(4, 8, 12, 0.62);
+      backdrop-filter: blur(2px);
+      display: grid;
+      place-items: center;
+    }
+
+    .loader-card {
+      width: min(320px, calc(100vw - 30px));
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: rgba(8, 18, 28, 0.95);
+      box-shadow: var(--shadow);
+      padding: 18px;
+      display: grid;
+      gap: 12px;
+      place-items: center;
+      text-align: center;
+    }
+
+    .spinner {
+      width: 38px;
+      height: 38px;
+      border-radius: 999px;
+      border: 3px solid rgba(87, 164, 255, 0.26);
+      border-top-color: var(--teal);
+      animation: spin 760ms linear infinite;
+    }
+
+    @keyframes spin {
+      from { transform: rotate(0deg); }
+      to { transform: rotate(360deg); }
     }
 
     .toast {
       position: fixed;
-      right: 22px;
-      bottom: 22px;
-      z-index: 20;
-      max-width: min(420px, calc(100vw - 32px));
+      right: 18px;
+      bottom: 18px;
+      z-index: 40;
+      max-width: min(420px, calc(100vw - 28px));
       border: 1px solid var(--line);
-      border-radius: var(--radius);
-      padding: 12px 14px;
-      background: rgba(12, 18, 31, .94);
+      border-radius: 12px;
+      background: rgba(8, 17, 26, 0.95);
       box-shadow: var(--shadow);
-      color: var(--soft);
-      transform: translateY(18px);
+      color: var(--text);
+      padding: 10px 12px;
       opacity: 0;
+      transform: translateY(16px);
       pointer-events: none;
-      transition: transform .18s ease, opacity .18s ease;
+      transition: transform 140ms ease, opacity 140ms ease;
     }
 
-    .toast.show { transform: translateY(0); opacity: 1; }
+    .toast.show { opacity: 1; transform: translateY(0); }
 
-    @media (max-width: 1180px) {
-      .app-shell { grid-template-columns: 1fr; }
-      .sidebar { position: relative; height: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
-      .brand { grid-column: 1 / -1; margin-bottom: 0; }
-      .side-card { margin-bottom: 0; }
-      .hero { grid-template-columns: 1fr; }
-      .stats-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    @media (max-width: 1280px) {
+      .control-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .kpi-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .tabs { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .topbar { grid-template-columns: 1fr; }
     }
 
-    @media (max-width: 760px) {
-      .app-shell { display: flex; flex-direction: column; }
-      .content { order: 1; }
-      .sidebar { order: 2; }
-      .content { padding: 14px; }
-      .sidebar { padding: 14px; grid-template-columns: 1fr; }
-      .hero-main { padding: 20px; }
-      .control-grid, .toggle-row, .actions { grid-template-columns: 1fr; }
-      .stats-grid { grid-template-columns: 1fr 1fr; }
-      canvas { height: 340px; }
-      .chart-wrap { min-height: 340px; }
-      .tabs { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); overflow: visible; }
-      .tab { width: 100%; }
+    @media (max-width: 900px) {
+      .chart-grid { grid-template-columns: 1fr; }
+      .actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .toggle-row { grid-template-columns: 1fr; }
     }
 
-    @media (max-width: 520px) {
-      .stats-grid { grid-template-columns: 1fr; }
-      .hero-title { font-size: 30px; }
-      .panel-header { flex-direction: column; }
+    @media (max-width: 640px) {
+      .shell { padding: 12px; }
+      .control-grid { grid-template-columns: 1fr; }
+      .kpi-grid { grid-template-columns: 1fr; }
+      .tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .actions { grid-template-columns: 1fr; }
+      canvas { height: 300px; }
+      .chart-wrap { min-height: 300px; }
     }
   </style>
 </head>
 <body>
-<div class="app-shell">
-  <aside class="sidebar" aria-label="System summary">
-    <div class="brand">
-      <div class="brand-mark" aria-hidden="true">K</div>
-      <div>
-        <h1>Capital Kronos</h1>
-        <p>Signal intelligence console</p>
-      </div>
-    </div>
-    <div class="side-card">
-      <div class="side-label">Runtime</div>
-      <div class="side-value" id="runtimeStatus">Loading</div>
-      <div class="side-note">Data-only signal generation. No order execution is implemented.</div>
-    </div>
-    <div class="side-card">
-      <div class="side-label">Latest Service Heartbeats</div>
-      <div class="side-value" id="heartbeatStatus">Waiting for status</div>
-    </div>
-    <div class="side-card">
-      <div class="side-label">Local Time Display</div>
-      <div class="side-value">Asia/Amman</div>
-    </div>
-  </aside>
+<div class="ambient"></div>
 
-  <main class="content">
-    <section class="hero">
-      <div class="hero-main">
-        <div>
-          <div class="eyebrow">ETHUSD forecasting and signal validation</div>
-          <h1 class="hero-title">Kronos signal cockpit for live market decisions.</h1>
-          <p class="hero-copy">Monitor Capital.com candles, Kronos forecast paths, PostgreSQL outcomes, and validation quality in one responsive production console.</p>
-        </div>
-        <div class="hero-meta" id="heroMeta">
-          <span class="badge info">Loading market state</span>
-        </div>
-      </div>
-
-      <section class="control-panel" aria-label="Prediction controls">
-        <div class="control-title">
-          <h2>Run Controls</h2>
-          <span class="badge info" id="controlBadge">Ready</span>
-        </div>
-        <div class="control-grid">
-          <label class="field">Market <input id="market" value="ETHUSD" autocomplete="off"></label>
-          <label class="field">Resolution <select id="resolution"><option>MINUTE_5</option><option>MINUTE_15</option><option>MINUTE_30</option><option>HOUR</option></select></label>
-          <label class="field">Prediction Length <input id="predLen" type="number" value="12" min="1" max="120"></label>
-          <label class="field">Lookback <input id="lookback" type="number" value="512" min="50" max="512"></label>
-          <label class="field">Feature Set <select id="featureSet"><option>auto</option><option>ohlc</option><option>ohlcv</option><option>ohlcva</option></select></label>
-          <label class="field">Auto Refresh <select id="autoRefresh"><option value="0">Off</option><option value="30">30 sec</option><option value="60">60 sec</option><option value="300">5 min</option></select></label>
-        </div>
-        <div class="toggle-row">
-          <label class="toggle"><span>Repair OHLC</span><input id="repairOhlc" type="checkbox" checked></label>
-          <label class="toggle"><span>Auto predict</span><input id="autoPredict" type="checkbox"></label>
-        </div>
-        <div class="actions">
-          <button id="predict" class="primary">Run Prediction</button>
-          <button id="refresh" class="secondary">Refresh</button>
-          <button id="fetchActual" class="warn">Fetch Actuals</button>
-          <button id="validateActual" class="warn">Validate Actuals</button>
-          <button id="baselines" class="secondary">Run Baselines</button>
-        </div>
-      </section>
-    </section>
-
-    <section class="stats-grid" id="summaryCards" aria-label="Key metrics"></section>
-
-    <nav class="tabs" aria-label="Dashboard sections">
-      <button class="tab active" data-tab="overview">Overview</button>
-      <button class="tab" data-tab="forecast">Forecast Chart</button>
-      <button class="tab" data-tab="candles">Candles</button>
-      <button class="tab" data-tab="validation">Validation</button>
-      <button class="tab" data-tab="baselines">Baselines</button>
-      <button class="tab" data-tab="risk">Risk</button>
-      <button class="tab" data-tab="history">History</button>
-      <button class="tab" data-tab="files">Files</button>
-      <button class="tab" data-tab="logs">Logs</button>
-      <button class="tab" data-tab="report">Embedded Report</button>
-    </nav>
-
-    <section id="overview" class="panel tabPanel"></section>
-    <section id="forecast" class="panel tabPanel hidden"><div class="panel-header"><div><h2>Actual + Forecast Close</h2><p class="muted">Blue is actual history, cyan is forecast path.</p></div></div><div class="chart-wrap"><canvas id="closeChart" width="1200" height="420"></canvas></div></section>
-    <section id="candles" class="panel tabPanel hidden"><div class="panel-header"><div><h2>Historical + Forecast Candles</h2><p class="muted">Historical and generated candles share the same price scale.</p></div></div><div class="chart-wrap"><canvas id="candleChart" width="1200" height="420"></canvas></div></section>
-    <section id="validation" class="panel tabPanel hidden"></section>
-    <section id="baselines" class="panel tabPanel hidden"></section>
-    <section id="risk" class="panel tabPanel hidden"></section>
-    <section id="history" class="panel tabPanel hidden"></section>
-    <section id="files" class="panel tabPanel hidden"></section>
-    <section id="logs" class="panel tabPanel hidden"><div class="panel-header"><h2>Logs</h2><span class="badge info">Action output</span></div><pre id="log">No actions run in this browser session.</pre></section>
-    <section id="report" class="panel tabPanel hidden"><div class="panel-header"><div><h2>Generated Prediction Report</h2><p class="muted">Reports render inline after a prediction run.</p></div><div id="reportLink" class="badge info">No report yet</div></div><iframe id="reportFrame" class="hidden" title="Prediction report"></iframe></section>
-  </main>
+<div id="loader" class="loader-overlay hidden" aria-live="polite" aria-busy="true">
+  <div class="loader-card">
+    <div class="spinner" aria-hidden="true"></div>
+    <div id="loaderText">Loading dashboard...</div>
+  </div>
 </div>
+
+<div class="shell">
+  <header class="topbar panel">
+    <div class="brand">
+          <h1>Kronos Live Signal Dashboard <span id="titlePrice" class="title-price">ETHUSD --</span></h1>
+      <p>Professional market intelligence view with live price tracking, forecast quality, and signal lifecycle status.</p>
+      <div class="status-strip" id="heroMeta">
+        <span class="chip info">Loading market state</span>
+      </div>
+    </div>
+    <div class="meta-grid">
+      <article class="meta-card">
+        <div class="meta-label">Runtime</div>
+        <div class="meta-value" id="runtimeStatus">Loading</div>
+      </article>
+      <article class="meta-card">
+        <div class="meta-label">Heartbeats</div>
+        <div class="meta-value" id="heartbeatStatus">Waiting for status</div>
+      </article>
+      <article class="meta-card">
+        <div class="meta-label">Display Timezone</div>
+        <div class="meta-value">Asia/Amman</div>
+      </article>
+      <article class="meta-card">
+        <div class="meta-label">Control Status</div>
+        <div class="meta-value"><span id="controlBadge" class="chip info">Ready</span></div>
+      </article>
+    </div>
+  </header>
+
+  <section class="control-board panel" aria-label="Prediction controls">
+    <div class="control-head">
+      <h2>Live Controls</h2>
+      <div class="muted">Auto mode is enabled for 5-minute candle-close prediction by default.</div>
+    </div>
+
+    <div class="control-grid">
+      <label class="field">Market
+        <input id="market" value="ETHUSD" autocomplete="off">
+      </label>
+      <label class="field">Resolution
+        <select id="resolution">
+          <option>MINUTE</option>
+          <option selected>MINUTE_5</option>
+          <option>MINUTE_15</option>
+          <option>MINUTE_30</option>
+          <option>HOUR</option>
+        </select>
+      </label>
+      <label class="field">Prediction Length
+        <input id="predLen" type="number" value="12" min="1" max="120">
+      </label>
+      <label class="field">Lookback
+        <input id="lookback" type="number" value="512" min="50" max="512">
+      </label>
+      <label class="field">Feature Set
+        <select id="featureSet">
+          <option>auto</option>
+          <option>ohlc</option>
+          <option>ohlcv</option>
+          <option>ohlcva</option>
+        </select>
+      </label>
+      <label class="field">Auto Refresh
+        <select id="autoRefresh">
+          <option value="0">Off</option>
+          <option value="1" selected>Live (1 sec)</option>
+          <option value="2">2 sec</option>
+          <option value="5">5 sec</option>
+          <option value="10">10 sec</option>
+          <option value="30">30 sec</option>
+        </select>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <label class="toggle-card"><span>Repair OHLC</span><input id="repairOhlc" type="checkbox" checked></label>
+      <label class="toggle-card"><span>Auto Predict on Candle Close</span><input id="autoPredict" type="checkbox" checked></label>
+    </div>
+
+    <div class="actions">
+      <button id="predict" class="btn-primary">Run Prediction</button>
+      <button id="refresh" class="btn-alt">Refresh Snapshot</button>
+      <button id="fetchActual" class="btn-warn">Fetch Actuals</button>
+      <button id="validateActual" class="btn-warn">Validate Actuals</button>
+      <button id="baselines" class="btn-alt">Run Baselines</button>
+    </div>
+  </section>
+
+  <section id="modelStatusPanel" class="model-status-panel panel" aria-label="Model version and promotion progress"></section>
+
+  <section id="summaryCards" class="kpi-grid" aria-label="Key metrics"></section>
+
+  <section class="chart-grid">
+    <article class="chart-panel panel">
+      <div class="panel-head">
+        <div>
+          <h3>Forecast vs Actual Close</h3>
+          <p>Blue is historical input, orange is forecast path, green is actual candles inside forecast window.</p>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="closeChart" width="1200" height="360"></canvas></div>
+    </article>
+
+    <article class="chart-panel panel">
+      <div class="panel-head">
+        <div>
+          <h3>Historical and Forecast Candles</h3>
+          <p>Left side is input candles, right side is forecast candles for fast visual sanity checks.</p>
+        </div>
+      </div>
+      <div class="chart-wrap"><canvas id="candleChart" width="1200" height="360"></canvas></div>
+    </article>
+  </section>
+
+  <nav class="tabs" aria-label="Dashboard sections">
+    <button class="tab active" data-tab="overview">Signals</button>
+    <button class="tab" data-tab="validation">Validation</button>
+    <button class="tab" data-tab="risk">Risk</button>
+    <button class="tab" data-tab="baselines">Baselines</button>
+    <button class="tab" data-tab="history">History</button>
+    <button class="tab" data-tab="files">Files</button>
+    <button class="tab" data-tab="logs">Logs</button>
+    <button class="tab" data-tab="report">Report</button>
+  </nav>
+
+  <section id="overview" class="details-panel panel tabPanel"></section>
+  <section id="validation" class="details-panel panel tabPanel hidden"></section>
+  <section id="risk" class="details-panel panel tabPanel hidden"></section>
+  <section id="baselines" class="details-panel panel tabPanel hidden"></section>
+  <section id="history" class="details-panel panel tabPanel hidden"></section>
+  <section id="files" class="details-panel panel tabPanel hidden"></section>
+  <section id="logs" class="details-panel panel tabPanel hidden">
+    <div class="panel-head"><h2>Execution Logs</h2><span class="chip info">Action output</span></div>
+    <pre id="log">No actions run in this browser session.</pre>
+  </section>
+  <section id="report" class="details-panel panel tabPanel hidden">
+    <div class="panel-head">
+      <div>
+        <h2>Prediction Report</h2>
+        <p class="muted">Generated HTML report is rendered inline after each successful prediction run.</p>
+      </div>
+      <div id="reportLink" class="chip info">No report yet</div>
+    </div>
+    <iframe id="reportFrame" class="hidden" title="Prediction report"></iframe>
+  </section>
+</div>
+
 <div id="toast" class="toast" role="status" aria-live="polite"></div>
 
 <script>
+const DASHBOARD_TZ = 'Asia/Amman';
+
 let latest = {};
+let latestSignals = { rows: [], pagination: { page: 1, page_size: 20, total: 0, total_pages: 1, has_next: false, has_prev: false } };
 let refreshTimer = null;
-let lastAutoInputEnd = null;
+let refreshInFlight = false;
 let autoPredictBusy = false;
+let signalPage = 1;
+let signalPageSize = 20;
+let activeTab = 'overview';
+let lastAutoPredictClosedBucket = null;
+let lastOverviewHtml = '';
+let lastOverviewRenderAtMs = 0;
+const OVERVIEW_BACKGROUND_RENDER_INTERVAL_MS = 15000;
+let lastRuntimeStatusKey = '';
+let lastHeartbeatStatusKey = '';
+let lastHeroMetaKey = '';
+let lastModelStatusKey = '';
+let lastSummaryCardsKey = '';
+let signalFilters = {
+  timeframe: '',
+  dateFrom: '',
+  dateTo: '',
+  direction: '',
+  status: '',
+  signalId: '',
+};
+
+const SIGNAL_FILTER_CONTROL_IDS = new Set([
+  'signalsTimeframe',
+  'signalsDateFrom',
+  'signalsDateTo',
+  'signalsDirection',
+  'signalsStatus',
+  'signalsSignalId',
+  'signalsPageSize',
+]);
+
+const SIGNAL_FILTER_AUTO_APPLY_IDS = new Set([
+  'signalsTimeframe',
+  'signalsDateFrom',
+  'signalsDateTo',
+  'signalsDirection',
+  'signalsStatus',
+]);
+
+let signalIdFilterDebounceTimer = null;
+
 const $ = id => document.getElementById(id);
 
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
 }
 
-function fmt(n, digits=4) {
-  return n === null || n === undefined || Number.isNaN(Number(n)) ? 'n/a' : Number(n).toFixed(digits);
+function fmtNumber(value, digits = 4) {
+  return value === null || value === undefined || Number.isNaN(Number(value)) ? 'n/a' : Number(value).toFixed(digits);
+}
+
+function fmtCount(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed.toLocaleString('en-US') : '0';
+}
+
+function toFiniteNumber(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function pct01(value, digits = 2) {
+  return value === null || value === undefined || Number.isNaN(Number(value)) ? 'n/a' : `${(Number(value) * 100).toFixed(digits)}%`;
+}
+
+function fmtDate(value) {
+  if (!value) return 'n/a';
+  const raw = String(value).trim().replace(' ', 'T');
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return String(value);
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: DASHBOARD_TZ,
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+  }).format(d).replace(',', '');
+}
+
+function parseTs(value) {
+  const d = new Date(value);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function resolveLatestPrice(data) {
+  const hs = data.human_summary || {};
+  const pg = data.postgres_snapshot || {};
+  const liveQuote = pg.live_quote || data.live_quote || {};
+  const latestSignal = (pg.signals || [])[0] || {};
+  const candles = pg.candles || [];
+  const latestCandle = candles.length ? candles[candles.length - 1] : {};
+  const metadata = data.metadata || {};
+  const candidates = [
+    hs.latest_price,
+    liveQuote.price,
+    latestCandle.close,
+    latestSignal.entry_price,
+    metadata.last_input_close,
+  ];
+  for (const candidate of candidates) {
+    const parsed = toFiniteNumber(candidate);
+    if (parsed !== null) return parsed;
+  }
+  return null;
+}
+
+function resolveLatestPriceTime(data) {
+  const hs = data.human_summary || {};
+  const pg = data.postgres_snapshot || {};
+  const liveQuote = pg.live_quote || data.live_quote || {};
+  const candles = pg.candles || [];
+  const latestCandle = candles.length ? candles[candles.length - 1] : {};
+  return (
+    hs.latest_price_time
+    || hs.latest_candle_time
+    || liveQuote.updated_at
+    || liveQuote.timestamp_utc
+    || latestCandle.timestamp_utc
+    || null
+  );
 }
 
 function statusClass(value) {
   const text = String(value || '').toUpperCase();
-  if (['OK','VALIDATED','WIN','PROMISING','LONG','UP'].includes(text)) return 'good';
-  if (['PENDING','PARTIAL','HOLD','NEEDS_MORE_SAMPLES','FLAT'].includes(text)) return 'warn';
-  if (['ERROR','LOSS','WEAK','NOT_TRADABLE','SHORT','DOWN'].includes(text)) return 'bad';
+  if (['OK', 'VALIDATED', 'WIN', 'PROMISING', 'LONG', 'UP', 'APPROVED', 'PROMOTED'].includes(text)) return 'good';
+  if (['PENDING', 'PARTIAL', 'HOLD', 'NEEDS_MORE_SAMPLES', 'FLAT', 'STALE', 'PENDING_REVIEW', 'SKIP'].includes(text)) return 'warn';
+  if (['ERROR', 'LOSS', 'WEAK', 'NOT_TRADABLE', 'SHORT', 'DOWN', 'NOT_READY'].includes(text)) return 'bad';
   return 'info';
 }
 
-function badge(value, extra='') {
-  return `<span class="badge ${statusClass(value)} ${extra}">${escapeHtml(value ?? 'n/a')}</span>`;
+function chip(value, extra = '') {
+  return `<span class="chip ${statusClass(value)} ${extra}">${escapeHtml(value ?? 'n/a')}</span>`;
 }
 
-function stat(label, value, sub='') {
-  return `<article class="stat-card"><div class="stat-label">${escapeHtml(label)}</div><div class="stat-value">${escapeHtml(value ?? 'n/a')}</div>${sub ? `<div class="stat-sub">${escapeHtml(sub)}</div>` : ''}</article>`;
+function kpi(label, value, sub = '') {
+  return `<article class="kpi"><div class="kpi-label">${escapeHtml(label)}</div><div class="kpi-value">${escapeHtml(value ?? 'n/a')}</div>${sub ? `<div class="kpi-sub">${escapeHtml(sub)}</div>` : ''}</article>`;
+}
+
+function setTextIfChanged(element, text) {
+  if (!element) return;
+  if (element.textContent !== text) {
+    element.textContent = text;
+  }
+}
+
+function setTitleIfChanged(element, text) {
+  if (!element) return;
+  if (element.title !== text) {
+    element.title = text;
+  }
+}
+
+function setHtmlIfChanged(element, html) {
+  if (!element) return;
+  if (element.innerHTML !== html) {
+    element.innerHTML = html;
+  }
 }
 
 function showToast(message) {
@@ -638,27 +1026,73 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add('show');
   clearTimeout(showToast.timer);
-  showToast.timer = setTimeout(() => toast.classList.remove('show'), 3600);
+  showToast.timer = setTimeout(() => toast.classList.remove('show'), 3400);
 }
 
-function setBusy(isBusy, label='Working') {
+function showLoader(text = 'Loading dashboard...') {
+  $('loaderText').textContent = text;
+  $('loader').classList.remove('hidden');
+}
+
+function hideLoader() {
+  $('loader').classList.add('hidden');
+}
+
+function setBusy(isBusy, label = 'Working') {
   $('predict').disabled = isBusy;
-  $('controlBadge').className = `badge ${isBusy ? 'warn' : 'info'}`;
+  $('controlBadge').className = `chip ${isBusy ? 'warn' : 'info'}`;
   $('controlBadge').textContent = isBusy ? label : 'Ready';
 }
 
 function setTab(name) {
+  activeTab = name;
   document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.querySelectorAll('.tabPanel').forEach(p => p.classList.toggle('hidden', p.id !== name));
-  if (name === 'forecast') drawCloseChart();
-  if (name === 'candles') drawCandleChart();
+  renderActiveTabContent();
+}
+
+function isSignalsFilterInteracting() {
+  const active = document.activeElement;
+  return !!(active && SIGNAL_FILTER_CONTROL_IDS.has(active.id));
+}
+
+function buildSignalPaginationButtons(currentPage, totalPages) {
+  const page = Math.max(1, Number(currentPage || 1));
+  const total = Math.max(1, Number(totalPages || 1));
+  const radius = 2;
+  let start = Math.max(1, page - radius);
+  let end = Math.min(total, page + radius);
+
+  if (end - start < radius * 2) {
+    start = Math.max(1, end - (radius * 2));
+    end = Math.min(total, start + (radius * 2));
+  }
+
+  const pieces = [];
+  const pageButton = (p, active = false) => `<button type="button" class="${active ? 'btn-primary' : 'btn-alt'}" data-signal-page="${p}" style="min-height: 34px; padding: 6px 10px;">${p}</button>`;
+
+  if (start > 1) {
+    pieces.push(pageButton(1, page === 1));
+    if (start > 2) pieces.push('<span class="muted">...</span>');
+  }
+
+  for (let p = start; p <= end; p += 1) {
+    pieces.push(pageButton(p, p === page));
+  }
+
+  if (end < total) {
+    if (end < total - 1) pieces.push('<span class="muted">...</span>');
+    pieces.push(pageButton(total, page === total));
+  }
+
+  return pieces.join('');
 }
 
 function resizeCanvas(canvas) {
   const dpr = window.devicePixelRatio || 1;
   const rect = canvas.getBoundingClientRect();
   const cssWidth = Math.max(320, rect.width);
-  const cssHeight = Number.parseFloat(getComputedStyle(canvas).height) || 420;
+  const cssHeight = Number.parseFloat(getComputedStyle(canvas).height) || 360;
   canvas.width = Math.floor(cssWidth * dpr);
   canvas.height = Math.floor(cssHeight * dpr);
   const ctx = canvas.getContext('2d');
@@ -666,223 +1100,1019 @@ function resizeCanvas(canvas) {
   return { ctx, w: cssWidth, h: cssHeight };
 }
 
-function drawLine(ctx, points, color, width=2) {
-  if (points.length < 2) return;
-  ctx.beginPath(); ctx.strokeStyle = color; ctx.lineWidth = width;
-  points.forEach((p,i) => i ? ctx.lineTo(p.x,p.y) : ctx.moveTo(p.x,p.y));
-  ctx.stroke();
-}
-
-function chartScale(rows, keys, w, h) {
-  const vals = [];
-  rows.forEach(r => keys.forEach(k => { if (r[k] !== undefined && r[k] !== null && !Number.isNaN(Number(r[k]))) vals.push(Number(r[k])); }));
-  let min = Math.min(...vals), max = Math.max(...vals);
-  if (!Number.isFinite(min) || !Number.isFinite(max)) { min = 0; max = 1; }
-  if (min === max) { min -= 1; max += 1; }
-  const pad = 42;
-  return {
-    x: i => pad + i * ((w - pad * 2) / Math.max(rows.length - 1, 1)),
-    y: v => h - pad - ((v - min) / (max - min)) * (h - pad * 2),
-    min, max, pad
-  };
-}
-
-function drawGrid(ctx, s, w, h) {
-  ctx.strokeStyle = 'rgba(148,163,184,.16)';
-  ctx.lineWidth = 1;
-  for (let i = 0; i <= 4; i++) {
-    const y = s.pad + i * ((h - s.pad * 2) / 4);
-    ctx.beginPath(); ctx.moveTo(s.pad, y); ctx.lineTo(w - s.pad, y); ctx.stroke();
-  }
-  ctx.fillStyle = '#9aa8bd';
-  ctx.font = '12px Segoe UI, Arial';
-  ctx.fillText(fmt(s.max, 2), 10, s.pad + 4);
-  ctx.fillText(fmt(s.min, 2), 10, h - s.pad + 4);
-}
-
-function drawCloseChart() {
-  const canvas = $('closeChart'); if (!canvas) return;
-  const {ctx, w, h} = resizeCanvas(canvas);
-  ctx.clearRect(0,0,w,h);
-  const actual = latest.actual_tail || [];
-  const forecast = latest.forecast || [];
-  const rows = [...actual.map(r => ({...r, type:'actual'})), ...forecast.map(r => ({...r, type:'forecast'}))];
-  if (!rows.length) { drawEmptyChart(ctx, w, h, 'No close data available'); return; }
-  const s = chartScale(rows, ['close'], w, h);
-  drawGrid(ctx, s, w, h);
-  drawLine(ctx, actual.map((r,i) => ({x:s.x(i), y:s.y(Number(r.close))})), '#62a8ff', 2.4);
-  const offset = actual.length;
-  drawLine(ctx, forecast.map((r,i) => ({x:s.x(offset+i), y:s.y(Number(r.close))})), '#27d3d8', 2.6);
-  if (forecast.length) {
-    const x = s.x(offset);
-    ctx.strokeStyle = '#f5b84b'; ctx.setLineDash([6,6]);
-    ctx.beginPath(); ctx.moveTo(x,s.pad); ctx.lineTo(x,h-s.pad); ctx.stroke(); ctx.setLineDash([]);
-  }
-  ctx.fillStyle = '#cbd5e1'; ctx.font = '12px Segoe UI, Arial';
-  ctx.fillText('Actual history', s.pad, 22);
-  ctx.fillStyle = '#27d3d8'; ctx.fillText('Forecast path', s.pad + 112, 22);
-}
-
-function drawCandleChart() {
-  const canvas = $('candleChart'); if (!canvas) return;
-  const {ctx, w, h} = resizeCanvas(canvas);
-  ctx.clearRect(0,0,w,h);
-  const actual = (latest.actual_tail || []).slice(-72);
-  const forecast = latest.forecast || [];
-  const rows = [...actual.map(r => ({...r, type:'actual'})), ...forecast.map(r => ({...r, type:'forecast'}))];
-  if (!rows.length) { drawEmptyChart(ctx, w, h, 'No candle data available'); return; }
-  const s = chartScale(rows, ['open','high','low','close'], w, h);
-  drawGrid(ctx, s, w, h);
-  const step = (w - s.pad * 2) / Math.max(rows.length, 1);
-  rows.forEach((r,i) => {
-    const x = s.pad + i * step + step / 2;
-    const o = Number(r.open), c = Number(r.close), hi = Number(r.high), lo = Number(r.low);
-    const up = c >= o;
-    const color = r.type === 'forecast' ? (up ? '#27d3d8' : '#f5b84b') : (up ? '#3ddc97' : '#ff6b6b');
-    ctx.strokeStyle = color; ctx.fillStyle = color;
-    ctx.beginPath(); ctx.moveTo(x, s.y(hi)); ctx.lineTo(x, s.y(lo)); ctx.stroke();
-    const y = Math.min(s.y(o), s.y(c)); const bh = Math.max(Math.abs(s.y(o)-s.y(c)), 2);
-    ctx.fillRect(x - Math.max(step*.26,2), y, Math.max(step*.52,3), bh);
-  });
-}
-
 function drawEmptyChart(ctx, w, h, text) {
-  ctx.fillStyle = '#9aa8bd';
-  ctx.font = '14px Segoe UI, Arial';
+  ctx.fillStyle = '#90a9bc';
+  ctx.font = '14px Space Grotesk';
   ctx.textAlign = 'center';
   ctx.fillText(text, w / 2, h / 2);
   ctx.textAlign = 'left';
 }
 
-function renderHeartbeat(pg) {
-  const beats = pg.heartbeats || [];
-  if (!beats.length) return 'No workers yet';
-  return beats.map(row => `${escapeHtml(row.service_name)} ${badge(row.status)}`).join('<br>');
+function buildCloseSeries() {
+  const inputTail = (latest.input_tail || []).slice(-120);
+  const marketTail = (latest.market_tail || []).slice(-120);
+  const history = inputTail.length ? inputTail : marketTail;
+  const forecast = (latest.forecast || []).slice();
+  const actual = (latest.actual_tail || []).slice();
+  const forecastStart = parseTs(forecast[0]?.timestamps);
+  const forecastEnd = parseTs(forecast[forecast.length - 1]?.timestamps);
+  const actualWindow = (forecastStart && forecastEnd)
+    ? actual.filter(row => {
+      const t = parseTs(row.timestamps);
+      return t && t >= forecastStart && t <= forecastEnd;
+    })
+    : [];
+  return { history, forecast, actualWindow, forecastStart };
 }
 
-function render(data) {
-  latest = data;
-  const m = data.metadata || {}, v = data.validation || {};
-  const db = data.prediction_db || {};
-  const pg = data.postgres_snapshot || {};
-  const latestSignal = (pg.signals || [])[0] || {};
-  const postgresOk = pg.postgres?.ok === true;
-  const signal = latestSignal.signal || 'n/a';
+function drawCloseChart() {
+  const canvas = $('closeChart');
+  if (!canvas) return;
+  const { ctx, w, h } = resizeCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
 
-  $('runtimeStatus').innerHTML = postgresOk ? badge('PostgreSQL OK') : badge('PostgreSQL Offline');
-  $('heartbeatStatus').innerHTML = renderHeartbeat(pg);
-  $('heroMeta').innerHTML = [
-    badge(signal),
-    badge(v.forecast_direction || 'Direction pending'),
-    badge(postgresOk ? 'PostgreSQL OK' : 'PostgreSQL Offline'),
-    `<span class="badge info">${escapeHtml(m.resolution || latestSignal.resolution || 'MINUTE_5')}</span>`
-  ].join('');
+  const { history, forecast, actualWindow, forecastStart } = buildCloseSeries();
+  const allRows = [...history, ...forecast, ...actualWindow];
+  if (!allRows.length) {
+    drawEmptyChart(ctx, w, h, 'No close-price data available');
+    return;
+  }
 
-  $('summaryCards').innerHTML = [
-    stat('Last Close', fmt(m.last_input_close), 'Latest input candle close'),
-    stat('Forecast Close', fmt(v.last_forecast_close), `${escapeHtml(v.forecast_direction || 'pending')} direction`),
-    stat('Signal', signal, `${fmt(latestSignal.confidence, 3)} confidence`),
-    stat('Expected Move', `${fmt(v.max_abs_close_move_pct)}%`, `${m.forecast_horizon_minutes || v.forecast_horizon_minutes || 'n/a'} minute horizon`),
-    stat('Win Rate', db.win_rate_pct === null || db.win_rate_pct === undefined ? 'n/a' : `${Number(db.win_rate_pct).toFixed(2)}%`, `${db.wins ?? 0} WIN / ${db.losses ?? 0} LOSS`),
-    stat('Pending', db.pending ?? 0, 'Forecast rows awaiting actuals'),
-  ].join('');
+  const allTimes = allRows.map(r => parseTs(r.timestamps)?.getTime()).filter(Boolean);
+  const allPrices = allRows.map(r => Number(r.close)).filter(v => Number.isFinite(v));
+  if (!allTimes.length || !allPrices.length) {
+    drawEmptyChart(ctx, w, h, 'Unable to draw chart from current data');
+    return;
+  }
 
-  const signals = pg.signals || [];
-  const signalRows = signals.length ? signals.map(r => `<tr><td>${escapeHtml(r.timestamp_utc)}</td><td>${badge(r.signal)}</td><td>${escapeHtml(r.direction || '')}</td><td>${fmt(r.confidence, 3)}</td><td>${fmt(r.expected_move_pct)}%</td><td>${escapeHtml(r.run_status || '')}</td></tr>`).join('') : `<tr><td colspan="6"><div class="empty">No PostgreSQL signals yet.</div></td></tr>`;
+  const pad = 46;
+  const minTs = Math.min(...allTimes);
+  const maxTs = Math.max(...allTimes);
+  const spanTs = Math.max(maxTs - minTs, 1);
+  const minPriceRaw = Math.min(...allPrices);
+  const maxPriceRaw = Math.max(...allPrices);
+  const pricePad = Math.max((maxPriceRaw - minPriceRaw) * 0.08, 0.2);
+  const minPrice = minPriceRaw - pricePad;
+  const maxPrice = maxPriceRaw + pricePad;
+
+  const x = t => pad + ((t - minTs) / spanTs) * (w - pad * 2);
+  const y = v => h - pad - ((v - minPrice) / Math.max(maxPrice - minPrice, 1e-9)) * (h - pad * 2);
+
+  ctx.strokeStyle = 'rgba(126,167,199,0.2)';
+  ctx.lineWidth = 1;
+  for (let i = 0; i <= 4; i++) {
+    const gy = pad + i * ((h - pad * 2) / 4);
+    ctx.beginPath();
+    ctx.moveTo(pad, gy);
+    ctx.lineTo(w - pad, gy);
+    ctx.stroke();
+  }
+
+  ctx.fillStyle = '#90a9bc';
+  ctx.font = '12px IBM Plex Sans';
+  ctx.fillText(fmtNumber(maxPrice, 2), 8, pad + 4);
+  ctx.fillText(fmtNumber(minPrice, 2), 8, h - pad + 4);
+
+  const drawSeries = (rows, color, width, dashed = false) => {
+    const points = rows.map(row => {
+      const t = parseTs(row.timestamps);
+      return t ? { x: x(t.getTime()), y: y(Number(row.close)) } : null;
+    }).filter(Boolean);
+    if (points.length < 2) return;
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = width;
+    if (dashed) ctx.setLineDash([6, 5]);
+    points.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  };
+
+  drawSeries(history, '#57a4ff', 2.4);
+  drawSeries(actualWindow, '#4ee38d', 2.1, true);
+  drawSeries(forecast, '#f6b35b', 2.8);
+
+  if (forecastStart) {
+    const vx = x(forecastStart.getTime());
+    ctx.strokeStyle = '#f6b35b';
+    ctx.setLineDash([7, 6]);
+    ctx.beginPath();
+    ctx.moveTo(vx, pad);
+    ctx.lineTo(vx, h - pad);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.fillStyle = '#dce9f8';
+  ctx.font = '12px IBM Plex Sans';
+  ctx.fillText('Input history', pad, 22);
+  ctx.fillStyle = '#f6b35b';
+  ctx.fillText('Forecast', pad + 94, 22);
+  ctx.fillStyle = '#4ee38d';
+  ctx.fillText('Actual in forecast window', pad + 160, 22);
+}
+
+function drawCandleChart() {
+  const canvas = $('candleChart');
+  if (!canvas) return;
+  const { ctx, w, h } = resizeCanvas(canvas);
+  ctx.clearRect(0, 0, w, h);
+
+  const inputTail = (latest.input_tail || []).slice(-72);
+  const marketTail = (latest.market_tail || []).slice(-72);
+  const history = inputTail.length ? inputTail : marketTail;
+  const forecast = (latest.forecast || []).slice(-24);
+  const rows = [...history.map(r => ({ ...r, kind: 'history' })), ...forecast.map(r => ({ ...r, kind: 'forecast' }))];
+
+  if (!rows.length) {
+    drawEmptyChart(ctx, w, h, 'No candlestick data available');
+    return;
+  }
+
+  const priceValues = [];
+  rows.forEach(r => {
+    ['open', 'high', 'low', 'close'].forEach(k => {
+      const val = Number(r[k]);
+      if (Number.isFinite(val)) priceValues.push(val);
+    });
+  });
+  if (!priceValues.length) {
+    drawEmptyChart(ctx, w, h, 'No valid OHLC values available');
+    return;
+  }
+
+  const pad = 46;
+  const minPriceRaw = Math.min(...priceValues);
+  const maxPriceRaw = Math.max(...priceValues);
+  const pPad = Math.max((maxPriceRaw - minPriceRaw) * 0.08, 0.2);
+  const minPrice = minPriceRaw - pPad;
+  const maxPrice = maxPriceRaw + pPad;
+  const y = v => h - pad - ((v - minPrice) / Math.max(maxPrice - minPrice, 1e-9)) * (h - pad * 2);
+
+  ctx.strokeStyle = 'rgba(126,167,199,0.2)';
+  for (let i = 0; i <= 4; i++) {
+    const gy = pad + i * ((h - pad * 2) / 4);
+    ctx.beginPath();
+    ctx.moveTo(pad, gy);
+    ctx.lineTo(w - pad, gy);
+    ctx.stroke();
+  }
+
+  const step = (w - pad * 2) / Math.max(rows.length, 1);
+  rows.forEach((r, i) => {
+    const cx = pad + i * step + step / 2;
+    const o = Number(r.open);
+    const c = Number(r.close);
+    const hi = Number(r.high);
+    const lo = Number(r.low);
+    if (![o, c, hi, lo].every(Number.isFinite)) return;
+    const up = c >= o;
+    const color = r.kind === 'forecast' ? (up ? '#f6b35b' : '#ff8a8a') : (up ? '#4ee38d' : '#57a4ff');
+    ctx.strokeStyle = color;
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(cx, y(hi));
+    ctx.lineTo(cx, y(lo));
+    ctx.stroke();
+    const top = Math.min(y(o), y(c));
+    const body = Math.max(Math.abs(y(o) - y(c)), 2);
+    ctx.fillRect(cx - Math.max(step * 0.25, 2), top, Math.max(step * 0.5, 3), body);
+  });
+
+  if (forecast.length) {
+    const splitX = pad + history.length * step;
+    ctx.strokeStyle = '#f6b35b';
+    ctx.setLineDash([7, 6]);
+    ctx.beginPath();
+    ctx.moveTo(splitX, pad);
+    ctx.lineTo(splitX, h - pad);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  ctx.fillStyle = '#dce9f8';
+  ctx.font = '12px IBM Plex Sans';
+  ctx.fillText('Input candles', pad, 22);
+  ctx.fillStyle = '#f6b35b';
+  ctx.fillText('Forecast candles', pad + 92, 22);
+}
+
+function renderHeartbeat(pg) {
+  const workers = pg.worker_statuses || {};
+  const keys = Object.keys(workers);
+  if (!keys.length) return 'No workers yet';
+  return keys
+    .sort()
+    .map(name => `${escapeHtml(name)} ${chip(workers[name]?.status || 'MISSING')}`)
+    .join('<br>');
+}
+
+function modelStat(label, value) {
+  return `<div class="model-stat"><div class="model-stat-label">${escapeHtml(label)}</div><div class="model-stat-value">${escapeHtml(value ?? 'n/a')}</div></div>`;
+}
+
+function renderModelStatus(autoStatus = {}, metadata = {}) {
+  const rows = Number(autoStatus.dataset_rows || 0);
+  const requiredRows = Number(autoStatus.required_dataset_rows || autoStatus.min_rows || 0);
+  const sourceCounts = autoStatus.dataset_source_counts || {};
+  const websocketRows = Number(autoStatus.websocket_rows ?? sourceCounts.websocket_ohlc ?? 0);
+  const historicalRows = Number(autoStatus.historical_rows ?? Math.max(0, rows - websocketRows));
+  const rawPct = Number(autoStatus.promotion_progress_pct);
+  const progressPct = Number.isFinite(rawPct)
+    ? Math.max(0, Math.min(100, rawPct))
+    : (requiredRows > 0 ? Math.max(0, Math.min(100, (rows / requiredRows) * 100)) : 0);
+  const rowsRemaining = Math.max(0, requiredRows - rows);
+  const modelLabel = autoStatus.current_model_label || metadata.model_name || 'Kronos-base';
+  const modelVersion = autoStatus.current_model_version || modelLabel;
+  const candidateVersion = autoStatus.candidate_model_version || autoStatus.active_model_path || 'No candidate model';
+  const promotionStatus = autoStatus.promotion_status || 'not_ready';
+  const action = autoStatus.action || 'idle';
+  const interval = Number(autoStatus.auto_finetune_interval_minutes || 5);
+  const latestDatasetTs = autoStatus.latest_dataset_timestamp_utc || autoStatus.latest_websocket_timestamp_utc;
+  const rowTarget = requiredRows > 0 ? `${fmtCount(rows)} / ${fmtCount(requiredRows)}` : fmtCount(rows);
+
+  const html = `
+    <div class="panel-head">
+      <div>
+        <h2>Model Version</h2>
+        <p>Running ${escapeHtml(modelVersion)} for ${escapeHtml(autoStatus.symbol || metadata.epic || 'ETHUSD')} ${escapeHtml(autoStatus.resolution || metadata.resolution || 'MINUTE_5')}</p>
+      </div>
+      <div class="status-strip">${chip(promotionStatus)}${chip(action)}</div>
+    </div>
+    <div class="model-status-grid">
+      <div>
+        <div class="model-version-title">${escapeHtml(modelLabel)}</div>
+        <div class="model-progress-sub">Candidate: ${escapeHtml(candidateVersion)}</div>
+      </div>
+      <div class="model-progress-area">
+        <div class="progress-row"><span>Next promotion</span><strong>${fmtNumber(progressPct, 2)}%</strong></div>
+        <div class="progress-track" aria-label="Next model promotion progress">
+          <div class="progress-fill" style="width: ${progressPct}%;"></div>
+        </div>
+        <div class="model-progress-sub">${rowTarget} five-minute rows loaded, ${fmtCount(rowsRemaining)} remaining. Split: ${fmtCount(websocketRows)} websocket + ${fmtCount(historicalRows)} historical/current.</div>
+      </div>
+    </div>
+    <div class="model-metrics">
+      ${modelStat('Interval', `${Number.isFinite(interval) ? interval : 5} min`)}
+      ${modelStat('Latest 5m Row', fmtDate(latestDatasetTs))}
+      ${modelStat('Latest Websocket Row', fmtDate(autoStatus.latest_websocket_timestamp_utc))}
+      ${modelStat('Last Check', fmtDate(autoStatus.last_checked_utc))}
+    </div>`;
+
+  const key = [
+    modelVersion,
+    candidateVersion,
+    promotionStatus,
+    action,
+    rows,
+    requiredRows,
+    websocketRows,
+    historicalRows,
+    progressPct,
+    latestDatasetTs || '',
+    autoStatus.latest_websocket_timestamp_utc || '',
+    autoStatus.last_checked_utc || '',
+    interval,
+  ].join('|');
+  if (key !== lastModelStatusKey) {
+    setHtmlIfChanged($('modelStatusPanel'), html);
+    lastModelStatusKey = key;
+  }
+}
+
+function currentStatusQuery() {
+  const params = new URLSearchParams();
+  params.set('symbol', $('market').value || 'ETHUSD');
+  params.set('resolution', $('resolution').value || 'MINUTE');
+  return params.toString();
+}
+
+function getSignalQuery(page = 1) {
+  const params = new URLSearchParams();
+  params.set('symbol', $('market').value || 'ETHUSD');
+  if (signalFilters.timeframe) params.set('timeframe', signalFilters.timeframe);
+  if (signalFilters.direction) params.set('direction', signalFilters.direction);
+  if (signalFilters.status) params.set('status', signalFilters.status);
+  if (signalFilters.signalId) params.set('signal_id', signalFilters.signalId);
+  if (signalFilters.dateFrom) params.set('date_from', signalFilters.dateFrom);
+  if (signalFilters.dateTo) params.set('date_to', signalFilters.dateTo);
+  params.set('page', String(page));
+  params.set('page_size', String(signalPageSize));
+  return params.toString();
+}
+
+function readSignalFiltersFromUi() {
+  const timeframeEl = $('signalsTimeframe');
+  const dateFromEl = $('signalsDateFrom');
+  const dateToEl = $('signalsDateTo');
+  const directionEl = $('signalsDirection');
+  const statusEl = $('signalsStatus');
+  const signalIdEl = $('signalsSignalId');
+  if (!timeframeEl) return;
+  signalFilters = {
+    timeframe: timeframeEl.value || '',
+    dateFrom: dateFromEl.value || '',
+    dateTo: dateToEl.value || '',
+    direction: directionEl.value || '',
+    status: statusEl.value || '',
+    signalId: signalIdEl.value || '',
+  };
+}
+
+async function refreshSignals(page = 1, options = {}) {
+  const { renderUi = true, forceRender = false } = options;
+  try {
+    const res = await fetch(`/api/signals?${getSignalQuery(page)}`, { cache: 'no-store' });
+    latestSignals = await res.json();
+    signalPage = latestSignals.pagination?.page || page;
+    if (renderUi && (forceRender || !isSignalsFilterInteracting())) {
+      renderOverview({ force: forceRender, background: false });
+    }
+  } catch (err) {
+    showToast(`Signals refresh failed: ${err.message}`);
+  }
+}
+
+function renderOverview(options = {}) {
+  const { force = false, background = false } = options;
+  const pg = latest.postgres_snapshot || {};
+  const warnings = latest.status_warnings || [];
+  const workerStates = pg.worker_statuses || {};
   const outcomes = (pg.outcomes || []).map(r => `${escapeHtml(r.status)}: ${escapeHtml(r.count)}`).join(' | ') || 'No outcomes yet';
+  const rows = latestSignals.rows || [];
+  const pag = latestSignals.pagination || { page: 1, total: 0, total_pages: 1, has_prev: false, has_next: false };
+  const pageButtons = buildSignalPaginationButtons(pag.page || 1, pag.total_pages || 1);
+  const workerCards = Object.entries(workerStates)
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, state]) => `<article class="worker-item"><div class="worker-name">${escapeHtml(name)}</div><div>${chip(state?.status || 'MISSING')}</div><div class="tiny-help">${state?.updated_at ? `Updated ${escapeHtml(fmtDate(state.updated_at))}` : 'No heartbeat yet'}</div></article>`)
+    .join('');
 
-  $('overview').innerHTML = `
-    <div class="panel-header"><div><h2>Signal Engine Overview</h2><p class="muted">Live operational view of forecast generation, persistence, and validation.</p></div>${badge(signal)}</div>
-    <div class="table-wrap"><table><thead><tr><th>Generated</th><th>Signal</th><th>Direction</th><th>Confidence</th><th>Move</th><th>Status</th></tr></thead><tbody>${signalRows}</tbody></table></div>
-    <p><b>Latest forecast:</b> ${escapeHtml(m.forecast_start_timestamp || 'n/a')} to ${escapeHtml(m.forecast_end_timestamp || 'n/a')}</p>
-    <p><b>Outcome mix:</b> ${escapeHtml(outcomes)}</p>`;
+  const bodyRows = rows.length
+    ? rows.map(r => `<tr>
+        <td>
+          <div>${escapeHtml(r.signal_id || '')}<button class="mini-copy" data-copy="${escapeHtml(r.signal_id || '')}" data-copy-label="signal id">Copy</button></div>
+          <div class="tiny-help">Run: ${escapeHtml(r.run_id || '')}<button class="mini-copy" data-copy="${escapeHtml(r.run_id || '')}" data-copy-label="run id">Copy</button></div>
+        </td>
+        <td>${fmtDate(r.timestamp_utc)}</td>
+        <td>${escapeHtml(r.resolution || '')}</td>
+        <td>${chip(r.signal)}</td>
+        <td>${r.shadow_signal ? `${chip(r.shadow_signal)}<div class="tiny-help">${escapeHtml(r.shadow_model_name || 'shadow')} ${pct01(r.shadow_confidence)}</div>` : '<span class="muted">n/a</span>'}</td>
+        <td>${chip(r.status)}</td>
+        <td>${chip(r.run_status || '')}</td>
+        <td>${escapeHtml(String((Number(r.outcomes_wins || 0) + Number(r.outcomes_losses || 0))))}/${escapeHtml(String((Number(r.outcomes_wins || 0) + Number(r.outcomes_losses || 0) + Number(r.outcomes_pending || 0))))}</td>
+        <td>${fmtNumber(r.entry_price)}</td>
+        <td>${fmtNumber(r.tp_price)}</td>
+        <td>${fmtNumber(r.sl_price)}</td>
+        <td>${pct01(r.confidence)}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="12"><div class="empty">No signals found for current filters.</div></td></tr>';
 
-  $('validation').innerHTML = `<div class="panel-header"><h2>Validation Payload</h2>${badge(v.quality_status || 'PENDING')}</div><pre>${escapeHtml(JSON.stringify(v, null, 2))}</pre>`;
-  $('risk').innerHTML = `<div class="panel-header"><h2>Forecast Confidence / Risk</h2>${badge(v.movement_after_cost_warning ? 'Cost Warning' : 'Cost Clear')}</div><pre>${escapeHtml(JSON.stringify(v.trading_usefulness || {}, null, 2))}</pre><p><b>Input rows:</b> ${escapeHtml(v.input_rows_used || m.input_rows_used || 'n/a')}/512</p><p><b>Analysis only:</b> no execution logic.</p>`;
-  $('files').innerHTML = `<div class="panel-header"><h2>Generated Files</h2><span class="badge info">Artifacts</span></div><div class="table-wrap"><table><thead><tr><th>Type</th><th>Path</th></tr></thead><tbody>${Object.entries(data.files || {}).map(([k,p]) => p ? `<tr><td>${escapeHtml(k)}</td><td><a target="_blank" href="/file?path=${encodeURIComponent(p)}">${escapeHtml(p)}</a></td></tr>` : '').join('') || '<tr><td colspan="2">No files found.</td></tr>'}</tbody></table></div>`;
-  $('history').innerHTML = `<div class="panel-header"><h2>Run History</h2><span class="badge info">${(db.recent_runs || []).length} DB runs</span></div>${renderHistory(data, db)}`;
-  $('baselines').innerHTML = `<div class="panel-header"><h2>Baselines</h2><span class="badge info">Comparisons</span></div><pre>${escapeHtml(JSON.stringify(data.baseline_summary || {}, null, 2))}</pre>`;
-  drawCloseChart(); drawCandleChart();
+  const warningHtml = warnings.length
+    ? `<div class="warning-stack">${warnings.map(w => `<div class="warning-item">${escapeHtml(w)}</div>`).join('')}</div>`
+    : '';
+
+  const overviewHtml = `
+    <div class="panel-head">
+      <div>
+        <h2>Signals Table</h2>
+        <p>Filter old and new signals by timeframe, date, direction, status, and signal id.</p>
+      </div>
+      <span class="chip info">${escapeHtml(String(pag.total || 0))} records</span>
+    </div>
+
+    ${warningHtml}
+
+    <div class="worker-grid">${workerCards || '<div class="empty">Worker states unavailable.</div>'}</div>
+
+    <div class="control-grid" style="grid-template-columns: repeat(6, minmax(0, 1fr)); margin-bottom: 10px;">
+      <label class="field">Timeframe
+        <select id="signalsTimeframe">
+          <option value="" ${signalFilters.timeframe === '' ? 'selected' : ''}>All</option>
+          <option value="MINUTE" ${signalFilters.timeframe === 'MINUTE' ? 'selected' : ''}>MINUTE</option>
+          <option value="MINUTE_5" ${signalFilters.timeframe === 'MINUTE_5' ? 'selected' : ''}>MINUTE_5</option>
+          <option value="MINUTE_15" ${signalFilters.timeframe === 'MINUTE_15' ? 'selected' : ''}>MINUTE_15</option>
+          <option value="MINUTE_30" ${signalFilters.timeframe === 'MINUTE_30' ? 'selected' : ''}>MINUTE_30</option>
+          <option value="HOUR" ${signalFilters.timeframe === 'HOUR' ? 'selected' : ''}>HOUR</option>
+        </select>
+      </label>
+      <label class="field">Date From (Asia/Amman)
+        <input id="signalsDateFrom" type="date" value="${escapeHtml(signalFilters.dateFrom)}" title="Dates are interpreted in Asia/Amman timezone.">
+      </label>
+      <label class="field">Date To (Asia/Amman)
+        <input id="signalsDateTo" type="date" value="${escapeHtml(signalFilters.dateTo)}" title="Dates are interpreted in Asia/Amman timezone.">
+      </label>
+      <label class="field">Direction
+        <select id="signalsDirection">
+          <option value="" ${signalFilters.direction === '' ? 'selected' : ''}>All</option>
+          <option value="UP" ${signalFilters.direction === 'UP' ? 'selected' : ''}>UP</option>
+          <option value="DOWN" ${signalFilters.direction === 'DOWN' ? 'selected' : ''}>DOWN</option>
+          <option value="FLAT" ${signalFilters.direction === 'FLAT' ? 'selected' : ''}>FLAT</option>
+        </select>
+      </label>
+      <label class="field">Status
+        <select id="signalsStatus">
+          <option value="" ${signalFilters.status === '' ? 'selected' : ''}>All</option>
+          <option value="PENDING" ${signalFilters.status === 'PENDING' ? 'selected' : ''}>PENDING</option>
+          <option value="PARTIAL" ${signalFilters.status === 'PARTIAL' ? 'selected' : ''}>PARTIAL (run)</option>
+          <option value="VALIDATED" ${signalFilters.status === 'VALIDATED' ? 'selected' : ''}>VALIDATED (run)</option>
+          <option value="WIN" ${signalFilters.status === 'WIN' ? 'selected' : ''}>WIN</option>
+          <option value="LOSS" ${signalFilters.status === 'LOSS' ? 'selected' : ''}>LOSS</option>
+        </select>
+      </label>
+      <label class="field">Signal ID <input id="signalsSignalId" value="${escapeHtml(signalFilters.signalId)}" autocomplete="off"></label>
+    </div>
+
+    <div class="tiny-help">Press Esc to reset all signal filters instantly.</div>
+
+    <div class="actions" style="grid-template-columns: repeat(2, minmax(0, 1fr)); margin-bottom: 10px;">
+      <button id="signalsApply" class="btn-alt">Apply Filters</button>
+      <button id="signalsReset" class="btn-warn">Reset Filters</button>
+    </div>
+
+    <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px;">
+      <label class="field" style="min-width: 120px; max-width: 180px; margin: 0;">
+        Rows / Page
+        <select id="signalsPageSize">
+          <option value="20" ${signalPageSize === 20 ? 'selected' : ''}>20</option>
+          <option value="50" ${signalPageSize === 50 ? 'selected' : ''}>50</option>
+          <option value="100" ${signalPageSize === 100 ? 'selected' : ''}>100</option>
+        </select>
+      </label>
+      <button id="signalsFirst" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_prev ? '' : 'disabled'}>First</button>
+      <button id="signalsPrev" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_prev ? '' : 'disabled'}>Prev</button>
+      <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">${pageButtons}</div>
+      <button id="signalsNext" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_next ? '' : 'disabled'}>Next</button>
+      <button id="signalsLast" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_next ? '' : 'disabled'}>Last</button>
+    </div>
+
+    <p class="muted">Page ${escapeHtml(String(pag.page || 1))} / ${escapeHtml(String(pag.total_pages || 1))} | ${escapeHtml(String(pag.total || 0))} total rows | Outcome mix: ${escapeHtml(outcomes)}</p>
+
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr><th>Signal ID / Run ID</th><th>Generated</th><th>Timeframe</th><th>Active</th><th>Shadow</th><th>Status</th><th>Run</th><th>Validated / Total</th><th>Entry</th><th>TP</th><th>SL</th><th>Confidence</th></tr>
+        </thead>
+        <tbody>${bodyRows}</tbody>
+      </table>
+    </div>`;
+
+  if (!force && background) {
+    const now = Date.now();
+    if (now - lastOverviewRenderAtMs < OVERVIEW_BACKGROUND_RENDER_INTERVAL_MS) {
+      return;
+    }
+  }
+
+  if (!force && overviewHtml === lastOverviewHtml) {
+    return;
+  }
+
+  $('overview').innerHTML = overviewHtml;
+  lastOverviewHtml = overviewHtml;
+  lastOverviewRenderAtMs = Date.now();
+}
+
+function renderValidation(data) {
+  const v = data.validation || {};
+  const source = data.validation_source || 'none';
+  const matchedCandles = Number(v.matched_candles || 0);
+  const accuracyHint = matchedCandles < 20
+    ? `Low sample size (${matchedCandles}) - direction accuracy is noisy.`
+    : `Sample size ${matchedCandles} - direction accuracy is more reliable.`;
+  const rows = [
+    ['Source', source],
+    ['Quality', v.quality_status],
+    ['Direction', v.forecast_direction],
+    ['Matched candles', v.matched_candles],
+    ['Direction accuracy', v.direction_accuracy_pct === undefined || v.direction_accuracy_pct === null ? 'n/a' : `${fmtNumber(v.direction_accuracy_pct, 2)}%`],
+    ['Direction accuracy hint', accuracyHint],
+    ['MAE', fmtNumber(v.mae)],
+    ['RMSE', fmtNumber(v.rmse)],
+    ['MAPE', v.mape_pct === undefined || v.mape_pct === null ? 'n/a' : `${fmtNumber(v.mape_pct, 3)}%`],
+    ['Expected move', v.max_abs_close_move_pct === undefined || v.max_abs_close_move_pct === null ? 'n/a' : `${fmtNumber(v.max_abs_close_move_pct, 3)}%`],
+  ];
+
+  $('validation').innerHTML = `
+    <div class="panel-head">
+      <div>
+        <h2>Validation Summary</h2>
+        <p>Readable quality metrics for the latest run without parsing raw JSON manually.</p>
+      </div>
+      ${chip(v.quality_status || 'PENDING')}
+    </div>
+
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+      ${rows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
+    </tbody></table></div>
+
+    <details style="margin-top: 10px;">
+      <summary class="muted">Show raw validation payload</summary>
+      <pre>${escapeHtml(JSON.stringify(v, null, 2))}</pre>
+    </details>`;
+}
+
+function renderRisk(data) {
+  const hs = data.human_summary || {};
+  const v = data.validation || {};
+
+  $('risk').innerHTML = `
+    <div class="panel-head">
+      <div>
+        <h2>Trade-Level Summary</h2>
+        <p>Entry, target, stop, confidence, and risk notes for the latest signal.</p>
+      </div>
+      ${chip(hs.signal_status || 'PENDING')}
+    </div>
+
+    <div class="table-wrap"><table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>
+      <tr><td>Signal</td><td>${escapeHtml(hs.signal || 'n/a')}</td></tr>
+      <tr><td>Entry Price</td><td>${fmtNumber(hs.entry_price)}</td></tr>
+      <tr><td>Take Profit (TP)</td><td>${fmtNumber(hs.tp_price)}</td></tr>
+      <tr><td>Stop Loss (SL)</td><td>${fmtNumber(hs.sl_price)}</td></tr>
+      <tr><td>Confidence</td><td>${hs.confidence_pct === null || hs.confidence_pct === undefined ? 'n/a' : `${fmtNumber(hs.confidence_pct, 2)}%`}</td></tr>
+      <tr><td>Expected Move</td><td>${v.max_abs_close_move_pct === undefined || v.max_abs_close_move_pct === null ? 'n/a' : `${fmtNumber(v.max_abs_close_move_pct, 3)}%`}</td></tr>
+      <tr><td>Cost Warning</td><td>${v.movement_after_cost_warning ? 'Yes' : 'No'}</td></tr>
+    </tbody></table></div>`;
+}
+
+function renderBaselines(data) {
+  const entries = Object.entries(data.baseline_summary || {});
+  const rows = entries.length
+    ? entries.map(([name, value]) => `<tr>
+      <td>${escapeHtml(name)}</td>
+      <td>${escapeHtml(value.forecast_direction || 'n/a')}</td>
+      <td>${escapeHtml(value.quality_status || 'n/a')}</td>
+      <td>${value.direction_accuracy_pct === undefined || value.direction_accuracy_pct === null ? 'n/a' : `${fmtNumber(value.direction_accuracy_pct, 2)}%`}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="4">No baseline reports yet.</td></tr>';
+
+  $('baselines').innerHTML = `
+    <div class="panel-head"><h2>Baselines</h2><span class="chip info">${entries.length} reports</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Baseline</th><th>Direction</th><th>Quality</th><th>Direction Accuracy</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+function renderFiles(data) {
+  const rows = Object.entries(data.files || {})
+    .map(([k, p]) => p ? `<tr><td>${escapeHtml(k)}</td><td><a target="_blank" href="/file?path=${encodeURIComponent(p)}">${escapeHtml(p)}</a></td></tr>` : '')
+    .join('');
+
+  $('files').innerHTML = `
+    <div class="panel-head"><h2>Generated Files</h2><span class="chip info">Artifacts</span></div>
+    <div class="table-wrap"><table><thead><tr><th>Type</th><th>Path</th></tr></thead><tbody>${rows || '<tr><td colspan="2">No files found.</td></tr>'}</tbody></table></div>`;
 }
 
 function renderHistory(data, db) {
-  const fileRows = (data.history || []).map(r => `<tr><td>${escapeHtml(r.generated_at_local || '')}</td><td>${escapeHtml(r.forecast_start || '')}<br>${escapeHtml(r.forecast_end || '')}</td><td>${escapeHtml(r.resolution || '')}</td><td>${escapeHtml(r.direction || '')}</td><td>${escapeHtml(r.quality_status || '')}</td><td>${r.forecast_path ? `<a target="_blank" href="/file?path=${encodeURIComponent(r.forecast_path)}">CSV</a>` : ''}</td></tr>`).join('');
-  const dbRows = (db.recent_runs || []).map(r => `<tr><td>${escapeHtml(r.run_id || '')}<br><span class="muted">${escapeHtml(r.epic || '')} ${escapeHtml(r.resolution || '')}</span></td><td>${escapeHtml(r.forecast_start_timestamp_utc || '')}<br>${escapeHtml(r.forecast_end_timestamp_utc || '')}</td><td>${badge(r.run_status)}</td><td>${escapeHtml(r.signal || '')}</td><td>${escapeHtml(r.wins || 0)}</td><td>${escapeHtml(r.losses || 0)}</td><td>${escapeHtml(r.pending || 0)}</td></tr>`).join('');
+  const fileRows = (data.history || []).map(r => `<tr>
+    <td>${fmtDate(r.generated_at_local)}</td>
+    <td>${fmtDate(r.forecast_start)}<br>${fmtDate(r.forecast_end)}</td>
+    <td>${escapeHtml(r.resolution || '')}</td>
+    <td>${escapeHtml(r.direction || '')}</td>
+    <td>${escapeHtml(r.quality_status || '')}</td>
+    <td>${r.forecast_path ? `<a target="_blank" href="/file?path=${encodeURIComponent(r.forecast_path)}">CSV</a>` : ''}</td>
+  </tr>`).join('');
+
+  const dbRows = (db.recent_runs || []).map(r => `<tr>
+    <td>${escapeHtml(r.signal_id || r.run_id || '')}<br><span class="muted">${escapeHtml(r.epic || '')} ${escapeHtml(r.resolution || '')}</span></td>
+    <td>${fmtDate(r.forecast_start_timestamp_utc)}<br>${fmtDate(r.forecast_end_timestamp_utc)}</td>
+    <td>${chip(r.run_status)}</td>
+    <td>${chip(r.signal_status || r.signal || '')}</td>
+    <td>${escapeHtml(r.wins || 0)}</td>
+    <td>${escapeHtml(r.losses || 0)}</td>
+    <td>${escapeHtml(r.pending || 0)}</td>
+  </tr>`).join('');
+
   return `
-    <h3>File Artifacts</h3><div class="table-wrap"><table><thead><tr><th>Generated</th><th>Window</th><th>Resolution</th><th>Direction</th><th>Quality</th><th>Forecast</th></tr></thead><tbody>${fileRows || '<tr><td colspan="6">No file history found.</td></tr>'}</tbody></table></div>
-    <h3>PostgreSQL Runs</h3><div class="table-wrap"><table><thead><tr><th>Run</th><th>Window UTC</th><th>Status</th><th>Signal</th><th>WIN</th><th>LOSS</th><th>PENDING</th></tr></thead><tbody>${dbRows || '<tr><td colspan="7">No DB run history found.</td></tr>'}</tbody></table></div>`;
+    <h3>File Artifact History</h3>
+    <div class="table-wrap"><table><thead><tr><th>Generated</th><th>Window</th><th>Resolution</th><th>Direction</th><th>Quality</th><th>Forecast</th></tr></thead><tbody>${fileRows || '<tr><td colspan="6">No file history found.</td></tr>'}</tbody></table></div>
+    <h3 style="margin-top: 14px;">Database Run History</h3>
+    <div class="table-wrap"><table><thead><tr><th>Run / Signal</th><th>Window</th><th>Run Status</th><th>Signal Status</th><th>WIN</th><th>LOSS</th><th>PENDING</th></tr></thead><tbody>${dbRows || '<tr><td colspan="7">No DB run history found.</td></tr>'}</tbody></table></div>`;
 }
 
-async function refreshStatus() {
-  try {
-    const res = await fetch('/api/status');
-    const data = await res.json();
-    render(data);
-    if (!$('autoPredict').checked || autoPredictBusy) return;
-    const currentInputEnd = data.metadata?.input_end_timestamp || null;
-    if (!lastAutoInputEnd) { lastAutoInputEnd = currentInputEnd; return; }
-    const forecastEnd = data.metadata?.forecast_end_timestamp ? Date.parse(data.metadata.forecast_end_timestamp) : null;
-    const forecastExpired = forecastEnd && Date.now() > forecastEnd;
-    if ((currentInputEnd && currentInputEnd !== lastAutoInputEnd) || forecastExpired) {
-      autoPredictBusy = true;
-      try {
-        await runPrediction();
-        const after = await (await fetch('/api/status')).json();
-        lastAutoInputEnd = after.metadata?.input_end_timestamp || currentInputEnd;
-      } finally { autoPredictBusy = false; }
+function renderActiveTabContent(options = {}) {
+  const { background = false, forceOverview = false } = options;
+  if (activeTab === 'overview') {
+    if (!isSignalsFilterInteracting()) {
+      renderOverview({ background, force: forceOverview });
     }
+    return;
+  }
+  if (activeTab === 'validation') {
+    renderValidation(latest);
+    return;
+  }
+  if (activeTab === 'risk') {
+    renderRisk(latest);
+    return;
+  }
+  if (activeTab === 'baselines') {
+    renderBaselines(latest);
+    return;
+  }
+  if (activeTab === 'history') {
+    const db = latest.prediction_db || {};
+    $('history').innerHTML = `<div class="panel-head"><h2>History</h2><span class="chip info">${(db.recent_runs || []).length} DB runs</span></div>${renderHistory(latest, db)}`;
+    return;
+  }
+  if (activeTab === 'files') {
+    renderFiles(latest);
+  }
+}
+
+function render(data, options = {}) {
+  const { background = false, forceOverview = false } = options;
+  latest = data;
+  const m = data.metadata || {};
+  const v = data.validation || {};
+  const db = data.prediction_db || {};
+  const pg = data.postgres_snapshot || {};
+  const hs = data.human_summary || {};
+  const latestSignal = (pg.signals || [])[0] || {};
+  const postgresOk = pg.postgres?.ok === true;
+  const titleSymbol = data.selected_symbol || $('market').value || 'ETHUSD';
+  const resolvedPrice = resolveLatestPrice(data);
+  const titlePriceTime = resolveLatestPriceTime(data);
+  const titleText = resolvedPrice === null ? `${titleSymbol} --` : `${titleSymbol} ${fmtNumber(resolvedPrice, 2)}`;
+  const titleTooltip = titlePriceTime ? `Updated ${fmtDate(titlePriceTime)}` : 'Live quote unavailable';
+  setTextIfChanged($('titlePrice'), titleText);
+  setTitleIfChanged($('titlePrice'), titleTooltip);
+  const browserTitle = `${titleText} | Kronos Signal Dashboard`;
+  if (document.title !== browserTitle) {
+    document.title = browserTitle;
+  }
+
+  const runtimeHtml = postgresOk ? chip('PostgreSQL OK') : chip('PostgreSQL Offline');
+  const runtimeKey = postgresOk ? 'ok' : 'offline';
+  if (runtimeKey !== lastRuntimeStatusKey) {
+    setHtmlIfChanged($('runtimeStatus'), runtimeHtml);
+    lastRuntimeStatusKey = runtimeKey;
+  }
+
+  const heartbeatStates = Object.entries(pg.worker_statuses || {})
+    .sort((a, b) => a[0].localeCompare(b[0]))
+    .map(([name, state]) => `${name}:${String(state?.status || 'MISSING').toUpperCase()}`)
+    .join('|');
+  const heartbeatHtml = renderHeartbeat(pg);
+  if (heartbeatStates !== lastHeartbeatStatusKey) {
+    setHtmlIfChanged($('heartbeatStatus'), heartbeatHtml);
+    lastHeartbeatStatusKey = heartbeatStates;
+  }
+
+  const websocketHealthLabel = hs.websocket_stale_alert ? 'websocket stale' : 'websocket fresh';
+  const heroMetaHtml = [
+    chip(hs.signal || latestSignal.signal || 'n/a'),
+    chip(hs.signal_status || latestSignal.status || 'PENDING'),
+    chip(v.forecast_direction || 'Direction pending'),
+    chip(postgresOk ? 'PostgreSQL OK' : 'PostgreSQL Offline'),
+    chip(hs.live_source || 'no_live_source'),
+    chip(websocketHealthLabel),
+    `<span class="chip info">${escapeHtml(data.selected_resolution || m.resolution || latestSignal.resolution || 'MINUTE')}</span>`,
+  ].join('');
+  const heroMetaKey = [
+    hs.signal || latestSignal.signal || 'n/a',
+    hs.signal_status || latestSignal.status || 'PENDING',
+    v.forecast_direction || 'Direction pending',
+    postgresOk ? 'ok' : 'offline',
+    hs.live_source || 'no_live_source',
+    websocketHealthLabel,
+    data.selected_resolution || m.resolution || latestSignal.resolution || 'MINUTE',
+  ].join('|');
+  if (heroMetaKey !== lastHeroMetaKey) {
+    setHtmlIfChanged($('heroMeta'), heroMetaHtml);
+    lastHeroMetaKey = heroMetaKey;
+  }
+
+  renderModelStatus(data.auto_finetune || {}, m);
+
+  const summaryCardsHtml = [
+    kpi('Current Price', resolvedPrice === null ? 'n/a' : fmtNumber(resolvedPrice), titlePriceTime ? `Updated: ${fmtDate(titlePriceTime)}` : 'Latest stored candle close'),
+    kpi('Signal', hs.signal || 'n/a', `Status: ${hs.signal_status || 'PENDING'}`),
+    kpi('Entry / TP / SL', `${fmtNumber(hs.entry_price)} / ${fmtNumber(hs.tp_price)} / ${fmtNumber(hs.sl_price)}`, 'Trade levels'),
+    kpi('Confidence', hs.confidence_pct === null || hs.confidence_pct === undefined ? 'n/a' : `${fmtNumber(hs.confidence_pct, 2)}%`, 'Model confidence'),
+    kpi('Last Prediction', fmtDate(hs.last_prediction_time), hs.last_prediction_run_id ? `Run: ${hs.last_prediction_run_id}` : 'No run id'),
+    kpi('Last Auto Prediction', fmtDate(hs.last_auto_prediction_time), 'Scheduler heartbeat timestamp'),
+    kpi('Win Rate', db.win_rate_pct === null || db.win_rate_pct === undefined ? 'n/a' : `${Number(db.win_rate_pct).toFixed(2)}%`, `${db.wins ?? 0} WIN / ${db.losses ?? 0} LOSS`),
+    kpi('Pending Candles', db.pending ?? 0, 'Awaiting actual candle close'),
+  ].join('');
+  const summaryCardsKey = [
+    resolvedPrice === null ? 'n/a' : fmtNumber(resolvedPrice),
+    titlePriceTime || '',
+    hs.signal || 'n/a',
+    hs.signal_status || 'PENDING',
+    fmtNumber(hs.entry_price),
+    fmtNumber(hs.tp_price),
+    fmtNumber(hs.sl_price),
+    hs.confidence_pct === null || hs.confidence_pct === undefined ? 'n/a' : fmtNumber(hs.confidence_pct, 2),
+    hs.last_prediction_time || '',
+    hs.last_prediction_run_id || '',
+    hs.last_auto_prediction_time || '',
+    db.win_rate_pct === null || db.win_rate_pct === undefined ? 'n/a' : Number(db.win_rate_pct).toFixed(2),
+    String(db.pending ?? 0),
+  ].join('|');
+  if (summaryCardsKey !== lastSummaryCardsKey) {
+    setHtmlIfChanged($('summaryCards'), summaryCardsHtml);
+    lastSummaryCardsKey = summaryCardsKey;
+  }
+
+  renderActiveTabContent({ background, forceOverview });
+
+  drawCloseChart();
+  drawCandleChart();
+}
+
+function resolutionToMs(resolution) {
+  const map = {
+    MINUTE: 60 * 1000,
+    MINUTE_5: 5 * 60 * 1000,
+    MINUTE_15: 15 * 60 * 1000,
+    MINUTE_30: 30 * 60 * 1000,
+    HOUR: 60 * 60 * 1000,
+    HOUR_4: 4 * 60 * 60 * 1000,
+    DAY: 24 * 60 * 60 * 1000,
+    WEEK: 7 * 24 * 60 * 60 * 1000,
+  };
+  return map[resolution] || 60 * 1000;
+}
+
+function candleClosedBucket(resolution) {
+  const ms = resolutionToMs(resolution);
+  return Math.floor(Date.now() / ms) - 1;
+}
+
+async function maybeAutoPredict() {
+  if (!$('autoPredict').checked || autoPredictBusy) return;
+  const resolution = $('resolution').value || 'MINUTE';
+  const closedBucket = candleClosedBucket(resolution);
+
+  if (lastAutoPredictClosedBucket === null) {
+    lastAutoPredictClosedBucket = closedBucket;
+    return;
+  }
+
+  if (closedBucket > lastAutoPredictClosedBucket) {
+    lastAutoPredictClosedBucket = closedBucket;
+    autoPredictBusy = true;
+    try {
+      await runPrediction({ auto: true, silent: true });
+    } finally {
+      autoPredictBusy = false;
+    }
+  }
+}
+
+async function refreshStatus(options = {}) {
+  const { showSpinner = false, background = false } = options;
+  if (refreshInFlight) return;
+  refreshInFlight = true;
+  try {
+    if (showSpinner) showLoader('Refreshing dashboard...');
+    const res = await fetch(`/api/status?${currentStatusQuery()}`, { cache: 'no-store' });
+    const data = await res.json();
+    await refreshSignals(signalPage, { renderUi: false });
+    render(data, { background, forceOverview: false });
+    await maybeAutoPredict();
   } catch (err) {
     showToast(`Status refresh failed: ${err.message}`);
+  } finally {
+    refreshInFlight = false;
+    if (showSpinner) hideLoader();
   }
 }
 
-async function postJson(url, payload={}) {
-  const res = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-  const data = await res.json();
-  $('log').textContent = data.output || data.error || JSON.stringify(data, null, 2);
-  if (data.report_url) {
-    $('reportFrame').src = data.report_url;
-    $('reportFrame').classList.remove('hidden');
-    $('reportLink').innerHTML = `<a target="_blank" href="${data.report_url}">Open generated report</a>`;
+async function postJson(url, payload = {}, options = {}) {
+  const {
+    loaderText = 'Working...',
+    withLoader = true,
+    silent = false,
+  } = options;
+  if (withLoader) showLoader(loaderText);
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const data = await res.json();
+    if (!silent) {
+      $('log').textContent = data.output || data.error || JSON.stringify(data, null, 2);
+    }
+    if (data.report_url) {
+      $('reportFrame').src = data.report_url;
+      $('reportFrame').classList.remove('hidden');
+      $('reportLink').innerHTML = `<a target="_blank" href="${data.report_url}">Open generated report</a>`;
+    }
+    await refreshStatus();
+    return data;
+  } finally {
+    if (withLoader) hideLoader();
   }
-  await refreshStatus();
-  return data;
 }
 
-async function runPrediction() {
-  setBusy(true, 'Running');
-  $('log').textContent = 'Running prediction...';
+async function runPrediction(options = {}) {
+  const auto = options.auto === true;
+  const silent = options.silent === true;
+  if (!auto) {
+    setBusy(true, 'Running');
+    $('log').textContent = 'Running prediction...';
+  }
+
   try {
     await postJson('/api/predict', {
-      market:$('market').value, resolution:$('resolution').value, pred_len:Number($('predLen').value),
-      lookback:Number($('lookback').value), feature_set:$('featureSet').value, repair_ohlc:$('repairOhlc').checked
+      market: $('market').value,
+      resolution: $('resolution').value,
+      pred_len: Number($('predLen').value),
+      lookback: Number($('lookback').value),
+      feature_set: $('featureSet').value,
+      repair_ohlc: $('repairOhlc').checked,
+    }, {
+      loaderText: auto ? 'Auto prediction at candle close...' : 'Running prediction...',
+      withLoader: !auto,
+      silent: auto || silent,
     });
-    setTab('forecast');
-    showToast('Prediction complete');
+
+    if (!auto) showToast('Prediction complete');
   } catch (err) {
-    $('log').textContent = err.message;
-    showToast(`Prediction failed: ${err.message}`);
+    if (!auto) {
+      $('log').textContent = err.message;
+      showToast(`Prediction failed: ${err.message}`);
+    } else {
+      console.warn('Auto prediction failed', err);
+    }
   } finally {
-    setBusy(false);
+    if (!auto) setBusy(false);
   }
 }
 
 function setupAutoRefresh() {
   if (refreshTimer) clearInterval(refreshTimer);
   const seconds = Number($('autoRefresh').value);
-  if (seconds > 0) refreshTimer = setInterval(refreshStatus, seconds * 1000);
+  if (seconds > 0) {
+    refreshTimer = setInterval(() => {
+      if (document.visibilityState === 'visible') refreshStatus({ background: true });
+    }, seconds * 1000);
+  }
 }
 
-document.querySelectorAll('.tab').forEach(b => b.addEventListener('click', () => setTab(b.dataset.tab)));
-$('predict').addEventListener('click', runPrediction);
-$('refresh').addEventListener('click', () => { refreshStatus(); showToast('Dashboard refreshed'); });
-$('fetchActual').addEventListener('click', () => postJson('/api/fetch-actual').then(() => showToast('Actual fetch finished')));
-$('validateActual').addEventListener('click', () => postJson('/api/validate-actual').then(() => showToast('Validation finished')));
-$('baselines').addEventListener('click', () => postJson('/api/baselines').then(() => showToast('Baseline run finished')));
+document.addEventListener('click', async event => {
+  const target = event.target;
+  if (!target || !(target instanceof HTMLElement)) return;
+
+  if (target.dataset.copy) {
+    const text = String(target.dataset.copy || '').trim();
+    if (text) {
+      try {
+        await navigator.clipboard.writeText(text);
+        showToast(`Copied ${target.dataset.copyLabel || 'value'}: ${text}`);
+      } catch (err) {
+        showToast(`Copy failed: ${err.message}`);
+      }
+    }
+  }
+
+  if (target.id === 'signalsApply') {
+    readSignalFiltersFromUi();
+    signalPage = 1;
+    await refreshSignals(signalPage, { forceRender: true });
+  }
+
+  if (target.id === 'signalsReset') {
+    signalFilters = {
+      timeframe: '',
+      dateFrom: '',
+      dateTo: '',
+      direction: '',
+      status: '',
+      signalId: '',
+    };
+    signalPage = 1;
+    await refreshSignals(signalPage, { forceRender: true });
+  }
+
+  if (target.id === 'signalsFirst') {
+    readSignalFiltersFromUi();
+    signalPage = 1;
+    await refreshSignals(signalPage, { forceRender: true });
+  }
+
+  if (target.id === 'signalsLast') {
+    readSignalFiltersFromUi();
+    const totalPages = Math.max(1, Number(latestSignals.pagination?.total_pages || 1));
+    signalPage = totalPages;
+    await refreshSignals(signalPage, { forceRender: true });
+  }
+
+  if (target.id === 'signalsPrev' && latestSignals.pagination?.has_prev) {
+    readSignalFiltersFromUi();
+    await refreshSignals(Math.max(1, signalPage - 1), { forceRender: true });
+  }
+
+  if (target.id === 'signalsNext' && latestSignals.pagination?.has_next) {
+    readSignalFiltersFromUi();
+    await refreshSignals(signalPage + 1, { forceRender: true });
+  }
+
+  const numberedPageButton = target.closest('[data-signal-page]');
+  if (numberedPageButton instanceof HTMLElement) {
+    const page = Number(numberedPageButton.dataset.signalPage || 0);
+    if (Number.isFinite(page) && page >= 1) {
+      readSignalFiltersFromUi();
+      await refreshSignals(page, { forceRender: true });
+    }
+  }
+});
+
+document.addEventListener('change', async event => {
+  const target = event.target;
+  if (!target || !(target instanceof HTMLElement)) return;
+
+  if (SIGNAL_FILTER_AUTO_APPLY_IDS.has(target.id)) {
+    readSignalFiltersFromUi();
+    signalPage = 1;
+    await refreshSignals(signalPage, { forceRender: true });
+    return;
+  }
+
+  if (target.id === 'signalsPageSize' && target instanceof HTMLSelectElement) {
+    const parsed = Number(target.value || 20);
+    signalPageSize = [20, 50, 100].includes(parsed) ? parsed : 20;
+    readSignalFiltersFromUi();
+    signalPage = 1;
+    await refreshSignals(signalPage, { forceRender: true });
+  }
+});
+
+document.addEventListener('input', event => {
+  const target = event.target;
+  if (!target || !(target instanceof HTMLElement)) return;
+  if (target.id !== 'signalsSignalId') return;
+
+  readSignalFiltersFromUi();
+  signalPage = 1;
+  clearTimeout(signalIdFilterDebounceTimer);
+  signalIdFilterDebounceTimer = setTimeout(() => {
+    refreshSignals(signalPage, { forceRender: true });
+  }, 300);
+});
+
+document.addEventListener('focusout', event => {
+  const target = event.target;
+  if (!target || !(target instanceof HTMLElement)) return;
+  if (!SIGNAL_FILTER_CONTROL_IDS.has(target.id)) return;
+  setTimeout(() => {
+    if (activeTab === 'overview' && !isSignalsFilterInteracting()) {
+      renderOverview();
+    }
+  }, 0);
+});
+
+document.addEventListener('keydown', async event => {
+  if (event.key !== 'Escape') return;
+  const overviewPanel = $('overview');
+  if (!overviewPanel || overviewPanel.classList.contains('hidden')) return;
+  const active = document.activeElement;
+  if (active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {
+    active.blur();
+  }
+  signalFilters = {
+    timeframe: '',
+    dateFrom: '',
+    dateTo: '',
+    direction: '',
+    status: '',
+    signalId: '',
+  };
+  signalPage = 1;
+  await refreshSignals(signalPage, { forceRender: true });
+  showToast('Signal filters reset');
+});
+
+document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => setTab(button.dataset.tab)));
+
+$('predict').addEventListener('click', () => runPrediction());
+$('refresh').addEventListener('click', () => refreshStatus({ showSpinner: true }));
+$('fetchActual').addEventListener('click', () => postJson('/api/fetch-actual', {}, { loaderText: 'Fetching actual candles...' }).then(() => showToast('Actual fetch finished')));
+$('validateActual').addEventListener('click', () => postJson('/api/validate-actual', {}, { loaderText: 'Validating actuals...' }).then(() => showToast('Validation finished')));
+$('baselines').addEventListener('click', () => postJson('/api/baselines', {}, { loaderText: 'Running baselines...' }).then(() => showToast('Baselines complete')));
+
 $('autoRefresh').addEventListener('change', setupAutoRefresh);
-$('autoPredict').addEventListener('change', () => { lastAutoInputEnd = latest.metadata?.input_end_timestamp || null; });
-window.addEventListener('resize', () => { drawCloseChart(); drawCandleChart(); });
-refreshStatus(); setupAutoRefresh();
+$('autoPredict').addEventListener('change', () => { lastAutoPredictClosedBucket = null; });
+$('market').addEventListener('change', () => {
+  signalPage = 1;
+  refreshStatus();
+});
+$('resolution').addEventListener('change', () => {
+  lastAutoPredictClosedBucket = null;
+  signalPage = 1;
+  refreshStatus();
+});
+
+window.addEventListener('resize', () => {
+  drawCloseChart();
+  drawCandleChart();
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshStatus();
+});
+
+signalFilters.timeframe = '';
+setupAutoRefresh();
+refreshStatus({ showSpinner: true });
 </script>
 </body>
 </html>"""

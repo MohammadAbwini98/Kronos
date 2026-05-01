@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
 from typing import Literal
@@ -112,12 +113,28 @@ def load_settings(env_override: str | None = None) -> BridgeSettings:
     )
 
 
-def configure_logging(level: int = logging.INFO) -> None:
+def configure_logging(level: int = logging.INFO, service_name: str | None = None) -> None:
+    handlers: list[logging.Handler] = [RichHandler(markup=True, rich_tracebacks=True, show_path=False)]
+    if service_name:
+        output_dir = Path(os.getenv("CAPITAL_OUTPUT_DIR", "output"))
+        log_dir = Path(os.getenv("CAPITAL_LOG_DIR", str(output_dir / "logs")))
+        log_dir.mkdir(parents=True, exist_ok=True)
+        max_bytes = int(os.getenv("CAPITAL_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
+        backup_count = int(os.getenv("CAPITAL_LOG_BACKUP_COUNT", "5"))
+        file_handler = RotatingFileHandler(
+            log_dir / f"{service_name}.log",
+            maxBytes=max(1024, max_bytes),
+            backupCount=max(1, backup_count),
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handlers.append(file_handler)
     logging.basicConfig(
         level=level,
         format="%(message)s",
         datefmt="[%X]",
-        handlers=[RichHandler(markup=True, rich_tracebacks=True, show_path=False)],
+        handlers=handlers,
+        force=True,
     )
 
 

@@ -6,7 +6,8 @@ from pathlib import Path
 
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
-from kronos_mapper import save_kronos_csv
+from db import connect
+from kronos_mapper import KRONOS_COLUMNS, save_kronos_csv
 import pandas as pd
 from prediction_store import upsert_ohlcv_df
 from time_utils import format_local_timestamp
@@ -32,6 +33,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", default=None, help="Actual candles CSV path. Defaults to timestamped output file.")
     parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN. Defaults to POSTGRES_DSN.")
     parser.add_argument("--buffer-candles", type=int, default=2, help="Fetch extra candles around the forecast window, then trim locally.")
+    parser.add_argument(
+        "--allow-partial",
+        action="store_true",
+        help="Allow fetching partial actual window up to now for incremental validation.",
+    )
     return parser.parse_args()
 
 
@@ -53,6 +59,54 @@ def _shift_timestamp(value: str, resolution: str, candles: int) -> str:
     return shifted.strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _expected_timestamps(start_ts: pd.Timestamp, end_ts: pd.Timestamp, resolution: str) -> set[pd.Timestamp]:
+    return set(pd.date_range(start_ts, end_ts, freq=f"{RESOLUTION_TO_MINUTES[resolution]}min", tz="UTC"))
+
+
+def _covers_required_window(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, resolution: str) -> bool:
+    if df.empty:
+        return False
+    available = set(pd.to_datetime(df["timestamps"], utc=True))
+    return _expected_timestamps(start_ts, end_ts, resolution).issubset(available)
+
+
+def _load_actuals_from_db(
+    *,
+    symbol: str,
+    epic: str,
+    resolution: str,
+    price_side: str,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    dsn: str | None,
+) -> pd.DataFrame:
+    try:
+        with connect(dsn) as conn:
+            rows = conn.execute(
+                """
+                SELECT timestamp_utc AS timestamps, open, high, low, close, volume, amount
+                FROM ohlcv_candles
+                WHERE symbol = %s
+                  AND epic = %s
+                  AND resolution = %s
+                  AND price_side = %s
+                  AND timestamp_utc >= %s
+                  AND timestamp_utc <= %s
+                ORDER BY timestamp_utc
+                """,
+                (symbol, epic, resolution, price_side, start_ts.isoformat(), end_ts.isoformat()),
+            ).fetchall()
+    except Exception:  # noqa: BLE001 - REST fallback keeps the command useful without PostgreSQL.
+        return pd.DataFrame(columns=KRONOS_COLUMNS)
+    df = pd.DataFrame(rows, columns=KRONOS_COLUMNS)
+    if df.empty:
+        return df
+    df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
+    for column in KRONOS_COLUMNS[1:]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+    return df.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+
+
 def main() -> None:
     configure_logging()
     args = parse_args()
@@ -67,52 +121,86 @@ def main() -> None:
     forecast_end = _capital_utc_timestamp(forecast_end_raw)
     forecast_end_ts = pd.to_datetime(metadata["forecast_end_timestamp"], utc=True)
     now_utc = pd.Timestamp.now(tz="UTC")
-    if forecast_end_ts > now_utc:
+    if forecast_end_ts > now_utc and not args.allow_partial:
         raise RuntimeError(
             f"Forecast window has not completed yet. forecast_end={forecast_end_ts}, now_utc={now_utc}. "
             "Run this script after the forecast period has passed."
         )
+    effective_end_ts = min(forecast_end_ts, now_utc) if args.allow_partial else forecast_end_ts
     timestamp = _metadata_timestamp(metadata_path)
 
     settings = load_settings(args.env)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
-    client = CapitalRestClient(settings)
-    client.authenticate()
-    df = client.get_historical_prices(
-        epic=epic,
-        resolution=resolution,
-        max_points=int(metadata.get("forecast_rows", 0)) + (args.buffer_candles * 2) + 10,
-        from_utc=_shift_timestamp(forecast_start_raw, resolution, -args.buffer_candles),
-        to_utc=_shift_timestamp(forecast_end_raw, resolution, args.buffer_candles),
-        price_side=price_side,
-        save_outputs=False,
-        min_rows=1,
-    )
     start_ts = pd.to_datetime(forecast_start_raw, utc=True)
-    end_ts = pd.to_datetime(forecast_end_raw, utc=True)
-    df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
-    df = df[(df["timestamps"] >= start_ts) & (df["timestamps"] <= end_ts)].copy()
-    if df.empty:
-        raise RuntimeError("Fetched actual candle buffer but no candles matched the forecast window after trimming.")
+    end_ts = effective_end_ts
     output = (
         Path(args.output)
         if args.output
         else settings.output_dir / f"actual_for_forecast_{safe_epic_for_filename(epic)}_{resolution}_{timestamp}.csv"
     )
-    save_kronos_csv(df, output, min_rows=1)
-    stored_rows = upsert_ohlcv_df(
-        df,
-        symbol=metadata.get("symbol") or epic,
+    symbol = metadata.get("symbol") or epic
+    db_df = _load_actuals_from_db(
+        symbol=symbol,
         epic=epic,
         resolution=resolution,
         price_side=price_side,
-        source="actual_validation",
+        start_ts=start_ts,
+        end_ts=end_ts,
         dsn=args.postgres_dsn,
     )
+    can_reuse_db = (args.allow_partial and not db_df.empty) or _covers_required_window(db_df, start_ts, end_ts, resolution)
+    if can_reuse_db:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        save_kronos_csv(db_df, output, min_rows=1)
+        print("\nActual candles reused from PostgreSQL")
+        print(f"Epic: {epic}")
+        print(f"Resolution: {resolution}")
+        print(f"Forecast window: {format_local_timestamp(forecast_start_raw)} -> {format_local_timestamp(forecast_end_raw)}")
+        print(f"Fetched through: {format_local_timestamp(effective_end_ts)}")
+        print(f"Partial mode: {args.allow_partial}")
+        print(f"Rows: {len(db_df)}")
+        print(f"Actual CSV: {output}")
+        return
+
+    client = CapitalRestClient(settings)
+    client.authenticate()
+    to_anchor = str(effective_end_ts) if args.allow_partial else forecast_end_raw
+    to_buffer = 0 if args.allow_partial else args.buffer_candles
+    df = client.get_historical_prices(
+        epic=epic,
+        resolution=resolution,
+        max_points=int(metadata.get("forecast_rows", 0)) + (args.buffer_candles * 2) + 10,
+        from_utc=_shift_timestamp(forecast_start_raw, resolution, -args.buffer_candles),
+        to_utc=_shift_timestamp(to_anchor, resolution, to_buffer),
+        price_side=price_side,
+        save_outputs=False,
+        min_rows=1,
+    )
+    df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
+    df = df[(df["timestamps"] >= start_ts) & (df["timestamps"] <= end_ts)].copy()
+    if df.empty and not args.allow_partial:
+        raise RuntimeError("Fetched actual candle buffer but no candles matched the forecast window after trimming.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if df.empty:
+        pd.DataFrame(columns=KRONOS_COLUMNS).to_csv(output, index=False)
+        stored_rows = 0
+    else:
+        save_kronos_csv(df, output, min_rows=1)
+        stored_rows = upsert_ohlcv_df(
+            df,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+            source="actual_validation",
+            dsn=args.postgres_dsn,
+        )
     print("\nActual candles fetched")
     print(f"Epic: {epic}")
     print(f"Resolution: {resolution}")
     print(f"Forecast window: {format_local_timestamp(forecast_start_raw)} -> {format_local_timestamp(forecast_end_raw)}")
+    print(f"Fetched through: {format_local_timestamp(effective_end_ts)}")
+    print(f"Partial mode: {args.allow_partial}")
     print(f"Rows: {len(df)}")
     print(f"PostgreSQL actual candles upserted: {stored_rows}")
     print(f"Actual CSV: {output}")

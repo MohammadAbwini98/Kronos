@@ -14,6 +14,53 @@ class KronosMappingError(ValueError):
     """Raised when Capital.com data cannot be mapped into Kronos schema."""
 
 
+def _first_present(payload: dict[str, Any], *keys: str) -> Any:
+    for key in keys:
+        if key in payload and payload[key] not in (None, ""):
+            return payload[key]
+    return None
+
+
+def _coerce_ws_number(value: Any) -> float:
+    if isinstance(value, dict):
+        mid = value.get("mid") or value.get("MID") or value.get("value") or value.get("VALUE")
+        if mid is not None:
+            return float(mid)
+        bid = value.get("bid") or value.get("BID")
+        ask = value.get("ask") or value.get("ASK")
+        if bid is not None and ask is not None:
+            return (float(bid) + float(ask)) / 2.0
+        if bid is not None:
+            return float(bid)
+        if ask is not None:
+            return float(ask)
+        raise KronosMappingError("Cannot parse numeric value from nested websocket price object")
+    return float(value)
+
+
+def _coerce_ws_timestamp(value: Any) -> pd.Timestamp:
+    if value is None:
+        raise KronosMappingError("WebSocket OHLC payload missing timestamp")
+    if isinstance(value, (int, float)):
+        ivalue = int(value)
+        unit = "ms" if abs(ivalue) > 10_000_000_000 else "s"
+        return pd.to_datetime(ivalue, unit=unit, utc=True)
+    text = str(value).strip()
+    if text.isdigit():
+        ivalue = int(text)
+        unit = "ms" if abs(ivalue) > 10_000_000_000 else "s"
+        return pd.to_datetime(ivalue, unit=unit, utc=True)
+    return pd.to_datetime(text, utc=True)
+
+
+def _mid_from_pair(payload: dict[str, Any], bid_key: str, ask_key: str) -> float | None:
+    bid = _first_present(payload, bid_key, bid_key.lower())
+    ask = _first_present(payload, ask_key, ask_key.lower())
+    if bid is None or ask is None:
+        return None
+    return (_coerce_ws_number(bid) + _coerce_ws_number(ask)) / 2.0
+
+
 def _price_value(price: dict[str, Any] | None, side: str) -> float:
     if not isinstance(price, dict):
         raise KronosMappingError("Missing price object in Capital.com price payload")
@@ -66,15 +113,33 @@ def capital_prices_to_kronos_df(raw_prices: Any, price_side: str = "mid", min_ro
 
 def ws_ohlc_to_kronos_row(event_payload: dict[str, Any]) -> dict[str, Any]:
     payload = event_payload.get("payload", event_payload)
-    for key in ("t", "o", "h", "l", "c"):
-        if key not in payload:
-            raise KronosMappingError(f"WebSocket OHLC payload missing {key!r}")
+    if not isinstance(payload, dict):
+        raise KronosMappingError("WebSocket OHLC payload must be an object")
+
+    ts_raw = _first_present(payload, "t", "T", "utm", "UTM", "timestamp", "TIMESTAMP", "snapshotTimeUTC", "snapshotTime")
+    open_raw = _first_present(payload, "o", "O", "open", "OPEN", "openPrice", "OPEN_PRICE")
+    high_raw = _first_present(payload, "h", "H", "high", "HIGH", "highPrice", "HIGH_PRICE")
+    low_raw = _first_present(payload, "l", "L", "low", "LOW", "lowPrice", "LOW_PRICE")
+    close_raw = _first_present(payload, "c", "C", "close", "CLOSE", "closePrice", "CLOSE_PRICE")
+
+    if open_raw is None:
+        open_raw = _mid_from_pair(payload, "BID_OPEN", "OFR_OPEN")
+    if high_raw is None:
+        high_raw = _mid_from_pair(payload, "BID_HIGH", "OFR_HIGH")
+    if low_raw is None:
+        low_raw = _mid_from_pair(payload, "BID_LOW", "OFR_LOW")
+    if close_raw is None:
+        close_raw = _mid_from_pair(payload, "BID_CLOSE", "OFR_CLOSE")
+
+    if ts_raw is None or open_raw is None or high_raw is None or low_raw is None or close_raw is None:
+        raise KronosMappingError(f"WebSocket OHLC payload missing required fields; keys={sorted(payload.keys())}")
+
     return {
-        "timestamps": pd.to_datetime(int(payload["t"]), unit="ms", utc=True),
-        "open": float(payload["o"]),
-        "high": float(payload["h"]),
-        "low": float(payload["l"]),
-        "close": float(payload["c"]),
+        "timestamps": _coerce_ws_timestamp(ts_raw),
+        "open": _coerce_ws_number(open_raw),
+        "high": _coerce_ws_number(high_raw),
+        "low": _coerce_ws_number(low_raw),
+        "close": _coerce_ws_number(close_raw),
         "volume": 0.0,
         "amount": 0.0,
     }

@@ -120,6 +120,30 @@ def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
 
 
+def _model_dir_ready(path: Path | None) -> bool:
+    if path is None or not path.is_dir():
+        return False
+    return (path / "config.json").exists() and (path / "model.safetensors").exists()
+
+
+def _auto_finetuned_model_dir(output_dir: Path) -> Path | None:
+    status_path = output_dir / "auto_finetune_status.json"
+    if not status_path.exists():
+        return None
+    try:
+        payload = json.loads(status_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    candidate = payload.get("active_model_path")
+    if not candidate:
+        return None
+    promotion_status = str(payload.get("promotion_status") or "").strip().lower()
+    if promotion_status not in {"approved", "promoted"}:
+        return None
+    model_path = Path(str(candidate))
+    return model_path if _model_dir_ready(model_path) else None
+
+
 def _infer_epic(input_csv: Path, resolution: str) -> str:
     stem = input_csv.stem
     prefix = "kronos_input_"
@@ -485,13 +509,18 @@ def main() -> None:
     _load_dotenv_if_present()
     args = parse_args()
     repo_dir = Path(args.repo_dir or _env("KRONOS_REPO_DIR", r"C:\AI\Kronos"))
-    model_dir = Path(args.model_dir or _env("KRONOS_MODEL_DIR", r"C:\AI\Models\Kronos\Kronos-base"))
     tokenizer_dir = Path(args.tokenizer_dir or _env("KRONOS_TOKENIZER_DIR", r"C:\AI\Models\Kronos\Kronos-Tokenizer-base"))
     device = args.device or _env("KRONOS_DEVICE", "auto")
     run_timestamp = _utc_file_timestamp()
     epic = args.epic or _infer_epic(Path(args.input), args.resolution)
     safe_epic = _safe_name(epic)
     output_dir = Path(args.output_dir)
+    configured_model_dir = Path(args.model_dir or _env("KRONOS_MODEL_DIR", r"C:\AI\Models\Kronos\Kronos-base"))
+    auto_model_dir = None
+    if args.model_dir is None:
+        auto_model_dir = _auto_finetuned_model_dir(output_dir)
+    model_dir = auto_model_dir or configured_model_dir
+    model_name = "Kronos-auto-finetuned" if auto_model_dir is not None else args.model_name
     output_csv = Path(args.output) if args.output else output_dir / f"kronos_forecast_{safe_epic}_{args.resolution}_{run_timestamp}.csv"
     metadata_output = (
         Path(args.metadata_output)
@@ -524,7 +553,7 @@ def main() -> None:
         market_name=args.market_name,
         price_side=args.price_side,
         source=args.source,
-        model_name=args.model_name,
+        model_name=model_name,
         temperature=args.temperature,
         top_p=args.top_p,
         sample_count=args.sample_count,

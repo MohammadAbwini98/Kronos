@@ -11,6 +11,12 @@ from db import connect, masked_postgres_dsn
 
 
 PREDICTION_COLUMNS = ["timestamps", "open", "high", "low", "close", "volume", "amount"]
+SOURCE_PRIORITY = {
+    "historical": 0,
+    "actual_validation": 1,
+    "latest_fetch": 2,
+    "websocket_ohlc": 3,
+}
 
 
 class PredictionStoreError(ValueError):
@@ -29,6 +35,14 @@ def _safe_float(value: Any) -> float:
     if pd.isna(value):
         return 0.0
     return float(value)
+
+
+def preferred_candle_source(existing: str | None, incoming: str | None) -> str:
+    existing_value = existing or "historical"
+    incoming_value = incoming or "historical"
+    existing_rank = SOURCE_PRIORITY.get(existing_value, -1)
+    incoming_rank = SOURCE_PRIORITY.get(incoming_value, -1)
+    return incoming_value if incoming_rank >= existing_rank else existing_value
 
 
 def _safe_symbol(metadata: dict[str, Any]) -> str:
@@ -140,13 +154,81 @@ def upsert_ohlcv_df(
                     close = EXCLUDED.close,
                     volume = EXCLUDED.volume,
                     amount = EXCLUDED.amount,
-                    source = EXCLUDED.source,
+                    source = CASE
+                        WHEN EXCLUDED.source = 'websocket_ohlc' OR ohlcv_candles.source = 'websocket_ohlc' THEN 'websocket_ohlc'
+                        WHEN EXCLUDED.source = 'latest_fetch' OR ohlcv_candles.source = 'latest_fetch' THEN 'latest_fetch'
+                        WHEN EXCLUDED.source = 'actual_validation' OR ohlcv_candles.source = 'actual_validation' THEN 'actual_validation'
+                        ELSE EXCLUDED.source
+                    END,
                     raw_payload = EXCLUDED.raw_payload,
                     updated_at = now()
                 """,
                 rows,
             )
     return len(rows)
+
+
+def upsert_live_quote(
+    *,
+    symbol: str,
+    epic: str,
+    payload: dict[str, Any],
+    provider: str = "Capital.com",
+    source: str = "websocket_quote",
+    dsn: str | None = None,
+) -> dict[str, Any]:
+    bid = payload.get("bid")
+    ask = payload.get("ofr", payload.get("ask"))
+    timestamp = payload.get("timestamp") or payload.get("t") or payload.get("utm")
+    bid_value = None if bid is None else float(bid)
+    ask_value = None if ask is None else float(ask)
+    if bid_value is not None and ask_value is not None:
+        price = (bid_value + ask_value) / 2.0
+    elif bid_value is not None:
+        price = bid_value
+    elif ask_value is not None:
+        price = ask_value
+    else:
+        raise PredictionStoreError("Live quote payload missing bid/ofr price")
+
+    timestamp_utc = None
+    if timestamp not in (None, ""):
+        numeric = int(timestamp)
+        unit = "ms" if abs(numeric) > 10_000_000_000 else "s"
+        timestamp_utc = pd.to_datetime(numeric, unit=unit, utc=True).isoformat()
+
+    with connect(dsn) as conn:
+        row = conn.execute(
+            """
+            INSERT INTO live_quotes(
+                provider, symbol, epic, bid, ask, mid, price, timestamp_utc, source, raw_payload, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT(provider, symbol, epic) DO UPDATE SET
+                bid = EXCLUDED.bid,
+                ask = EXCLUDED.ask,
+                mid = EXCLUDED.mid,
+                price = EXCLUDED.price,
+                timestamp_utc = EXCLUDED.timestamp_utc,
+                source = EXCLUDED.source,
+                raw_payload = EXCLUDED.raw_payload,
+                updated_at = now()
+            RETURNING symbol, epic, bid, ask, mid, price, timestamp_utc, source, updated_at
+            """,
+            (
+                provider,
+                symbol,
+                epic,
+                bid_value,
+                ask_value,
+                (bid_value + ask_value) / 2.0 if bid_value is not None and ask_value is not None else None,
+                price,
+                timestamp_utc,
+                source,
+                Jsonb(payload),
+            ),
+        ).fetchone()
+    return dict(row)
 
 
 def insert_raw_market_event(
@@ -233,6 +315,30 @@ def _signal_from_forecast(
     }
 
 
+def _trade_levels_from_signal(*, entry_price: float, signal: dict[str, Any], cost_threshold_pct: float) -> dict[str, float]:
+    base_move_pct = max(abs(float(signal["expected_move_pct"])), cost_threshold_pct)
+    projected_move = entry_price * (base_move_pct / 100.0)
+    risk_move = projected_move / 1.5
+    kind = str(signal["signal"])
+    if kind == "LONG":
+        return {
+            "entry_price": entry_price,
+            "tp_price": entry_price + projected_move,
+            "sl_price": entry_price - risk_move,
+        }
+    if kind == "SHORT":
+        return {
+            "entry_price": entry_price,
+            "tp_price": entry_price - projected_move,
+            "sl_price": entry_price + risk_move,
+        }
+    return {
+        "entry_price": entry_price,
+        "tp_price": entry_price,
+        "sl_price": entry_price,
+    }
+
+
 def save_prediction_run(
     metadata_path: str | Path,
     *,
@@ -260,6 +366,7 @@ def save_prediction_run(
         cost_threshold_pct=cost_threshold_pct,
         min_confidence=min_confidence,
     )
+    trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
     upsert_instrument(
         symbol=symbol,
         epic=epic,
@@ -389,20 +496,26 @@ def save_prediction_run(
         conn.execute(
             """
             INSERT INTO signals(
-                run_id, symbol, epic, resolution, timestamp_utc, signal, direction, confidence,
-                expected_move_pct, cost_threshold_pct, reason, updated_at
+                run_id, signal_id, symbol, epic, resolution, timestamp_utc, signal, direction, confidence,
+                expected_move_pct, cost_threshold_pct, entry_price, tp_price, sl_price, status, reason, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
             ON CONFLICT(run_id) DO UPDATE SET
+                signal_id = EXCLUDED.signal_id,
                 signal = EXCLUDED.signal,
                 direction = EXCLUDED.direction,
                 confidence = EXCLUDED.confidence,
                 expected_move_pct = EXCLUDED.expected_move_pct,
                 cost_threshold_pct = EXCLUDED.cost_threshold_pct,
+                entry_price = EXCLUDED.entry_price,
+                tp_price = EXCLUDED.tp_price,
+                sl_price = EXCLUDED.sl_price,
+                status = EXCLUDED.status,
                 reason = EXCLUDED.reason,
                 updated_at = now()
             """,
             (
+                run_id,
                 run_id,
                 symbol,
                 epic,
@@ -413,6 +526,9 @@ def save_prediction_run(
                 signal["confidence"],
                 signal["expected_move_pct"],
                 cost_threshold_pct,
+                trade_levels["entry_price"],
+                trade_levels["tp_price"],
+                trade_levels["sl_price"],
                 signal["reason"],
             ),
         )
@@ -420,6 +536,84 @@ def save_prediction_run(
         "dsn": masked_postgres_dsn(dsn),
         "run_id": run_id,
         "saved_records": saved,
+        "signal": signal,
+    }
+
+
+def save_shadow_prediction(
+    *,
+    active_run_id: str,
+    metadata_path: str | Path,
+    dsn: str | None = None,
+    cost_threshold_pct: float = 0.05,
+    min_confidence: float = 0.55,
+) -> dict[str, Any]:
+    metadata_source = Path(metadata_path)
+    metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
+    forecast = _load_ohlcv_csv(metadata["forecast_csv_path"], "shadow forecast")
+    last_input_close = float(metadata["last_input_close"])
+    final_close = float(forecast["close"].iloc[-1])
+    signal = _signal_from_forecast(
+        last_input_close=last_input_close,
+        final_close=final_close,
+        cost_threshold_pct=cost_threshold_pct,
+        min_confidence=min_confidence,
+    )
+    trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
+    shadow_run_id = metadata_source.stem
+    with connect(dsn) as conn:
+        conn.execute(
+            """
+            INSERT INTO signal_shadow_predictions(
+                active_run_id, shadow_run_id, model_name, model_path, generated_at_utc,
+                signal, direction, confidence, expected_move_pct, cost_threshold_pct,
+                entry_price, tp_price, sl_price, reason, metadata_path, forecast_csv_path,
+                validation_report_path, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT(active_run_id) DO UPDATE SET
+                shadow_run_id = EXCLUDED.shadow_run_id,
+                model_name = EXCLUDED.model_name,
+                model_path = EXCLUDED.model_path,
+                generated_at_utc = EXCLUDED.generated_at_utc,
+                signal = EXCLUDED.signal,
+                direction = EXCLUDED.direction,
+                confidence = EXCLUDED.confidence,
+                expected_move_pct = EXCLUDED.expected_move_pct,
+                cost_threshold_pct = EXCLUDED.cost_threshold_pct,
+                entry_price = EXCLUDED.entry_price,
+                tp_price = EXCLUDED.tp_price,
+                sl_price = EXCLUDED.sl_price,
+                reason = EXCLUDED.reason,
+                metadata_path = EXCLUDED.metadata_path,
+                forecast_csv_path = EXCLUDED.forecast_csv_path,
+                validation_report_path = EXCLUDED.validation_report_path,
+                updated_at = now()
+            """,
+            (
+                active_run_id,
+                shadow_run_id,
+                str(metadata.get("model_name", "Kronos-shadow")),
+                metadata.get("model_path"),
+                _to_utc_iso(metadata["generated_at_utc"]),
+                signal["signal"],
+                signal["direction"],
+                signal["confidence"],
+                signal["expected_move_pct"],
+                cost_threshold_pct,
+                trade_levels["entry_price"],
+                trade_levels["tp_price"],
+                trade_levels["sl_price"],
+                signal["reason"],
+                str(metadata_source),
+                str(metadata.get("forecast_csv_path") or ""),
+                str(metadata.get("validation_report_path") or ""),
+            ),
+        )
+    return {
+        "dsn": masked_postgres_dsn(dsn),
+        "active_run_id": active_run_id,
+        "shadow_run_id": shadow_run_id,
         "signal": signal,
     }
 
@@ -468,6 +662,7 @@ def update_predictions_with_actuals(
             """,
             (run_id,),
         ).fetchall()
+        total_records = len(records)
         previous_actual_close = float(run["last_input_close"])
         for record in records:
             ts = _to_utc_iso(record["timestamp_utc"])
@@ -529,8 +724,21 @@ def update_predictions_with_actuals(
                 losses += 1
             validated += 1
             previous_actual_close = actual_close
-        run_status = "VALIDATED" if pending == 0 else "PARTIAL"
+        if pending == total_records:
+            run_status = "PENDING"
+        elif pending == 0:
+            run_status = "VALIDATED"
+        else:
+            run_status = "PARTIAL"
+        if validated == 0:
+            signal_status = "PENDING"
+        else:
+            signal_status = "WIN" if wins >= losses else "LOSS"
         conn.execute("UPDATE prediction_runs SET run_status = %s, updated_at = now() WHERE run_id = %s", (run_status, run_id))
+        conn.execute(
+            "UPDATE signals SET status = %s, outcome_updated_at = now(), updated_at = now() WHERE run_id = %s",
+            (signal_status, run_id),
+        )
     total = wins + losses
     return {
         "dsn": masked_postgres_dsn(dsn),
@@ -563,7 +771,8 @@ def prediction_summary(dsn: str | None = None, limit: int = 20, db_path: str | P
             SELECT
                 r.run_id, r.symbol, r.epic, r.resolution, r.price_side, r.generated_at_utc,
                 r.forecast_start_timestamp_utc, r.forecast_end_timestamp_utc, r.run_status,
-                s.signal, s.confidence, s.expected_move_pct,
+                s.signal_id, s.signal, s.direction, s.status AS signal_status,
+                s.confidence, s.expected_move_pct, s.entry_price, s.tp_price, s.sl_price,
                 COUNT(o.id)::int AS records,
                 COALESCE(SUM(CASE WHEN o.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
                 COALESCE(SUM(CASE WHEN o.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
@@ -571,7 +780,7 @@ def prediction_summary(dsn: str | None = None, limit: int = 20, db_path: str | P
             FROM prediction_runs r
             LEFT JOIN prediction_outcomes o ON o.run_id = r.run_id
             LEFT JOIN signals s ON s.run_id = r.run_id
-            GROUP BY r.run_id, s.signal, s.confidence, s.expected_move_pct
+            GROUP BY r.run_id, s.signal_id, s.signal, s.direction, s.status, s.confidence, s.expected_move_pct, s.entry_price, s.tp_price, s.sl_price
             ORDER BY r.generated_at_utc DESC
             LIMIT %s
             """,

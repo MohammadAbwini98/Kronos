@@ -26,6 +26,49 @@ CAPITAL_DISPLAY_TIMEZONE=Asia/Amman
 
 Never commit `.env`. Do not hardcode credentials in code. Capital.com API keys may have trading privileges, and this bridge intentionally avoids trading endpoints.
 
+## Operational Environment Variables
+
+Use `.env.example` as the full reference. The most important runtime controls are:
+
+```text
+ENABLE_AUTO_FINETUNE=true
+ENABLE_MAINTENANCE_WORKER=true
+LIVE_PRICE_RESOLUTION=MINUTE
+WORKER_RESTART_MAX_ATTEMPTS=20
+WORKER_MONITOR_INTERVAL_SECONDS=5
+
+KRONOS_FINETUNE_COMMAND=
+KRONOS_AUTO_MODEL_DIR=C:\AI\Models\Kronos\Kronos-auto-finetuned
+AUTO_FINETUNE_DATASET_LIMIT=50000
+AUTO_FINETUNE_MIN_ROWS=2000
+AUTO_FINETUNE_MIN_NEW_ROWS=1000
+AUTO_FINETUNE_INTERVAL_MINUTES=15
+AUTO_FINETUNE_PROMOTION_MIN_DIRECTION_ACCURACY=55.0
+AUTO_FINETUNE_PROMOTION_MIN_MATCHED_CANDLES=20
+
+MAINTENANCE_POLL_SECONDS=60
+OUTCOME_ARCHIVE_RETENTION_DAYS=30
+OUTCOME_ARCHIVE_INTERVAL_MINUTES=60
+NIGHTLY_BACKUP_HOUR_UTC=2
+BACKUP_RETENTION_DAYS=14
+
+CAPITAL_LOG_DIR=output\logs
+CAPITAL_LOG_MAX_BYTES=5242880
+CAPITAL_LOG_BACKUP_COUNT=5
+```
+
+Auto-finetune command safety:
+
+- `KRONOS_FINETUNE_COMMAND` can be empty to disable training runs safely.
+- If configured, the command template must include both `{dataset}` and `{model_dir}` placeholders.
+- Optional placeholders `{symbol}` and `{resolution}` are also available.
+
+Example command template:
+
+```text
+KRONOS_FINETUNE_COMMAND=C:\AI\capital_kronos_data_bridge\.venv\Scripts\python.exe C:\AI\capital_kronos_data_bridge\src\main_bootstrap_auto_model.py --dataset {dataset} --model-dir {model_dir} --symbol {symbol} --resolution {resolution}
+```
+
 ## Demo vs Live
 
 - Demo REST base URL: `https://demo-api-capital.backend-capital.com/api/v1`
@@ -171,6 +214,18 @@ Dashboard features:
 - Tabs for overview, charts, candles, validation, baselines, risk, history, files, logs, and embedded report.
 - Buttons to fetch actual candles, validate actuals, and generate baseline comparisons.
 - Auto-refresh control, run history table, and local prediction database WIN/LOSS summary.
+
+## Dashboard Supervisor Behavior
+
+`start_dashboard.ps1` runs as a supervisor with startup preflight checks and managed worker restarts.
+
+- Preflight validates Python, creates output and log directories, prints active runtime config, and warns if `POSTGRES_DSN` is missing.
+- Startup runs migrations once before worker launch.
+- Managed workers are `prediction_scheduler`, `validation_worker`, `websocket_stream`, optional `auto_finetune_worker`, and optional `maintenance_worker`.
+- Worker restart policy is controlled by `WORKER_RESTART_MAX_ATTEMPTS` (default `20`).
+- Supervisor loop cadence is controlled by `WORKER_MONITOR_INTERVAL_SECONDS` (default `5`).
+- Set `ENABLE_MAINTENANCE_WORKER=false` to skip maintenance worker startup.
+- Set `ENABLE_AUTO_FINETUNE=false` to keep auto-finetune disabled without changing code.
 
 When `--output` is omitted, the runner saves timestamped artifacts:
 
