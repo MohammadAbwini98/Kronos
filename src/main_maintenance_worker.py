@@ -13,7 +13,8 @@ from typing import Any
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings
 from historical_backfill import ensure_historical_candles
-from psycopg.types.json import Jsonb
+from rate_limit_state import RateLimitCooldownError
+from service_runtime import write_heartbeat
 
 from db import connect
 
@@ -44,18 +45,7 @@ def parse_args() -> argparse.Namespace:
 
 def _heartbeat(status: str, details: dict[str, Any], dsn: str | None) -> None:
     try:
-        with connect(dsn) as conn:
-            conn.execute(
-                """
-                INSERT INTO service_heartbeats(service_name, status, details, updated_at)
-                VALUES ('maintenance_worker', %s, %s, now())
-                ON CONFLICT(service_name) DO UPDATE
-                SET status = EXCLUDED.status,
-                    details = EXCLUDED.details,
-                    updated_at = now()
-                """,
-                (status, Jsonb(details)),
-            )
+        write_heartbeat("maintenance_worker", status, details, dsn)
     except Exception:  # noqa: BLE001
         LOGGER.debug("Unable to write maintenance heartbeat", exc_info=True)
 
@@ -198,6 +188,16 @@ def _should_backup_today(*, now_utc: datetime, backup_hour_utc: int, state: dict
     return now_utc.hour >= backup_hour_utc and last_date != today
 
 
+def _resolve_backfill_market(settings: Any, args: argparse.Namespace) -> tuple[CapitalRestClient, dict[str, Any]]:
+    client = CapitalRestClient(settings)
+    client.authenticate()
+    selected = client.resolve_market(args.market, args.epic, streaming=False)
+    if not selected or not selected.get("epic"):
+        raise RuntimeError(f"Historical backfill market was not resolved for market={args.market!r} epic={args.epic!r}")
+    client.save_market_details(selected["epic"])
+    return client, selected
+
+
 def main() -> None:
     args = parse_args()
     configure_logging(service_name="maintenance_worker")
@@ -229,13 +229,8 @@ def main() -> None:
             if not args.disable_historical_backfill and ((time.time() - last_backfill_at) >= backfill_interval_seconds or args.once):
                 if str(args.resolution).upper() != "MINUTE_5":
                     raise ValueError("Maintenance historical backfill is pinned to MINUTE_5.")
-                if backfill_client is None:
-                    backfill_client = CapitalRestClient(settings)
-                    backfill_client.authenticate()
-                    backfill_selected = backfill_client.resolve_market(args.market, args.epic, streaming=False)
-                    backfill_client.save_market_details(backfill_selected["epic"])
-                if backfill_selected is None:
-                    raise RuntimeError("Historical backfill market was not resolved")
+                if backfill_client is None or backfill_selected is None:
+                    backfill_client, backfill_selected = _resolve_backfill_market(settings, args)
                 summary = ensure_historical_candles(
                     client=backfill_client,
                     selected_market=backfill_selected,
@@ -278,8 +273,9 @@ def main() -> None:
                 details["backup_copied_files"] = int(copied)
                 details["backup_old_dirs_removed"] = int(removed_dirs)
         except Exception as exc:  # noqa: BLE001
-            status = "ERROR"
+            status = "COOLDOWN" if isinstance(exc, RateLimitCooldownError) else "ERROR"
             details["error"] = str(exc)
+            details["state"] = "cooldown" if status == "COOLDOWN" else "error"
             LOGGER.exception("Maintenance worker cycle failed")
 
         _heartbeat(status, details, args.postgres_dsn)

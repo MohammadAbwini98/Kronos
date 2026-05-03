@@ -8,6 +8,16 @@ import pandas as pd
 from psycopg.types.json import Jsonb
 
 from db import connect, masked_postgres_dsn
+from forecast_scoring import (
+    DEFAULT_COST_THRESHOLD_PCT,
+    DEFAULT_FLAT_THRESHOLD_PCT,
+    DEFAULT_SCORING_VERSION,
+    direction_from_prices,
+    score_forecast_against_actuals,
+    score_signal_quality,
+    signal_status_from_counts,
+)
+from model_registry import associate_run_model_version, model_version_id_for_path, register_model_version
 
 
 PREDICTION_COLUMNS = ["timestamps", "open", "high", "low", "close", "volume", "amount"]
@@ -21,6 +31,22 @@ SOURCE_PRIORITY = {
 
 class PredictionStoreError(ValueError):
     """Raised when prediction persistence or validation cannot be completed."""
+
+
+def _ensure_scoring_version(conn: Any, *, scoring_version: str = DEFAULT_SCORING_VERSION, flat_threshold_pct: float = DEFAULT_FLAT_THRESHOLD_PCT, cost_threshold_pct: float = DEFAULT_COST_THRESHOLD_PCT) -> None:
+    conn.execute(
+        """
+        INSERT INTO forecast_scoring_versions(scoring_version, description, flat_threshold_pct, cost_threshold_pct)
+        VALUES (%s, %s, %s, %s)
+        ON CONFLICT(scoring_version) DO NOTHING
+        """,
+        (
+            scoring_version,
+            "Canonical close-direction and cost-aware signal scoring.",
+            float(flat_threshold_pct),
+            float(cost_threshold_pct),
+        ),
+    )
 
 
 def _utc_now() -> str:
@@ -51,15 +77,6 @@ def _safe_symbol(metadata: dict[str, Any]) -> str:
 
 def run_id_from_metadata_path(metadata_path: str | Path) -> str:
     return Path(metadata_path).stem.replace("forecast_metadata_", "")
-
-
-def direction_from_prices(anchor_close: float, close: float, flat_threshold_pct: float = 0.02) -> str:
-    if anchor_close == 0:
-        return "FLAT"
-    move_pct = ((close / anchor_close) - 1.0) * 100.0
-    if abs(move_pct) < flat_threshold_pct:
-        return "FLAT"
-    return "UP" if move_pct > 0 else "DOWN"
 
 
 def _load_ohlcv_csv(path: str | Path, label: str) -> pd.DataFrame:
@@ -283,35 +300,126 @@ def _metadata_utc(metadata: dict[str, Any], local_key: str, utc_key: str) -> str
     return _to_utc_iso(metadata.get(utc_key) or metadata[local_key])
 
 
+def _load_recent_volatility_pct(input_csv_path: str | None) -> float | None:
+    """Return rolling-12 close-return std-dev (in %) from the input candle CSV, or None."""
+    if not input_csv_path:
+        return None
+    try:
+        idf = pd.read_csv(input_csv_path)
+        std = idf["close"].pct_change().rolling(12, min_periods=1).std().iloc[-1]
+        return float(std) * 100.0 if pd.notna(std) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _signal_from_forecast(
     *,
     last_input_close: float,
     final_close: float,
     cost_threshold_pct: float,
     min_confidence: float,
+    forecast_closes: list[float] | None = None,
+    recent_volatility_pct: float | None = None,
 ) -> dict[str, Any]:
+    """
+    Horizon-aware, volatility-adjusted signal generation.
+
+    Replaces the terminal-close heuristic with a multi-factor engine that
+    considers the full forecast path direction consistency, volatility-normalised
+    edge, and a blended confidence score.  The output schema is backward-compatible.
+
+    Parameters
+    ----------
+    forecast_closes:
+        All forecast close prices in horizon order.  When supplied, direction
+        agreement is checked across every horizon step.  Defaults to
+        [final_close] for backward-compat callers that do not pass the full path.
+    recent_volatility_pct:
+        Recent rolling close-return std-dev in percent (e.g. from 12-bar input
+        window).  Used to normalise the expected edge so that a large move in a
+        volatile regime is not over-scored.
+    """
+    closes = list(forecast_closes) if forecast_closes else [final_close]
+    n = len(closes)
+
+    # Terminal expected move (kept as primary metric for backward-compat schema)
     if last_input_close == 0:
         expected_move_pct = 0.0
     else:
         expected_move_pct = ((final_close / last_input_close) - 1.0) * 100.0
+
     direction = "UP" if expected_move_pct > 0 else ("DOWN" if expected_move_pct < 0 else "FLAT")
     magnitude = abs(expected_move_pct)
-    confidence = min(0.99, max(0.0, magnitude / max(cost_threshold_pct * 4.0, 1e-9)))
-    if magnitude < cost_threshold_pct:
-        signal = "HOLD"
-        reason = "Expected movement is below configured cost threshold."
-    elif confidence < min_confidence:
-        signal = "HOLD"
-        reason = "Confidence is below configured minimum."
+
+    # --- Direction agreement across all forecast horizons ---
+    all_closes = [last_input_close] + closes
+    steps = [all_closes[i + 1] - all_closes[i] for i in range(n)]
+    if magnitude > 0:
+        dominant_up = expected_move_pct > 0
+        agreeing = sum(1 for s in steps if (s > 0) == dominant_up and s != 0)
     else:
-        signal = "LONG" if expected_move_pct > 0 else "SHORT"
-        reason = "Forecast movement cleared cost and confidence thresholds."
+        agreeing = 0
+    direction_agreement = agreeing / n if n > 0 else 0.0
+
+    # --- Volatility-normalised edge ---
+    # vol_floor prevents noise-dominated signals when the market is very quiet.
+    vol_floor = max(
+        recent_volatility_pct if (recent_volatility_pct and recent_volatility_pct > 0) else 0.0,
+        cost_threshold_pct * 2.0,
+        0.001,
+    )
+    vol_adjusted_edge = magnitude / vol_floor  # > 1.0 means move is larger than noise floor
+
+    # --- Blended confidence score (three components, 0–1 final) ---
+    # Component 1: edge multiples of cost threshold (0–50 pts)
+    edge_pts = min(50.0, (magnitude / max(cost_threshold_pct * 4.0, 1e-9)) * 50.0)
+    # Component 2: cross-horizon direction agreement (0–30 pts)
+    agree_pts = direction_agreement * 30.0
+    # Component 3: volatility-normalised edge bonus (0–20 pts)
+    vol_pts = min(20.0, max(0.0, (vol_adjusted_edge - 1.0) * 10.0))
+    confidence = round(min(0.99, max(0.0, (edge_pts + agree_pts + vol_pts) / 100.0)), 4)
+
+    # --- HOLD conditions ---
+    if magnitude < cost_threshold_pct:
+        return {
+            "signal": "HOLD",
+            "direction": direction,
+            "confidence": confidence,
+            "expected_move_pct": expected_move_pct,
+            "reason": "Expected movement is below configured cost threshold.",
+        }
+
+    if n > 1 and direction_agreement < 0.5:
+        return {
+            "signal": "HOLD",
+            "direction": direction,
+            "confidence": confidence,
+            "expected_move_pct": expected_move_pct,
+            "reason": (
+                f"Horizon direction disagrees "
+                f"({direction_agreement:.0%} agreement across {n} horizons)."
+            ),
+        }
+
+    if confidence < min_confidence:
+        return {
+            "signal": "HOLD",
+            "direction": direction,
+            "confidence": confidence,
+            "expected_move_pct": expected_move_pct,
+            "reason": "Confidence is below configured minimum.",
+        }
+
     return {
-        "signal": signal,
+        "signal": "LONG" if expected_move_pct > 0 else "SHORT",
         "direction": direction,
         "confidence": confidence,
         "expected_move_pct": expected_move_pct,
-        "reason": reason,
+        "reason": (
+            f"Forecast cleared cost ({magnitude:.3f}%), "
+            f"direction ({direction_agreement:.0%} agreement across {n} horizons), "
+            "and confidence thresholds."
+        ),
     }
 
 
@@ -365,7 +473,27 @@ def save_prediction_run(
         final_close=final_close,
         cost_threshold_pct=cost_threshold_pct,
         min_confidence=min_confidence,
+        forecast_closes=list(forecast["close"]),
+        recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
     )
+    data_quality = metadata.get("data_quality") or {}
+    data_quality_grade = data_quality.get("quality_grade")
+    model_name = str(metadata.get("model_name", "Kronos"))
+    model_path = metadata.get("model_path") or ""
+    tokenizer_path = metadata.get("tokenizer_path")
+    model_version = register_model_version(
+        model_version_id=metadata.get("model_version_id"),
+        model_name=model_name,
+        model_path=str(model_path or model_name),
+        tokenizer_path=tokenizer_path,
+        symbol=symbol,
+        resolution=str(metadata["resolution"]),
+        lookback=int(metadata.get("input_rows_used") or metadata.get("lookback") or 512),
+        pred_len=int(metadata.get("forecast_rows") or 12),
+        promotion_status="pending_review",
+        dsn=dsn,
+    )
+    model_version_id = model_version["model_version_id"]
     trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
     upsert_instrument(
         symbol=symbol,
@@ -377,6 +505,7 @@ def save_prediction_run(
         dsn=dsn,
     )
     with connect(dsn) as conn:
+        _ensure_scoring_version(conn, scoring_version=DEFAULT_SCORING_VERSION, flat_threshold_pct=flat_threshold_pct, cost_threshold_pct=cost_threshold_pct)
         conn.execute(
             """
             INSERT INTO prediction_runs(
@@ -386,7 +515,7 @@ def save_prediction_run(
                 forecast_start_timestamp_utc, forecast_end_timestamp_utc,
                 input_rows_used, forecast_rows, forecast_horizon_minutes, last_input_close,
                 metadata_path, input_csv_path, forecast_csv_path, validation_report_path,
-                run_status, updated_at
+                scoring_version, data_quality_grade, model_version_id, run_status, updated_at
             )
             VALUES (
                 %(run_id)s, %(provider)s, %(symbol)s, %(epic)s, %(market_name)s, %(resolution)s, %(price_side)s, %(source_provider)s,
@@ -394,7 +523,7 @@ def save_prediction_run(
                 %(input_start)s, %(input_end)s, %(forecast_start)s, %(forecast_end)s,
                 %(input_rows_used)s, %(forecast_rows)s, %(forecast_horizon_minutes)s, %(last_input_close)s,
                 %(metadata_path)s, %(input_csv_path)s, %(forecast_csv_path)s, %(validation_report_path)s,
-                'PENDING', now()
+                %(scoring_version)s, %(data_quality_grade)s, %(model_version_id)s, 'PENDING', now()
             )
             ON CONFLICT(run_id) DO UPDATE SET
                 forecast_rows = EXCLUDED.forecast_rows,
@@ -404,6 +533,9 @@ def save_prediction_run(
                 input_csv_path = EXCLUDED.input_csv_path,
                 forecast_csv_path = EXCLUDED.forecast_csv_path,
                 validation_report_path = EXCLUDED.validation_report_path,
+                scoring_version = EXCLUDED.scoring_version,
+                data_quality_grade = EXCLUDED.data_quality_grade,
+                model_version_id = EXCLUDED.model_version_id,
                 updated_at = now()
             """,
             {
@@ -415,9 +547,9 @@ def save_prediction_run(
                 "resolution": metadata["resolution"],
                 "price_side": price_side,
                 "source_provider": provider,
-                "model_name": metadata.get("model_name", "Kronos"),
-                "model_path": metadata.get("model_path"),
-                "tokenizer_path": metadata.get("tokenizer_path"),
+                "model_name": model_name,
+                "model_path": model_path,
+                "tokenizer_path": tokenizer_path,
                 "generated_at_utc": _to_utc_iso(metadata["generated_at_utc"]),
                 "input_start": _metadata_utc(metadata, "input_start_timestamp", "input_start_timestamp_utc"),
                 "input_end": _metadata_utc(metadata, "input_end_timestamp", "input_end_timestamp_utc"),
@@ -431,6 +563,9 @@ def save_prediction_run(
                 "input_csv_path": str(metadata.get("input_csv_path") or ""),
                 "forecast_csv_path": str(metadata.get("forecast_csv_path") or ""),
                 "validation_report_path": str(metadata.get("validation_report_path") or ""),
+                "scoring_version": DEFAULT_SCORING_VERSION,
+                "data_quality_grade": data_quality_grade,
+                "model_version_id": model_version_id,
             },
         )
         anchor_close = last_input_close
@@ -497,9 +632,10 @@ def save_prediction_run(
             """
             INSERT INTO signals(
                 run_id, signal_id, symbol, epic, resolution, timestamp_utc, signal, direction, confidence,
-                expected_move_pct, cost_threshold_pct, entry_price, tp_price, sl_price, status, reason, updated_at
+                expected_move_pct, cost_threshold_pct, entry_price, tp_price, sl_price,
+                scoring_version, actionable, quality_grade, status, reason, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
             ON CONFLICT(run_id) DO UPDATE SET
                 signal_id = EXCLUDED.signal_id,
                 signal = EXCLUDED.signal,
@@ -510,6 +646,9 @@ def save_prediction_run(
                 entry_price = EXCLUDED.entry_price,
                 tp_price = EXCLUDED.tp_price,
                 sl_price = EXCLUDED.sl_price,
+                scoring_version = EXCLUDED.scoring_version,
+                actionable = EXCLUDED.actionable,
+                quality_grade = EXCLUDED.quality_grade,
                 status = EXCLUDED.status,
                 reason = EXCLUDED.reason,
                 updated_at = now()
@@ -529,14 +668,19 @@ def save_prediction_run(
                 trade_levels["entry_price"],
                 trade_levels["tp_price"],
                 trade_levels["sl_price"],
+                DEFAULT_SCORING_VERSION,
+                signal["signal"] in {"LONG", "SHORT"},
+                data_quality_grade,
                 signal["reason"],
             ),
         )
+    associate_run_model_version(run_id=run_id, model_version_id=model_version_id, role="active", dsn=dsn)
     return {
         "dsn": masked_postgres_dsn(dsn),
         "run_id": run_id,
         "saved_records": saved,
         "signal": signal,
+        "model_version_id": model_version_id,
     }
 
 
@@ -547,6 +691,7 @@ def save_shadow_prediction(
     dsn: str | None = None,
     cost_threshold_pct: float = 0.05,
     min_confidence: float = 0.55,
+    shadow_model_version_id: str | None = None,
 ) -> dict[str, Any]:
     metadata_source = Path(metadata_path)
     metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
@@ -558,19 +703,37 @@ def save_shadow_prediction(
         final_close=final_close,
         cost_threshold_pct=cost_threshold_pct,
         min_confidence=min_confidence,
+        forecast_closes=list(forecast["close"]),
+        recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
     )
     trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
     shadow_run_id = metadata_source.stem
+    model_name = str(metadata.get("model_name", "Kronos-shadow"))
+    model_path = str(metadata.get("model_path") or model_name)
+    registered = register_model_version(
+        model_version_id=shadow_model_version_id or metadata.get("model_version_id"),
+        model_name=model_name,
+        model_path=model_path,
+        tokenizer_path=metadata.get("tokenizer_path"),
+        symbol=str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD"),
+        resolution=str(metadata.get("resolution") or "MINUTE_5"),
+        lookback=int(metadata.get("input_rows_used") or 512),
+        pred_len=int(metadata.get("forecast_rows") or 12),
+        promotion_status="shadow",
+        dsn=dsn,
+    )
+    shadow_model_version_id = registered["model_version_id"]
     with connect(dsn) as conn:
+        _ensure_scoring_version(conn, scoring_version=DEFAULT_SCORING_VERSION, cost_threshold_pct=cost_threshold_pct)
         conn.execute(
             """
             INSERT INTO signal_shadow_predictions(
                 active_run_id, shadow_run_id, model_name, model_path, generated_at_utc,
                 signal, direction, confidence, expected_move_pct, cost_threshold_pct,
                 entry_price, tp_price, sl_price, reason, metadata_path, forecast_csv_path,
-                validation_report_path, updated_at
+                validation_report_path, shadow_model_version_id, scoring_version, status, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', now())
             ON CONFLICT(active_run_id) DO UPDATE SET
                 shadow_run_id = EXCLUDED.shadow_run_id,
                 model_name = EXCLUDED.model_name,
@@ -588,6 +751,10 @@ def save_shadow_prediction(
                 metadata_path = EXCLUDED.metadata_path,
                 forecast_csv_path = EXCLUDED.forecast_csv_path,
                 validation_report_path = EXCLUDED.validation_report_path,
+                shadow_model_version_id = EXCLUDED.shadow_model_version_id,
+                scoring_version = EXCLUDED.scoring_version,
+                status = 'PENDING',
+                outcome_updated_at = NULL,
                 updated_at = now()
             """,
             (
@@ -608,13 +775,220 @@ def save_shadow_prediction(
                 str(metadata_source),
                 str(metadata.get("forecast_csv_path") or ""),
                 str(metadata.get("validation_report_path") or ""),
+                shadow_model_version_id,
+                DEFAULT_SCORING_VERSION,
             ),
         )
     return {
         "dsn": masked_postgres_dsn(dsn),
         "active_run_id": active_run_id,
         "shadow_run_id": shadow_run_id,
+        "shadow_model_version_id": shadow_model_version_id,
         "signal": signal,
+    }
+
+
+def _shadow_validation_summary(
+    *,
+    forecast_csv_path: str | Path,
+    actual_by_ts: dict[str, pd.Series],
+    last_input_close: float,
+    flat_threshold_pct: float,
+) -> dict[str, Any]:
+    forecast = _load_ohlcv_csv(forecast_csv_path, "shadow forecast")
+    actual = pd.DataFrame(
+        [{"timestamps": timestamp, "close": _safe_float(row["close"])} for timestamp, row in actual_by_ts.items()],
+        columns=["timestamps", "close"],
+    )
+    score = score_forecast_against_actuals(
+        forecast,
+        actual,
+        last_input_close=float(last_input_close),
+        flat_threshold_pct=flat_threshold_pct,
+    )
+    summary = score["summary"]
+    return {
+        "status": summary["status"],
+        "wins": summary["wins"],
+        "losses": summary["losses"],
+        "pending": summary["pending"],
+        "validated": summary["validated"],
+        "horizon_metrics": score["rows"],
+    }
+
+
+def _signal_status_for_primary_window(horizon_rows: list[dict[str, Any]]) -> str:
+    if not horizon_rows:
+        return "PENDING"
+    first_row = min(horizon_rows, key=lambda row: int(row.get("horizon_index") or 10**9))
+    status = str(first_row.get("status") or "PENDING").upper()
+    if status in {"WIN", "LOSS"}:
+        return status
+    return "PENDING"
+
+
+def _upsert_shadow_evaluation(conn: Any, *, active_run_id: str, shadow_summary: dict[str, Any]) -> None:
+    row = conn.execute(
+        """
+        SELECT
+            r.run_id,
+            r.symbol,
+            r.resolution,
+            r.generated_at_utc,
+            r.model_version_id AS active_model_version_id,
+            r.data_quality_grade,
+            s.signal AS active_signal,
+            s.status AS active_status,
+            shp.shadow_run_id,
+            shp.shadow_model_version_id,
+            shp.signal AS shadow_signal,
+            shp.status AS shadow_status,
+            shp.scoring_version,
+            COALESCE(SUM(CASE WHEN o.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS active_wins,
+            COALESCE(SUM(CASE WHEN o.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS active_losses
+        FROM prediction_runs r
+        JOIN signals s ON s.run_id = r.run_id
+        JOIN signal_shadow_predictions shp ON shp.active_run_id = r.run_id
+        LEFT JOIN prediction_outcomes o ON o.run_id = r.run_id
+        WHERE r.run_id = %s
+        GROUP BY r.run_id, s.signal, s.status, shp.shadow_run_id, shp.shadow_model_version_id,
+                 shp.signal, shp.status, shp.scoring_version
+        """,
+        (active_run_id,),
+    ).fetchone()
+    if not row or not row.get("shadow_model_version_id"):
+        return
+    # Use persisted signals.status (primary-window semantics) instead of recomputing
+    # from aggregate win/loss counts which use the old aggregate semantics.
+    active_status = str(row.get("active_status") or "PENDING")
+    shadow_status = str(shadow_summary.get("status") or row.get("shadow_status") or "PENDING")
+    disagreement = str(row.get("active_signal") or "") != str(row.get("shadow_signal") or "")
+    conn.execute(
+        """
+        INSERT INTO shadow_evaluations(
+            active_run_id, shadow_run_id, active_model_version_id, shadow_model_version_id,
+            scoring_version, symbol, resolution, generated_at_utc, active_signal, active_status,
+            shadow_signal, shadow_status, disagreement, active_wins, active_losses, shadow_wins,
+            shadow_losses, comparable_horizons, horizon_metrics, data_quality_grade, updated_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+        ON CONFLICT(active_run_id, shadow_model_version_id, scoring_version) DO UPDATE SET
+            active_status = EXCLUDED.active_status,
+            shadow_status = EXCLUDED.shadow_status,
+            disagreement = EXCLUDED.disagreement,
+            active_wins = EXCLUDED.active_wins,
+            active_losses = EXCLUDED.active_losses,
+            shadow_wins = EXCLUDED.shadow_wins,
+            shadow_losses = EXCLUDED.shadow_losses,
+            comparable_horizons = EXCLUDED.comparable_horizons,
+            horizon_metrics = EXCLUDED.horizon_metrics,
+            data_quality_grade = EXCLUDED.data_quality_grade,
+            updated_at = now()
+        """,
+        (
+            active_run_id,
+            row["shadow_run_id"],
+            row.get("active_model_version_id"),
+            row["shadow_model_version_id"],
+            row.get("scoring_version") or DEFAULT_SCORING_VERSION,
+            row["symbol"],
+            row["resolution"],
+            _to_utc_iso(row["generated_at_utc"]),
+            row["active_signal"],
+            active_status,
+            row["shadow_signal"],
+            shadow_status,
+            disagreement,
+            int(row.get("active_wins") or 0),
+            int(row.get("active_losses") or 0),
+            int(shadow_summary.get("wins") or 0),
+            int(shadow_summary.get("losses") or 0),
+            int(shadow_summary.get("validated") or 0),
+            Jsonb(shadow_summary.get("horizon_metrics") or {}),
+            row.get("data_quality_grade"),
+        ),
+    )
+
+
+def refresh_shadow_prediction_statuses(*, dsn: str | None = None, limit: int = 50) -> dict[str, Any]:
+    checked = updated = pending = errors = 0
+    with connect(dsn) as conn:
+        shadows = conn.execute(
+            """
+            SELECT
+                shp.active_run_id,
+                shp.forecast_csv_path,
+                r.symbol,
+                r.epic,
+                r.resolution,
+                r.price_side,
+                r.last_input_close,
+                r.forecast_start_timestamp_utc,
+                r.forecast_end_timestamp_utc
+            FROM signal_shadow_predictions shp
+            JOIN prediction_runs r ON r.run_id = shp.active_run_id
+            WHERE shp.status = 'PENDING'
+              AND r.run_status IN ('PARTIAL', 'VALIDATED')
+            ORDER BY shp.updated_at ASC
+            LIMIT %s
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+        for shadow in shadows:
+            checked += 1
+            try:
+                actual_rows = conn.execute(
+                    """
+                    SELECT timestamp_utc AS timestamps, close
+                    FROM ohlcv_candles
+                    WHERE symbol = %s
+                      AND epic = %s
+                      AND resolution = %s
+                      AND price_side = %s
+                      AND timestamp_utc >= %s
+                      AND timestamp_utc <= %s
+                    ORDER BY timestamp_utc ASC
+                    """,
+                    (
+                        shadow["symbol"],
+                        shadow["epic"],
+                        shadow["resolution"],
+                        shadow["price_side"],
+                        shadow["forecast_start_timestamp_utc"],
+                        shadow["forecast_end_timestamp_utc"],
+                    ),
+                ).fetchall()
+                actual_by_ts = {_to_utc_iso(row["timestamps"]): pd.Series({"close": row["close"]}) for row in actual_rows}
+                summary = _shadow_validation_summary(
+                    forecast_csv_path=shadow["forecast_csv_path"],
+                    actual_by_ts=actual_by_ts,
+                    last_input_close=float(shadow["last_input_close"]),
+                    flat_threshold_pct=0.02,
+                )
+                if summary["status"] == "PENDING":
+                    pending += 1
+                    continue
+                conn.execute(
+                    """
+                    UPDATE signal_shadow_predictions
+                    SET status = %s,
+                        disagreement = (signal <> (SELECT signal FROM signals WHERE signals.run_id = signal_shadow_predictions.active_run_id)),
+                        horizon_metrics = %s,
+                        outcome_updated_at = now(),
+                        updated_at = now()
+                    WHERE active_run_id = %s
+                    """,
+                    (summary["status"], Jsonb(summary.get("horizon_metrics") or {}), shadow["active_run_id"]),
+                )
+                _upsert_shadow_evaluation(conn, active_run_id=shadow["active_run_id"], shadow_summary=summary)
+                updated += 1
+            except Exception:  # noqa: BLE001
+                errors += 1
+    return {
+        "checked": checked,
+        "updated": updated,
+        "pending": pending,
+        "errors": errors,
     }
 
 
@@ -626,6 +1000,7 @@ def update_predictions_with_actuals(
     db_path: str | Path | None = None,
     dsn: str | None = None,
     flat_threshold_pct: float = 0.02,
+    scoring_version: str = DEFAULT_SCORING_VERSION,
 ) -> dict[str, Any]:
     if db_path is not None and dsn is None:
         dsn = str(db_path)
@@ -637,6 +1012,7 @@ def update_predictions_with_actuals(
     actual_by_ts = {_to_utc_iso(row["timestamps"]): row for _, row in actual.iterrows()}
     wins = losses = pending = validated = 0
     with connect(dsn) as conn:
+        _ensure_scoring_version(conn, scoring_version=scoring_version, flat_threshold_pct=flat_threshold_pct)
         run = conn.execute(
             "SELECT symbol, epic, resolution, price_side, provider, last_input_close FROM prediction_runs WHERE run_id = %s",
             (run_id,),
@@ -663,8 +1039,25 @@ def update_predictions_with_actuals(
             (run_id,),
         ).fetchall()
         total_records = len(records)
-        previous_actual_close = float(run["last_input_close"])
+        forecast_for_score = pd.DataFrame(
+            [
+                {
+                    "timestamps": record["timestamp_utc"],
+                    "close": record["close"],
+                }
+                for record in records
+            ],
+            columns=["timestamps", "close"],
+        )
+        score = score_forecast_against_actuals(
+            forecast_for_score,
+            actual,
+            last_input_close=float(run["last_input_close"]),
+            flat_threshold_pct=flat_threshold_pct,
+        )
+        score_by_horizon = {row["horizon_index"]: row for row in score["rows"]}
         for record in records:
+            score_row = score_by_horizon[int(record["horizon_index"])]
             ts = _to_utc_iso(record["timestamp_utc"])
             actual_row = actual_by_ts.get(ts)
             if actual_row is None:
@@ -677,12 +1070,46 @@ def update_predictions_with_actuals(
                     """,
                     (run_id, record["id"]),
                 )
+                conn.execute(
+                    """
+                    INSERT INTO forecast_horizon_metrics(
+                        run_id, scoring_version, horizon_index, forecast_timestamp_utc,
+                        predicted_direction, actual_direction, status, forecast_close, actual_close,
+                        close_error, close_error_pct, abs_close_error, expected_move_pct,
+                        realized_move_pct, movement_after_cost_pct, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, NULL, 'PENDING', %s, NULL, NULL, NULL, NULL, %s, NULL, NULL, now())
+                    ON CONFLICT(run_id, scoring_version, horizon_index) DO UPDATE SET
+                        forecast_timestamp_utc = EXCLUDED.forecast_timestamp_utc,
+                        predicted_direction = EXCLUDED.predicted_direction,
+                        actual_direction = EXCLUDED.actual_direction,
+                        status = EXCLUDED.status,
+                        forecast_close = EXCLUDED.forecast_close,
+                        actual_close = EXCLUDED.actual_close,
+                        close_error = EXCLUDED.close_error,
+                        close_error_pct = EXCLUDED.close_error_pct,
+                        abs_close_error = EXCLUDED.abs_close_error,
+                        expected_move_pct = EXCLUDED.expected_move_pct,
+                        realized_move_pct = EXCLUDED.realized_move_pct,
+                        movement_after_cost_pct = EXCLUDED.movement_after_cost_pct,
+                        updated_at = now()
+                    """,
+                    (
+                        run_id,
+                        scoring_version,
+                        int(record["horizon_index"]),
+                        ts,
+                        score_row["predicted_direction"] or "FLAT",
+                        score_row["forecast_close"],
+                        score_row["expected_move_pct"],
+                    ),
+                )
                 continue
-            actual_close = _safe_float(actual_row["close"])
-            actual_direction = direction_from_prices(previous_actual_close, actual_close, flat_threshold_pct)
-            status = "WIN" if actual_direction == record["predicted_direction"] else "LOSS"
-            close_error = float(record["close"]) - actual_close
-            close_error_pct = None if actual_close == 0 else (close_error / actual_close) * 100.0
+            actual_close = score_row["actual_close"]
+            actual_direction = score_row["actual_direction"]
+            status = score_row["status"]
+            close_error = score_row["close_error"]
+            close_error_pct = score_row["close_error_pct"]
             candle = conn.execute(
                 """
                 SELECT id FROM ohlcv_candles
@@ -697,6 +1124,7 @@ def update_predictions_with_actuals(
                 UPDATE prediction_outcomes
                 SET actual_candle_id = %s,
                     actual_timestamp_utc = %s,
+                    predicted_direction = %s,
                     actual_direction = %s,
                     actual_close = %s,
                     close_error = %s,
@@ -709,6 +1137,7 @@ def update_predictions_with_actuals(
                 (
                     candle["id"] if candle else None,
                     ts,
+                    score_row["predicted_direction"],
                     actual_direction,
                     actual_close,
                     close_error,
@@ -718,27 +1147,160 @@ def update_predictions_with_actuals(
                     record["id"],
                 ),
             )
+            conn.execute(
+                """
+                INSERT INTO forecast_horizon_metrics(
+                    run_id, scoring_version, horizon_index, forecast_timestamp_utc,
+                    predicted_direction, actual_direction, status, forecast_close, actual_close,
+                    close_error, close_error_pct, abs_close_error, expected_move_pct,
+                    realized_move_pct, movement_after_cost_pct, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT(run_id, scoring_version, horizon_index) DO UPDATE SET
+                    forecast_timestamp_utc = EXCLUDED.forecast_timestamp_utc,
+                    predicted_direction = EXCLUDED.predicted_direction,
+                    actual_direction = EXCLUDED.actual_direction,
+                    status = EXCLUDED.status,
+                    forecast_close = EXCLUDED.forecast_close,
+                    actual_close = EXCLUDED.actual_close,
+                    close_error = EXCLUDED.close_error,
+                    close_error_pct = EXCLUDED.close_error_pct,
+                    abs_close_error = EXCLUDED.abs_close_error,
+                    expected_move_pct = EXCLUDED.expected_move_pct,
+                    realized_move_pct = EXCLUDED.realized_move_pct,
+                    movement_after_cost_pct = EXCLUDED.movement_after_cost_pct,
+                    updated_at = now()
+                """,
+                (
+                    run_id,
+                    scoring_version,
+                    int(record["horizon_index"]),
+                    ts,
+                    score_row["predicted_direction"] or "FLAT",
+                    actual_direction,
+                    status,
+                    score_row["forecast_close"],
+                    actual_close,
+                    close_error,
+                    close_error_pct,
+                    None if close_error is None else abs(float(close_error)),
+                    score_row["expected_move_pct"],
+                    score_row["realized_move_pct"],
+                    score_row["movement_after_cost_pct"],
+                ),
+            )
             if status == "WIN":
                 wins += 1
             else:
                 losses += 1
             validated += 1
-            previous_actual_close = actual_close
         if pending == total_records:
             run_status = "PENDING"
         elif pending == 0:
             run_status = "VALIDATED"
         else:
             run_status = "PARTIAL"
-        if validated == 0:
-            signal_status = "PENDING"
-        else:
-            signal_status = "WIN" if wins >= losses else "LOSS"
+        signal_status = _signal_status_for_primary_window(score["rows"])
         conn.execute("UPDATE prediction_runs SET run_status = %s, updated_at = now() WHERE run_id = %s", (run_status, run_id))
+        signal_row = conn.execute(
+            "SELECT signal, confidence, expected_move_pct, cost_threshold_pct FROM signals WHERE run_id = %s",
+            (run_id,),
+        ).fetchone()
+        signal_quality = None
+        if signal_row:
+            signal_quality = score_signal_quality(
+                signal=signal_row["signal"],
+                confidence=float(signal_row["confidence"]),
+                expected_move_pct=float(signal_row["expected_move_pct"]),
+                cost_threshold_pct=float(signal_row["cost_threshold_pct"]),
+                scoring_summary=score["summary"],
+            )
+            conn.execute(
+                """
+                INSERT INTO signal_quality_metrics(
+                    run_id, scoring_version, signal, status, actionable, confidence,
+                    expected_move_pct, realized_move_pct, cost_threshold_pct,
+                    movement_after_cost_pct, precision_bucket, false_positive, hold_quality, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                ON CONFLICT(run_id) DO UPDATE SET
+                    scoring_version = EXCLUDED.scoring_version,
+                    signal = EXCLUDED.signal,
+                    status = EXCLUDED.status,
+                    actionable = EXCLUDED.actionable,
+                    confidence = EXCLUDED.confidence,
+                    expected_move_pct = EXCLUDED.expected_move_pct,
+                    realized_move_pct = EXCLUDED.realized_move_pct,
+                    cost_threshold_pct = EXCLUDED.cost_threshold_pct,
+                    movement_after_cost_pct = EXCLUDED.movement_after_cost_pct,
+                    precision_bucket = EXCLUDED.precision_bucket,
+                    false_positive = EXCLUDED.false_positive,
+                    hold_quality = EXCLUDED.hold_quality,
+                    updated_at = now()
+                """,
+                (
+                    run_id,
+                    scoring_version,
+                    signal_quality["signal"],
+                    signal_quality["status"],
+                    signal_quality["actionable"],
+                    signal_quality["confidence"],
+                    signal_quality["expected_move_pct"],
+                    signal_quality["realized_move_pct"],
+                    signal_quality["cost_threshold_pct"],
+                    signal_quality["movement_after_cost_pct"],
+                    signal_quality["precision_bucket"],
+                    signal_quality["false_positive"],
+                    signal_quality["hold_quality"],
+                ),
+            )
+        movement_after_cost = None if signal_quality is None else signal_quality.get("movement_after_cost_pct")
         conn.execute(
             "UPDATE signals SET status = %s, outcome_updated_at = now(), updated_at = now() WHERE run_id = %s",
             (signal_status, run_id),
         )
+        conn.execute(
+            """
+            UPDATE signals
+            SET movement_after_cost_pct = %s,
+                scoring_version = %s,
+                actionable = signal IN ('LONG','SHORT'),
+                updated_at = now()
+            WHERE run_id = %s
+            """,
+            (movement_after_cost, scoring_version, run_id),
+        )
+        shadow = conn.execute(
+            """
+            SELECT forecast_csv_path
+            FROM signal_shadow_predictions
+            WHERE active_run_id = %s
+            """,
+            (run_id,),
+        ).fetchone()
+        if shadow and shadow.get("forecast_csv_path"):
+            try:
+                shadow_summary = _shadow_validation_summary(
+                    forecast_csv_path=shadow["forecast_csv_path"],
+                    actual_by_ts=actual_by_ts,
+                    last_input_close=float(run["last_input_close"]),
+                    flat_threshold_pct=flat_threshold_pct,
+                )
+                conn.execute(
+                    """
+                    UPDATE signal_shadow_predictions
+                    SET status = %s,
+                        disagreement = (signal <> (SELECT signal FROM signals WHERE signals.run_id = signal_shadow_predictions.active_run_id)),
+                        horizon_metrics = %s,
+                        outcome_updated_at = now(),
+                        updated_at = now()
+                    WHERE active_run_id = %s
+                    """,
+                    (shadow_summary["status"], Jsonb(shadow_summary.get("horizon_metrics") or {}), run_id),
+                )
+                _upsert_shadow_evaluation(conn, active_run_id=run_id, shadow_summary=shadow_summary)
+            except Exception:  # noqa: BLE001
+                pass
     total = wins + losses
     return {
         "dsn": masked_postgres_dsn(dsn),

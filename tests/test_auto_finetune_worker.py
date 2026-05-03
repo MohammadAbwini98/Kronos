@@ -57,6 +57,8 @@ class PromotionDecisionTests(unittest.TestCase):
         self.assertIn("matched_candles_below_threshold", reason)
 
     def test_direction_accuracy_unavailable(self):
+        # With enough matched candles, accuracy=None now returns pending_evaluation
+        # so that formal evaluate_promotion() can be run with candidate evidence.
         status, reason = main_auto_finetune_worker._promotion_decision(
             model_ready=True,
             metrics={"matched_candles": 30, "direction_accuracy_pct": None},
@@ -64,9 +66,11 @@ class PromotionDecisionTests(unittest.TestCase):
             min_matched=20,
             previous_promoted_accuracy=None,
         )
-        self.assertEqual(("pending_review", "direction_accuracy_unavailable"), (status, reason))
+        self.assertEqual("pending_evaluation", status)
 
     def test_direction_accuracy_below_threshold(self):
+        # _promotion_decision no longer rejects on accuracy threshold;
+        # that decision belongs to evaluate_promotion() with candidate evidence.
         status, reason = main_auto_finetune_worker._promotion_decision(
             model_ready=True,
             metrics={"matched_candles": 30, "direction_accuracy_pct": 50.0},
@@ -74,10 +78,12 @@ class PromotionDecisionTests(unittest.TestCase):
             min_matched=20,
             previous_promoted_accuracy=None,
         )
-        self.assertEqual("pending_review", status)
-        self.assertIn("direction_accuracy_below_threshold", reason)
+        self.assertEqual("pending_evaluation", status)
+        self.assertNotEqual("approved", status)
 
     def test_direction_accuracy_not_improved(self):
+        # Even when accuracy is good, _promotion_decision returns pending_evaluation;
+        # final approval must come from evaluate_promotion().
         status, reason = main_auto_finetune_worker._promotion_decision(
             model_ready=True,
             metrics={"matched_candles": 30, "direction_accuracy_pct": 60.0},
@@ -85,10 +91,11 @@ class PromotionDecisionTests(unittest.TestCase):
             min_matched=20,
             previous_promoted_accuracy=60.0,
         )
-        self.assertEqual("pending_review", status)
-        self.assertIn("direction_accuracy_not_improved", reason)
+        self.assertNotEqual("approved", status)
 
     def test_promotion_approved(self):
+        # _promotion_decision must NEVER return 'approved'; that is now exclusively
+        # the role of evaluate_promotion() in model_registry.
         status, reason = main_auto_finetune_worker._promotion_decision(
             model_ready=True,
             metrics={"matched_candles": 30, "direction_accuracy_pct": 61.0},
@@ -96,7 +103,8 @@ class PromotionDecisionTests(unittest.TestCase):
             min_matched=20,
             previous_promoted_accuracy=60.0,
         )
-        self.assertEqual(("approved", "promotion_criteria_met"), (status, reason))
+        self.assertNotEqual("approved", status,
+            "_promotion_decision must never return 'approved'; use evaluate_promotion() instead")
 
 
 class FinetuneDatasetTests(unittest.TestCase):

@@ -56,6 +56,9 @@ class CapitalOhlcWebSocketClient:
         self.csv_path = settings.output_dir / f"kronos_stream_input_{safe_epic_for_filename(epic)}_{self.resolution}.csv"
         self.df = pd.DataFrame(columns=KRONOS_COLUMNS)
         self._running = False
+        # CSV write-buffer: avoid full-frame rewrite on every incoming candle.
+        self._csv_write_pending: int = 0
+        self._csv_write_interval: int = max(1, int(os.getenv("WS_CSV_WRITE_INTERVAL", "5")))
 
     async def stream_forever(self) -> None:
         tokens = self.authenticator.tokens or self.authenticator.authenticate()
@@ -262,7 +265,10 @@ class CapitalOhlcWebSocketClient:
             .tail(self.max_rows)
             .reset_index(drop=True)
         )
-        self.df.to_csv(self.csv_path, index=False)
+        self._csv_write_pending += 1
+        if self._csv_write_pending >= self._csv_write_interval:
+            self.df.to_csv(self.csv_path, index=False)
+            self._csv_write_pending = 0
         upsert_ohlcv_df(
             pd.DataFrame([row], columns=KRONOS_COLUMNS),
             symbol=self.symbol,

@@ -575,6 +575,99 @@ def dashboard_html() -> str:
       margin-left: 6px;
     }
 
+    .signal-id-line {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .signal-group-row td {
+      vertical-align: middle;
+    }
+
+    .signal-group-start td {
+      border-top: 1px solid rgba(126, 167, 199, 0.16);
+    }
+
+    .signal-variant-label {
+      color: var(--muted);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      font-weight: 700;
+    }
+
+    .signal-badge-cell {
+      white-space: nowrap;
+    }
+
+    .signal-numeric {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .signal-actions {
+      display: grid;
+      gap: 6px;
+      justify-items: start;
+    }
+
+    .signal-actions .mini-copy {
+      margin-left: 0;
+    }
+
+    .signal-note-row td {
+      padding-top: 6px;
+      padding-bottom: 10px;
+    }
+
+    .signal-note {
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+
+    .signal-table-footer {
+      margin-top: 10px;
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-start;
+      gap: 10px;
+    }
+
+    .signal-pagination-left {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .signal-pagination-pages {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .signal-pagination-right {
+      margin-left: auto;
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+      min-width: 250px;
+      text-align: right;
+    }
+
+    .signal-page-size-field {
+      min-width: 132px;
+      max-width: 176px;
+      margin: 0;
+      text-align: left;
+    }
+
     .worker-grid {
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -680,6 +773,12 @@ def dashboard_html() -> str:
       .chart-grid { grid-template-columns: 1fr; }
       .actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .toggle-row { grid-template-columns: 1fr; }
+      .signal-pagination-right {
+        width: 100%;
+        margin-left: 0;
+        align-items: flex-start;
+        text-align: left;
+      }
     }
 
     @media (max-width: 640px) {
@@ -768,9 +867,7 @@ def dashboard_html() -> str:
       <label class="field">Auto Refresh
         <select id="autoRefresh">
           <option value="0">Off</option>
-          <option value="1" selected>Live (1 sec)</option>
-          <option value="2">2 sec</option>
-          <option value="5">5 sec</option>
+          <option value="5" selected>5 sec</option>
           <option value="10">10 sec</option>
           <option value="30">30 sec</option>
         </select>
@@ -820,6 +917,7 @@ def dashboard_html() -> str:
   <nav class="tabs" aria-label="Dashboard sections">
     <button class="tab active" data-tab="overview">Signals</button>
     <button class="tab" data-tab="validation">Validation</button>
+    <button class="tab" data-tab="modelPerformance">Model Performance</button>
     <button class="tab" data-tab="risk">Risk</button>
     <button class="tab" data-tab="baselines">Baselines</button>
     <button class="tab" data-tab="history">History</button>
@@ -830,6 +928,7 @@ def dashboard_html() -> str:
 
   <section id="overview" class="details-panel panel tabPanel"></section>
   <section id="validation" class="details-panel panel tabPanel hidden"></section>
+  <section id="modelPerformance" class="details-panel panel tabPanel hidden"></section>
   <section id="risk" class="details-panel panel tabPanel hidden"></section>
   <section id="baselines" class="details-panel panel tabPanel hidden"></section>
   <section id="history" class="details-panel panel tabPanel hidden"></section>
@@ -856,12 +955,12 @@ def dashboard_html() -> str:
 const DASHBOARD_TZ = 'Asia/Amman';
 
 let latest = {};
-let latestSignals = { rows: [], pagination: { page: 1, page_size: 20, total: 0, total_pages: 1, has_next: false, has_prev: false } };
+let latestSignals = { rows: [], pagination: { page: 1, page_size: 10, total: 0, total_pages: 1, has_next: false, has_prev: false } };
 let refreshTimer = null;
 let refreshInFlight = false;
 let autoPredictBusy = false;
 let signalPage = 1;
-let signalPageSize = 20;
+let signalPageSize = 10;
 let activeTab = 'overview';
 let lastAutoPredictClosedBucket = null;
 let lastOverviewHtml = '';
@@ -872,6 +971,8 @@ let lastHeartbeatStatusKey = '';
 let lastHeroMetaKey = '';
 let lastModelStatusKey = '';
 let lastSummaryCardsKey = '';
+let selectedRunId = '';
+let latestModelPerformance = null;
 let signalFilters = {
   timeframe: '',
   dateFrom: '',
@@ -951,6 +1052,7 @@ function resolveLatestPrice(data) {
   const pg = data.postgres_snapshot || {};
   const liveQuote = pg.live_quote || data.live_quote || {};
   const latestSignal = (pg.signals || [])[0] || {};
+  if (!selectedRunId && latestSignal.run_id) selectedRunId = latestSignal.run_id;
   const candles = pg.candles || [];
   const latestCandle = candles.length ? candles[candles.length - 1] : {};
   const metadata = data.metadata || {};
@@ -1424,6 +1526,7 @@ async function refreshSignals(page = 1, options = {}) {
   try {
     const res = await fetch(`/api/signals?${getSignalQuery(page)}`, { cache: 'no-store' });
     latestSignals = await res.json();
+    if (!res.ok) throw new Error(latestSignals.error?.message || `Signals HTTP ${res.status}`);
     signalPage = latestSignals.pagination?.page || page;
     if (renderUi && (forceRender || !isSignalsFilterInteracting())) {
       renderOverview({ force: forceRender, background: false });
@@ -1447,25 +1550,73 @@ function renderOverview(options = {}) {
     .map(([name, state]) => `<article class="worker-item"><div class="worker-name">${escapeHtml(name)}</div><div>${chip(state?.status || 'MISSING')}</div><div class="tiny-help">${state?.updated_at ? `Updated ${escapeHtml(fmtDate(state.updated_at))}` : 'No heartbeat yet'}</div></article>`)
     .join('');
 
+  const badgeOrMuted = value => {
+    const text = String(value || '').trim();
+    return text ? chip(text) : '<span class="muted">n/a</span>';
+  };
+
   const bodyRows = rows.length
-    ? rows.map(r => `<tr>
-        <td>
-          <div>${escapeHtml(r.signal_id || '')}<button class="mini-copy" data-copy="${escapeHtml(r.signal_id || '')}" data-copy-label="signal id">Copy</button></div>
-          <div class="tiny-help">Run: ${escapeHtml(r.run_id || '')}<button class="mini-copy" data-copy="${escapeHtml(r.run_id || '')}" data-copy-label="run id">Copy</button></div>
+    ? rows.map(r => {
+      const validatedCount = Number(r.outcomes_wins || 0) + Number(r.outcomes_losses || 0);
+      const totalCount = validatedCount + Number(r.outcomes_pending || 0);
+      const runBadge = badgeOrMuted(r.run_status || '');
+      const activeDecision = badgeOrMuted(r.signal);
+      const activeOutcome = badgeOrMuted(r.status);
+      const activeStatus = badgeOrMuted(r.status_raw || r.status);
+      const activeConfidence = pct01(r.confidence);
+      const shadowDecision = badgeOrMuted(r.shadow_signal);
+      const shadowOutcome = r.shadow_signal ? badgeOrMuted(r.shadow_status || 'PENDING') : '<span class="muted">n/a</span>';
+      const shadowStatus = r.shadow_signal ? badgeOrMuted(r.shadow_status || 'PENDING') : '<span class="muted">n/a</span>';
+      const shadowConfidence = r.shadow_signal ? pct01(r.shadow_confidence) : '<span class="muted">n/a</span>';
+      const modelNoteParts = [];
+      if (r.shadow_model_version_id || r.shadow_model_name) {
+        modelNoteParts.push(String(r.shadow_model_version_id || r.shadow_model_name));
+      }
+      if (r.disagreement) {
+        modelNoteParts.push('disagreement');
+      }
+      const modelNoteRow = modelNoteParts.length
+        ? `<tr class="signal-note-row"><td colspan="14"><div class="signal-note">Model Note: ${escapeHtml(modelNoteParts.join(' | '))}</div></td></tr>`
+        : '';
+      return `<tr class="signal-group-row signal-group-start">
+        <td rowspan="2">
+          <div class="signal-id-line">${escapeHtml(r.signal_id || '')}</div>
+          <div class="tiny-help">Run ID: ${escapeHtml(r.run_id || '')}</div>
         </td>
-        <td>${fmtDate(r.timestamp_utc)}</td>
-        <td>${escapeHtml(r.resolution || '')}</td>
-        <td>${chip(r.signal)}</td>
-        <td>${r.shadow_signal ? `${chip(r.shadow_signal)}<div class="tiny-help">${escapeHtml(r.shadow_model_name || 'shadow')} ${pct01(r.shadow_confidence)}</div>` : '<span class="muted">n/a</span>'}</td>
-        <td>${chip(r.status)}</td>
-        <td>${chip(r.run_status || '')}</td>
-        <td>${escapeHtml(String((Number(r.outcomes_wins || 0) + Number(r.outcomes_losses || 0))))}/${escapeHtml(String((Number(r.outcomes_wins || 0) + Number(r.outcomes_losses || 0) + Number(r.outcomes_pending || 0))))}</td>
-        <td>${fmtNumber(r.entry_price)}</td>
-        <td>${fmtNumber(r.tp_price)}</td>
-        <td>${fmtNumber(r.sl_price)}</td>
-        <td>${pct01(r.confidence)}</td>
-      </tr>`).join('')
-    : '<tr><td colspan="12"><div class="empty">No signals found for current filters.</div></td></tr>';
+        <td rowspan="2">${fmtDate(r.timestamp_utc)}</td>
+        <td rowspan="2">${escapeHtml(r.resolution || '')}</td>
+        <td><span class="signal-variant-label">ACTIVE</span></td>
+        <td class="signal-badge-cell">${activeDecision}</td>
+        <td class="signal-badge-cell">${activeOutcome}</td>
+        <td class="signal-badge-cell">${activeStatus}</td>
+        <td class="signal-badge-cell">${runBadge}</td>
+        <td rowspan="2" class="signal-numeric">${escapeHtml(String(validatedCount))}/${escapeHtml(String(totalCount))}</td>
+        <td class="signal-numeric">${fmtNumber(r.entry_price)}</td>
+        <td class="signal-numeric">${fmtNumber(r.tp_price)}</td>
+        <td class="signal-numeric">${fmtNumber(r.sl_price)}</td>
+        <td class="signal-numeric">${activeConfidence}</td>
+        <td rowspan="2">
+          <div class="signal-actions">
+            <button class="mini-copy" data-copy="${escapeHtml(r.signal_id || '')}" data-copy-label="signal id">Copy Signal</button>
+            <button class="mini-copy" data-copy="${escapeHtml(r.run_id || '')}" data-copy-label="run id">Copy Run</button>
+            <button class="mini-copy" data-audit-run="${escapeHtml(r.run_id || '')}">Audit</button>
+          </div>
+        </td>
+      </tr>
+      <tr class="signal-group-row">
+        <td><span class="signal-variant-label">SHADOW</span></td>
+        <td class="signal-badge-cell">${shadowDecision}</td>
+        <td class="signal-badge-cell">${shadowOutcome}</td>
+        <td class="signal-badge-cell">${shadowStatus}</td>
+        <td class="signal-badge-cell">${runBadge}</td>
+        <td class="signal-numeric">${fmtNumber(r.shadow_entry_price)}</td>
+        <td class="signal-numeric">${fmtNumber(r.shadow_tp_price)}</td>
+        <td class="signal-numeric">${fmtNumber(r.shadow_sl_price)}</td>
+        <td class="signal-numeric">${shadowConfidence}</td>
+      </tr>
+      ${modelNoteRow}`;
+    }).join('')
+    : '<tr><td colspan="14"><div class="empty">No signals found for current filters.</div></td></tr>';
 
   const warningHtml = warnings.length
     ? `<div class="warning-stack">${warnings.map(w => `<div class="warning-item">${escapeHtml(w)}</div>`).join('')}</div>`
@@ -1529,31 +1680,36 @@ function renderOverview(options = {}) {
       <button id="signalsReset" class="btn-warn">Reset Filters</button>
     </div>
 
-    <div style="display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 10px;">
-      <label class="field" style="min-width: 120px; max-width: 180px; margin: 0;">
-        Rows / Page
-        <select id="signalsPageSize">
-          <option value="20" ${signalPageSize === 20 ? 'selected' : ''}>20</option>
-          <option value="50" ${signalPageSize === 50 ? 'selected' : ''}>50</option>
-          <option value="100" ${signalPageSize === 100 ? 'selected' : ''}>100</option>
-        </select>
-      </label>
-      <button id="signalsFirst" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_prev ? '' : 'disabled'}>First</button>
-      <button id="signalsPrev" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_prev ? '' : 'disabled'}>Prev</button>
-      <div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap;">${pageButtons}</div>
-      <button id="signalsNext" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_next ? '' : 'disabled'}>Next</button>
-      <button id="signalsLast" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_next ? '' : 'disabled'}>Last</button>
-    </div>
-
-    <p class="muted">Page ${escapeHtml(String(pag.page || 1))} / ${escapeHtml(String(pag.total_pages || 1))} | ${escapeHtml(String(pag.total || 0))} total rows | Outcome mix: ${escapeHtml(outcomes)}</p>
-
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>Signal ID / Run ID</th><th>Generated</th><th>Timeframe</th><th>Active</th><th>Shadow</th><th>Status</th><th>Run</th><th>Validated / Total</th><th>Entry</th><th>TP</th><th>SL</th><th>Confidence</th></tr>
+          <tr><th>Signal ID / Run ID</th><th>Generated</th><th>Timeframe</th><th>Variant</th><th>Decision</th><th>Shadow / Active Outcome</th><th>Status</th><th>Run</th><th class="signal-numeric">Validated / Total</th><th class="signal-numeric">Entry</th><th class="signal-numeric">TP</th><th class="signal-numeric">SL</th><th class="signal-numeric">Confidence</th><th>Actions</th></tr>
         </thead>
         <tbody>${bodyRows}</tbody>
       </table>
+    </div>
+
+    <div class="signal-table-footer">
+      <div class="signal-pagination-left">
+        <button id="signalsFirst" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_prev ? '' : 'disabled'}>First</button>
+        <button id="signalsPrev" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_prev ? '' : 'disabled'}>Prev</button>
+        <div class="signal-pagination-pages">${pageButtons}</div>
+        <button id="signalsNext" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_next ? '' : 'disabled'}>Next</button>
+        <button id="signalsLast" class="btn-alt" style="min-height: 34px; padding: 6px 10px;" ${pag.has_next ? '' : 'disabled'}>Last</button>
+      </div>
+      <div class="signal-pagination-right">
+        <label class="field signal-page-size-field">Rows / Page
+          <select id="signalsPageSize">
+            <option value="10" ${signalPageSize === 10 ? 'selected' : ''}>10</option>
+            <option value="20" ${signalPageSize === 20 ? 'selected' : ''}>20</option>
+            <option value="50" ${signalPageSize === 50 ? 'selected' : ''}>50</option>
+            <option value="100" ${signalPageSize === 100 ? 'selected' : ''}>100</option>
+          </select>
+        </label>
+        <div class="tiny-help">Page ${escapeHtml(String(pag.page || 1))} / ${escapeHtml(String(pag.total_pages || 1))}</div>
+        <div class="tiny-help">${escapeHtml(String(pag.total || 0))} total rows</div>
+        <div class="tiny-help">Outcome mix: ${escapeHtml(outcomes)}</div>
+      </div>
     </div>`;
 
   if (!force && background) {
@@ -1700,6 +1856,10 @@ function renderActiveTabContent(options = {}) {
     renderValidation(latest);
     return;
   }
+  if (activeTab === 'modelPerformance') {
+    renderModelPerformance(latestModelPerformance || latest.postgres_snapshot || {});
+    return;
+  }
   if (activeTab === 'risk') {
     renderRisk(latest);
     return;
@@ -1716,6 +1876,53 @@ function renderActiveTabContent(options = {}) {
   if (activeTab === 'files') {
     renderFiles(latest);
   }
+}
+
+function renderModelPerformance(perf) {
+  const active = perf.active_model || {};
+  const shadow = perf.shadow_model || {};
+  const disagreement = perf.disagreement || {};
+  const comparison = perf.comparison || {};
+  const matched = comparison.matched_runs || {};
+  const statusCmp = comparison.signal_status || {};
+  const activeMatched = matched.active || {};
+  const shadowMatched = matched.shadow || {};
+  const statusActiveAll = statusCmp.active_all_runs || {};
+  const statusActiveCovered = statusCmp.active_shadow_covered_runs || {};
+  const statusShadowRuns = statusCmp.shadow_runs || {};
+  const horizons = perf.horizons || perf.horizon_metrics || [];
+  const gates = perf.promotion_gates || [];
+  const horizonRows = horizons.length
+    ? horizons.map(h => `<tr><td>${escapeHtml(h.horizon_index)}</td><td>${fmtCount(h.samples)}</td><td>${h.active_accuracy_pct === null || h.active_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(h.active_accuracy_pct, 2)}%`}</td><td>${h.shadow_accuracy_pct === null || h.shadow_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(h.shadow_accuracy_pct, 2)}%`}</td><td>${h.mape_pct === null || h.mape_pct === undefined ? 'n/a' : `${fmtNumber(h.mape_pct, 4)}%`}</td></tr>`).join('')
+    : '<tr><td colspan="5">No horizon metrics persisted yet.</td></tr>';
+  const gateRows = gates.length
+    ? gates.map(g => `<tr><td>${escapeHtml(g.gate_name)}</td><td>${chip(g.status)}</td><td>${fmtNumber(g.metric_value)}</td><td>${fmtNumber(g.threshold_value)}</td></tr>`).join('')
+    : '<tr><td colspan="4">No promotion gates evaluated yet.</td></tr>';
+  const matchedRows = `<tr><th>Wins / Losses</th><td>${fmtCount(activeMatched.wins)} / ${fmtCount(activeMatched.losses)}</td><td>${fmtCount(shadowMatched.wins)} / ${fmtCount(shadowMatched.losses)}</td></tr>
+    <tr><th>Directional Samples</th><td>${fmtCount(activeMatched.samples)}</td><td>${fmtCount(shadowMatched.samples)}</td></tr>
+    <tr><th>Win Rate</th><td>${activeMatched.win_rate_pct === null || activeMatched.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(activeMatched.win_rate_pct, 2)}%`}</td><td>${shadowMatched.win_rate_pct === null || shadowMatched.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(shadowMatched.win_rate_pct, 2)}%`}</td></tr>
+    <tr><th>Shadow Lift</th><td colspan="2">${matched.shadow_minus_active_pct === null || matched.shadow_minus_active_pct === undefined ? 'n/a' : `${fmtNumber(matched.shadow_minus_active_pct, 2)}%`}</td></tr>
+    <tr><th>Disagreements</th><td>${fmtCount(matched.disagreement?.active_wins_when_disagree)} active wins / ${fmtCount(matched.disagreement?.samples)} samples</td><td>${fmtCount(matched.disagreement?.shadow_wins_when_disagree)} shadow wins / ${fmtCount(matched.disagreement?.samples)} samples</td></tr>`;
+  const statusRows = `<tr><th>Wins / Losses / Pending</th><td>${fmtCount(statusActiveAll.wins)} / ${fmtCount(statusActiveAll.losses)} / ${fmtCount(statusActiveAll.pending)}</td><td>${fmtCount(statusActiveCovered.wins)} / ${fmtCount(statusActiveCovered.losses)} / ${fmtCount(statusActiveCovered.pending)}</td><td>${fmtCount(statusShadowRuns.wins)} / ${fmtCount(statusShadowRuns.losses)} / ${fmtCount(statusShadowRuns.pending)}</td></tr>
+    <tr><th>Run Count</th><td>${fmtCount(statusActiveAll.total)}</td><td>${fmtCount(statusActiveCovered.total)}</td><td>${fmtCount(statusShadowRuns.total)}</td></tr>
+    <tr><th>Win Rate</th><td>${statusActiveAll.win_rate_pct === null || statusActiveAll.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusActiveAll.win_rate_pct, 2)}%`}</td><td>${statusActiveCovered.win_rate_pct === null || statusActiveCovered.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusActiveCovered.win_rate_pct, 2)}%`}</td><td>${statusShadowRuns.win_rate_pct === null || statusShadowRuns.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusShadowRuns.win_rate_pct, 2)}%`}</td></tr>`;
+  $('modelPerformance').innerHTML = `
+    <div class="panel-head"><h2>Model Performance</h2><span class="chip info">${escapeHtml(shadow.model_version_id || shadow.shadow_model_version_id || 'no shadow')}</span></div>
+    <div class="kpi-grid" style="margin-bottom: 12px;">
+      ${kpi('Active Accuracy', active.direction_accuracy_pct === null || active.direction_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(active.direction_accuracy_pct, 2)}%`, `${fmtCount(active.samples)} samples`)}
+      ${kpi('Shadow Accuracy', shadow.direction_accuracy_pct === null || shadow.direction_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(shadow.direction_accuracy_pct, 2)}%`, `${fmtCount(shadow.samples)} samples`)}
+      ${kpi('Shadow Lift', shadow.lift_pct === null || shadow.lift_pct === undefined ? 'n/a' : `${fmtNumber(shadow.lift_pct, 2)}%`, 'Shadow minus active')}
+      ${kpi('Disagreements', fmtCount(disagreement.samples), `${fmtCount(disagreement.shadow_wins_when_disagree)} shadow wins`)}
+    </div>
+    <h3>Fair Comparison (Same Evaluated Windows)</h3>
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Active</th><th>Shadow</th></tr></thead><tbody>${matchedRows}</tbody></table></div>
+    <div style="margin-top: 6px; font-size: 12px; opacity: 0.85;">Shadow model: ${escapeHtml(comparison.shadow_model_version_id || shadow.model_version_id || 'n/a')} · evaluation rows: ${fmtCount(matched.evaluation_rows)}</div>
+    <h3 style="margin-top: 14px;">Signal Status Comparison (Run-level)</h3>
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Active (all runs)</th><th>Active (shadow-covered runs)</th><th>Shadow runs</th></tr></thead><tbody>${statusRows}</tbody></table></div>
+    <h3>Horizon Metrics</h3>
+    <div class="table-wrap"><table><thead><tr><th>Horizon</th><th>Samples</th><th>Active Accuracy</th><th>Shadow Accuracy</th><th>MAPE</th></tr></thead><tbody>${horizonRows}</tbody></table></div>
+    <h3 style="margin-top: 14px;">Promotion Gates</h3>
+    <div class="table-wrap"><table><thead><tr><th>Gate</th><th>Status</th><th>Metric</th><th>Threshold</th></tr></thead><tbody>${gateRows}</tbody></table></div>`;
 }
 
 function render(data, options = {}) {
@@ -1867,6 +2074,10 @@ async function refreshStatus(options = {}) {
     if (showSpinner) showLoader('Refreshing dashboard...');
     const res = await fetch(`/api/status?${currentStatusQuery()}`, { cache: 'no-store' });
     const data = await res.json();
+    if (!res.ok) throw new Error(data.error?.message || `Status HTTP ${res.status}`);
+    const perfRes = await fetch(`/api/model-performance?${currentStatusQuery()}`, { cache: 'no-store' });
+    latestModelPerformance = await perfRes.json();
+    if (!perfRes.ok) latestModelPerformance = null;
     await refreshSignals(signalPage, { renderUi: false });
     render(data, { background, forceOverview: false });
     await maybeAutoPredict();
@@ -1888,6 +2099,10 @@ async function postJson(url, payload = {}, options = {}) {
   try {
     const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const data = await res.json();
+    if (!res.ok) {
+      const message = data.error?.message || data.error || `HTTP ${res.status}`;
+      throw new Error(message);
+    }
     if (!silent) {
       $('log').textContent = data.output || data.error || JSON.stringify(data, null, 2);
     }
@@ -1919,6 +2134,7 @@ async function runPrediction(options = {}) {
       lookback: Number($('lookback').value),
       feature_set: $('featureSet').value,
       repair_ohlc: $('repairOhlc').checked,
+      run_shadow: true,
     }, {
       loaderText: auto ? 'Auto prediction at candle close...' : 'Running prediction...',
       withLoader: !auto,
@@ -1962,6 +2178,22 @@ document.addEventListener('click', async event => {
         showToast(`Copy failed: ${err.message}`);
       }
     }
+  }
+
+  if (target.dataset.auditRun) {
+    selectedRunId = String(target.dataset.auditRun || '').trim();
+    const row = (latestSignals.rows || []).find(item => item.run_id === selectedRunId) || {};
+    $('logs').innerHTML = `<div class="panel-head"><h2>Signal Audit</h2>${chip(row.status || 'PENDING')}</div>
+      <div class="table-wrap"><table><tbody>
+        <tr><th>Run ID</th><td>${escapeHtml(selectedRunId)}</td></tr>
+        <tr><th>Active Signal</th><td>${chip(row.signal || 'n/a')} ${chip(row.status || 'PENDING')}</td></tr>
+        <tr><th>Shadow Signal</th><td>${row.shadow_signal ? `${chip(row.shadow_signal)} ${chip(row.shadow_status || 'PENDING')}` : 'n/a'}</td></tr>
+        <tr><th>Quality</th><td>${escapeHtml(row.quality_grade || 'n/a')}</td></tr>
+        <tr><th>Outcomes</th><td>${fmtCount(row.outcomes_wins)} WIN / ${fmtCount(row.outcomes_losses)} LOSS / ${fmtCount(row.outcomes_pending)} PENDING</td></tr>
+        <tr><th>Reason</th><td>${escapeHtml(row.reason || '')}</td></tr>
+      </tbody></table></div><pre id="log" class="hidden"></pre>`;
+    setTab('logs');
+    showToast(`Selected run ${selectedRunId}`);
   }
 
   if (target.id === 'signalsApply') {
@@ -2028,8 +2260,8 @@ document.addEventListener('change', async event => {
   }
 
   if (target.id === 'signalsPageSize' && target instanceof HTMLSelectElement) {
-    const parsed = Number(target.value || 20);
-    signalPageSize = [20, 50, 100].includes(parsed) ? parsed : 20;
+    const parsed = Number(target.value || 10);
+    signalPageSize = [10, 20, 50, 100].includes(parsed) ? parsed : 10;
     readSignalFiltersFromUi();
     signalPage = 1;
     await refreshSignals(signalPage, { forceRender: true });
@@ -2085,9 +2317,9 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
 
 $('predict').addEventListener('click', () => runPrediction());
 $('refresh').addEventListener('click', () => refreshStatus({ showSpinner: true }));
-$('fetchActual').addEventListener('click', () => postJson('/api/fetch-actual', {}, { loaderText: 'Fetching actual candles...' }).then(() => showToast('Actual fetch finished')));
-$('validateActual').addEventListener('click', () => postJson('/api/validate-actual', {}, { loaderText: 'Validating actuals...' }).then(() => showToast('Validation finished')));
-$('baselines').addEventListener('click', () => postJson('/api/baselines', {}, { loaderText: 'Running baselines...' }).then(() => showToast('Baselines complete')));
+$('fetchActual').addEventListener('click', () => postJson('/api/fetch-actual', { run_id: selectedRunId }, { loaderText: 'Fetching actual candles...' }).then(() => showToast('Actual fetch finished')));
+$('validateActual').addEventListener('click', () => postJson('/api/validate-actual', { run_id: selectedRunId, scoring_version: 'v1' }, { loaderText: 'Validating actuals...' }).then(() => showToast('Validation finished')));
+$('baselines').addEventListener('click', () => postJson('/api/baselines', { run_id: selectedRunId }, { loaderText: 'Running baselines...' }).then(() => showToast('Baselines complete')));
 
 $('autoRefresh').addEventListener('change', setupAutoRefresh);
 $('autoPredict').addEventListener('change', () => { lastAutoPredictClosedBucket = null; });

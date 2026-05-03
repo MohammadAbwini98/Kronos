@@ -60,6 +60,10 @@ $envName = if ($env:CAPITAL_ENV) { $env:CAPITAL_ENV } else { "demo" }
 [int]$monitorIntervalSeconds = if ($env:WORKER_MONITOR_INTERVAL_SECONDS) { $env:WORKER_MONITOR_INTERVAL_SECONDS } else { 5 }
 [int]$dashboardRestartMaxAttempts = if ($env:DASHBOARD_RESTART_MAX_ATTEMPTS) { $env:DASHBOARD_RESTART_MAX_ATTEMPTS } else { 20 }
 $cleanupStaleProcessesOnStart = if ($env:CLEANUP_STALE_PROCESSES_ON_START) { $env:CLEANUP_STALE_PROCESSES_ON_START } else { "true" }
+$supervisorInstanceId = if ($env:SUPERVISOR_INSTANCE_ID) { $env:SUPERVISOR_INSTANCE_ID } else { [guid]::NewGuid().ToString() }
+$env:SUPERVISOR_INSTANCE_ID = $supervisorInstanceId
+$allowDuplicateWorkers = if ($env:ALLOW_DUPLICATE_WORKERS) { $env:ALLOW_DUPLICATE_WORKERS } else { "false" }
+[int]$supervisorLeaseTtlSeconds = if ($env:SUPERVISOR_LEASE_TTL_SECONDS) { $env:SUPERVISOR_LEASE_TTL_SECONDS } else { 120 }
 
 $outputDir = Join-Path $PSScriptRoot "output"
 $logsDir = Join-Path $outputDir "logs"
@@ -275,6 +279,8 @@ function Test-Preflight {
     Write-Host "  Dashboard restart max attempts: $dashboardRestartMaxAttempts"
     Write-Host "  Monitor interval (seconds): $monitorIntervalSeconds"
     Write-Host "  Cleanup stale processes on start: $(Test-FlagEnabled -Value $cleanupStaleProcessesOnStart -Default $true)"
+    Write-Host "  Supervisor instance: $supervisorInstanceId"
+    Write-Host "  Allow duplicate workers: $(Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)"
     if ($env:POSTGRES_DSN) {
         Write-Host "  PostgreSQL DSN: configured"
     }
@@ -303,6 +309,49 @@ function New-Worker {
     }
 }
 
+function Join-ProcessArguments {
+    param(
+        [string[]]$Arguments
+    )
+    $quoted = foreach ($arg in $Arguments) {
+        if ($null -eq $arg) {
+            '""'
+            continue
+        }
+        $text = [string]$arg
+        if ($text -notmatch '[\s"]') {
+            $text
+            continue
+        }
+        $builder = New-Object System.Text.StringBuilder
+        [void]$builder.Append('"')
+        $backslashes = 0
+        foreach ($char in $text.ToCharArray()) {
+            if ($char -eq '\') {
+                $backslashes += 1
+                continue
+            }
+            if ($char -eq '"') {
+                [void]$builder.Append(('\' * (($backslashes * 2) + 1)))
+                [void]$builder.Append('"')
+                $backslashes = 0
+                continue
+            }
+            if ($backslashes -gt 0) {
+                [void]$builder.Append(('\' * $backslashes))
+                $backslashes = 0
+            }
+            [void]$builder.Append($char)
+        }
+        if ($backslashes -gt 0) {
+            [void]$builder.Append(('\' * ($backslashes * 2)))
+        }
+        [void]$builder.Append('"')
+        $builder.ToString()
+    }
+    return ($quoted -join " ")
+}
+
 function Start-Worker {
     param(
         [Parameter(Mandatory = $true)]
@@ -312,7 +361,10 @@ function Start-Worker {
         return
     }
     Write-Host "Starting worker $($Worker.Name)"
-    $Worker.Process = Start-Process -FilePath $python -ArgumentList $Worker.LaunchParams -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru
+    $workerStdOutLog = Join-Path $logsDir "$($Worker.Name)_stdout.log"
+    $workerStdErrLog = Join-Path $logsDir "$($Worker.Name)_stderr.log"
+    $argumentLine = Join-ProcessArguments -Arguments $Worker.LaunchParams
+    $Worker.Process = Start-Process -FilePath $python -ArgumentList $argumentLine -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $workerStdOutLog -RedirectStandardError $workerStdErrLog
     Add-ProcessToJob -Process $Worker.Process -Name $Worker.Name
 }
 
@@ -434,6 +486,26 @@ try {
         throw "Database migration failed with exit code $LASTEXITCODE"
     }
 
+    Write-Host "Acquiring supervisor lease"
+    $leaseArgs = @(
+        "src\main_supervisor_lease.py",
+        "acquire",
+        "--instance-id", $supervisorInstanceId,
+        "--process-id", "$PID",
+        "--command-line", "start_dashboard.ps1",
+        "--ttl-seconds", "$supervisorLeaseTtlSeconds"
+    )
+    if (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false) {
+        $leaseArgs += "--allow-duplicate"
+    }
+    if ($env:POSTGRES_DSN) {
+        $leaseArgs += @("--dsn", $env:POSTGRES_DSN)
+    }
+    & $python @leaseArgs
+    if ($LASTEXITCODE -ne 0) {
+        throw "Another active dashboard supervisor lease exists. Set ALLOW_DUPLICATE_WORKERS=true to override intentionally."
+    }
+
     if (Test-FlagEnabled -Value $historicalBackfillEnabled -Default $true) {
         Write-Host "Backfilling and gap-filling $historicalBackfillDays day(s) of 5-minute Capital.com candles"
         $backfillArgs = @(
@@ -467,6 +539,20 @@ try {
 
     while ($true) {
         Start-Sleep -Seconds $monitorIntervalSeconds
+
+        $heartbeatArgs = @(
+            "src\main_supervisor_lease.py",
+            "heartbeat",
+            "--instance-id", $supervisorInstanceId,
+            "--ttl-seconds", "$supervisorLeaseTtlSeconds"
+        )
+        if ($env:POSTGRES_DSN) {
+            $heartbeatArgs += @("--dsn", $env:POSTGRES_DSN)
+        }
+        & $python @heartbeatArgs | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning "Supervisor lease heartbeat failed. Continuing process monitor loop."
+        }
 
         $dashboardRunning = Get-Process -Id $dashboard.Id -ErrorAction SilentlyContinue
         if ($null -eq $dashboardRunning) {
@@ -506,5 +592,14 @@ finally {
     foreach ($worker in $workers) {
         Stop-TrackedProcess -Process $worker.Process -Name $worker.Name
     }
+    $releaseArgs = @(
+        "src\main_supervisor_lease.py",
+        "release",
+        "--instance-id", $supervisorInstanceId
+    )
+    if ($env:POSTGRES_DSN) {
+        $releaseArgs += @("--dsn", $env:POSTGRES_DSN)
+    }
+    & $python @releaseArgs | Out-Null
     Write-Host "Dashboard and workers stopped."
 }

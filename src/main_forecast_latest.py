@@ -11,6 +11,7 @@ import pandas as pd
 
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
+from data_quality import analyze_ohlcv_quality, grade_meets_minimum, persist_prediction_run_quality
 from prediction_store import run_id_from_metadata_path, save_shadow_prediction, upsert_instrument, upsert_ohlcv_df
 from time_utils import format_local_timestamp
 
@@ -51,7 +52,7 @@ def _model_ready(path: Path) -> bool:
     return path.is_dir() and (path / "config.json").exists() and (path / "model.safetensors").exists()
 
 
-def _shadow_candidate_model_dir(output_dir: Path) -> Path | None:
+def _shadow_candidate_model(output_dir: Path) -> dict[str, str] | None:
     status_path = output_dir / "auto_finetune_status.json"
     if not status_path.exists():
         return None
@@ -60,13 +61,21 @@ def _shadow_candidate_model_dir(output_dir: Path) -> Path | None:
     except Exception:  # noqa: BLE001
         return None
     promotion_status = str(payload.get("promotion_status") or "").strip().lower()
-    if promotion_status != "pending_review":
+    # Shadow runs during both "pending_review" (accumulating matches) and
+    # "pending_evaluation" (model trained, awaiting evaluate_promotion()).
+    # "not_ready" and "approved" do not run shadow.
+    if promotion_status not in ("pending_review", "pending_evaluation"):
         return None
     candidate = payload.get("active_model_path")
     if not candidate:
         return None
     model_dir = Path(str(candidate))
-    return model_dir if _model_ready(model_dir) else None
+    if not _model_ready(model_dir):
+        return None
+    return {
+        "model_dir": str(model_dir),
+        "model_version_id": payload.get("candidate_model_version_id") or payload.get("model_version_id") or model_dir.name,
+    }
 
 
 def _run_shadow_prediction(
@@ -75,6 +84,7 @@ def _run_shadow_prediction(
     active_metadata: Path,
     output_dir: Path,
     model_dir: Path,
+    shadow_model_version_id: str | None,
     dsn: str | None,
 ) -> None:
     active_run_id = run_id_from_metadata_path(active_metadata)
@@ -103,7 +113,12 @@ def _run_shadow_prediction(
     if result.returncode != 0:
         print(f"Shadow model prediction failed with exit code {result.returncode}.")
         return
-    save_shadow_prediction(active_run_id=active_run_id, metadata_path=shadow_metadata, dsn=dsn)
+    save_shadow_prediction(
+        active_run_id=active_run_id,
+        metadata_path=shadow_metadata,
+        dsn=dsn,
+        shadow_model_version_id=shadow_model_version_id,
+    )
     print(f"Shadow model signal recorded for active run {active_run_id}.")
 
 
@@ -131,6 +146,18 @@ def main() -> None:
         save_outputs=True,
         min_rows=min(args.lookback, args.max_points, 50),
     )
+    data_quality = analyze_ohlcv_quality(
+        df,
+        resolution=resolution,
+        expected_rows=args.lookback,
+    )
+    min_quality_grade = os.getenv("MIN_PREDICTION_QUALITY_GRADE")
+    quality_action = os.getenv("PREDICTION_QUALITY_ACTION", "downgrade").strip().lower()
+    if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
+        message = f"Prediction input quality {data_quality.quality_grade} is below minimum {min_quality_grade}."
+        if quality_action == "block":
+            raise SystemExit(message)
+        print(f"WARNING: {message} Signal quality will be downgraded in metadata.")
     upsert_instrument(
         symbol=symbol,
         epic=epic,
@@ -157,6 +184,9 @@ def main() -> None:
     print(f"PostgreSQL candles upserted: {stored_rows}")
     print(f"Last input candle: {format_local_timestamp(last_input)}")
 
+    # Generate run_stamp here so we can construct artifact paths deterministically
+    # instead of globbing for the lexicographic latest file after the subprocess.
+    run_stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
     cmd = [
         args.kronos_python,
         str(Path("src") / "main_run_kronos_predict.py"),
@@ -180,6 +210,8 @@ def main() -> None:
         str(settings.output_dir),
         "--postgres-dsn",
         args.postgres_dsn or "",
+        "--run-stamp",
+        run_stamp,
     ]
     if args.repair_ohlc:
         cmd.append("--repair-ohlc")
@@ -191,16 +223,30 @@ def main() -> None:
     if result.returncode != 0:
         raise SystemExit(result.returncode)
 
-    latest_metadata = sorted(settings.output_dir.glob(f"forecast_metadata_{safe_epic_for_filename(epic)}_{resolution}_*.json"))[-1]
+    latest_metadata = settings.output_dir / f"forecast_metadata_{safe_epic_for_filename(epic)}_{resolution}_{run_stamp}.json"
     metadata = json.loads(latest_metadata.read_text(encoding="utf-8"))
-    shadow_model_dir = None if args.disable_shadow_model else _shadow_candidate_model_dir(settings.output_dir)
-    if shadow_model_dir is not None and _flag_enabled("ENABLE_SHADOW_MODEL", True):
+    metadata["data_quality"] = data_quality.to_dict()
+    if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
+        metadata["data_quality"]["quality_gate_action"] = quality_action
+        metadata["data_quality"]["minimum_grade"] = min_quality_grade
+    latest_metadata.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
+    try:
+        persist_prediction_run_quality(
+            run_id_from_metadata_path(latest_metadata),
+            data_quality,
+            dsn=args.postgres_dsn,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: data quality report could not be persisted: {exc}")
+    shadow_model = None if args.disable_shadow_model else _shadow_candidate_model(settings.output_dir)
+    if shadow_model is not None and _flag_enabled("ENABLE_SHADOW_MODEL", True):
         try:
             _run_shadow_prediction(
                 base_cmd=cmd,
                 active_metadata=latest_metadata,
                 output_dir=settings.output_dir,
-                model_dir=shadow_model_dir,
+                model_dir=Path(shadow_model["model_dir"]),
+                shadow_model_version_id=shadow_model.get("model_version_id"),
                 dsn=args.postgres_dsn,
             )
         except Exception as exc:  # noqa: BLE001

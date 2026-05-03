@@ -20,6 +20,13 @@ from config import (
     validate_resolution,
 )
 from kronos_mapper import capital_prices_to_kronos_df, save_kronos_csv
+from rate_limit_state import (
+    RateLimitCooldownError,
+    clear_cooldown,
+    endpoint_class_for_path,
+    ensure_not_cooling_down,
+    record_rate_limit,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -68,6 +75,8 @@ class CapitalRestClient:
     )
     def _request(self, method: str, path: str, *, params: dict[str, Any] | None = None) -> Any:
         assert_data_only_path(path)
+        endpoint_class = endpoint_class_for_path(path)
+        ensure_not_cooling_down(endpoint_class)
         url = f"{self.settings.base_url}{path}"
         self._rate_limiter.wait()
         response = self.http.request(
@@ -88,10 +97,29 @@ class CapitalRestClient:
                 headers=self.authenticator.auth_headers(),
                 timeout=30,
             )
-        if response.status_code in {408, 425, 429, 500, 502, 503, 504}:
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After")
+            try:
+                retry_after_seconds = int(retry_after) if retry_after else 60
+            except ValueError:
+                retry_after_seconds = 60
+            try:
+                record_rate_limit(
+                    endpoint_class,
+                    error=response.text,
+                    status_code=429,
+                    retry_after_seconds=retry_after_seconds,
+                )
+            except Exception:  # noqa: BLE001
+                LOGGER.debug("Unable to persist Capital.com cooldown state", exc_info=True)
+            raise RateLimitCooldownError(
+                f"Capital.com endpoint class {endpoint_class} entered COOLDOWN after HTTP 429: {response.text}"
+            )
+        if response.status_code in {408, 425, 500, 502, 503, 504}:
             raise TransientCapitalApiError(f"Transient Capital.com HTTP {response.status_code}: {response.text}")
         if response.status_code >= 400:
             raise CapitalApiError(f"Capital.com HTTP {response.status_code} for {path}: {response.text}")
+        clear_cooldown(endpoint_class)
         if not response.content:
             return {}
         try:

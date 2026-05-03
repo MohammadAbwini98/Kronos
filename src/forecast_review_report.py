@@ -7,7 +7,8 @@ from typing import Any
 
 import pandas as pd
 
-from forecast_quality_validator import direction_from_move_pct, validate_ohlc_df
+from forecast_quality_validator import validate_ohlc_df
+from forecast_scoring import score_forecast_against_actuals
 from time_utils import display_timezone_name, format_local_timestamp
 
 
@@ -137,23 +138,32 @@ def _metrics_table(metadata: dict[str, Any], quality: dict[str, Any]) -> str:
 
 def _direction_table(joined: pd.DataFrame, flat_threshold_pct: float = 0.02) -> str:
     rows: list[str] = []
-    actual_prev = joined["close_actual"].shift(1)
+    forecast = joined[["timestamps", "close_forecast"]].rename(columns={"close_forecast": "close"})
+    actual = (
+        joined.dropna(subset=["close_actual"])[["timestamps", "close_actual"]]
+        .rename(columns={"close_actual": "close"})
+    )
+    scored = score_forecast_against_actuals(
+        forecast,
+        actual,
+        last_input_close=None,
+        flat_threshold_pct=flat_threshold_pct,
+    )
+    scored_by_ts = {row["timestamp_utc"]: row for row in scored["rows"]}
     for idx, row in joined.iterrows():
+        scored_row = scored_by_ts.get(pd.to_datetime(row["timestamps"], utc=True).isoformat(), {})
         if pd.isna(row.get("close_actual")):
             status = "missing actual"
             actual_dir = "n/a"
             forecast_dir = "n/a"
-        elif idx == 0 or pd.isna(actual_prev.iloc[idx]):
+        elif scored_row.get("status") == "PENDING":
             status = "no previous actual"
             actual_dir = "n/a"
             forecast_dir = "n/a"
         else:
-            prev = float(actual_prev.iloc[idx])
-            actual_move = ((float(row["close_actual"]) / prev) - 1.0) * 100.0
-            forecast_move = ((float(row["close_forecast"]) / prev) - 1.0) * 100.0
-            actual_dir = direction_from_move_pct(actual_move, flat_threshold_pct)
-            forecast_dir = direction_from_move_pct(forecast_move, flat_threshold_pct)
-            status = "hit" if actual_dir == forecast_dir else "miss"
+            actual_dir = str(scored_row.get("actual_direction") or "n/a")
+            forecast_dir = str(scored_row.get("predicted_direction") or "n/a")
+            status = "hit" if scored_row.get("status") == "WIN" else "miss"
         rows.append(
             "<tr>"
             f"<td>{_fmt_time(row['timestamps'])}</td>"

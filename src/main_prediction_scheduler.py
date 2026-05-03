@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import logging
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
-from psycopg.types.json import Jsonb
 
 from config import configure_logging
 from db import connect
+from service_runtime import write_heartbeat
 
 LOGGER = logging.getLogger(__name__)
 
@@ -27,6 +29,18 @@ RESOLUTION_TO_MINUTES = {
     "DAY": 1440,
     "WEEK": 10080,
 }
+
+DEFAULT_WEBSOCKET_STALE_SECONDS = max(30, int(os.getenv("SIGNAL_WEBSOCKET_STALE_SECONDS", "90")))
+WEBSOCKET_STREAM_PAUSE_STATUSES = {"RECONNECTING", "COOLDOWN", "ERROR", "MISSING"}
+_LAST_PROCESSED_WEBSOCKET_CANDLE: dict[tuple[str, str], pd.Timestamp] = {}
+
+
+@dataclass
+class WebSocketPredictionGate:
+    allow: bool
+    reason: str
+    details: dict[str, Any]
+    latest_candle_timestamp_utc: str | None = None
 
 
 def _combined_output(result: subprocess.CompletedProcess[str]) -> str:
@@ -57,25 +71,165 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", default=os.getenv("CAPITAL_ENV", "demo"), choices=["demo", "live"])
     parser.add_argument("--postgres-dsn", default=None)
     parser.add_argument("--kronos-python", default=r"C:\AI\Kronos\.venv\Scripts\python.exe")
+    parser.add_argument(
+        "--websocket-stale-seconds",
+        type=int,
+        default=DEFAULT_WEBSOCKET_STALE_SECONDS,
+        help="Pause prediction runs when websocket updates are older than this threshold.",
+    )
     parser.add_argument("--once", action="store_true", help="Run one scheduler cycle and exit.")
     args = parser.parse_args()
     args.resolution = str(args.resolution).upper()
+    args.websocket_stale_seconds = max(30, int(args.websocket_stale_seconds))
     if args.interval_minutes is None:
         args.interval_minutes = RESOLUTION_TO_MINUTES.get(args.resolution, 5)
     return args
 
 
+def _to_utc_timestamp(value: Any) -> pd.Timestamp | None:
+    if value in (None, ""):
+        return None
+    ts = pd.to_datetime(value, utc=True, errors="coerce")
+    if ts is pd.NaT:
+        return None
+    return ts
+
+
+def _seconds_since(value: pd.Timestamp | None, *, now: pd.Timestamp) -> int | None:
+    if value is None:
+        return None
+    return max(0, int((now - value).total_seconds()))
+
+
+def _iso(value: pd.Timestamp | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+def _websocket_key(args: argparse.Namespace) -> tuple[str, str]:
+    return (str(args.symbol).upper(), str(args.resolution).upper())
+
+
+def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionGate:
+    now_utc = pd.Timestamp.now(tz="UTC")
+    symbol = str(args.symbol).strip()
+    resolution = str(args.resolution).strip().upper()
+    stale_threshold = int(args.websocket_stale_seconds)
+    key = _websocket_key(args)
+    last_processed = _LAST_PROCESSED_WEBSOCKET_CANDLE.get(key)
+    details: dict[str, Any] = {
+        "state": "websocket_gate",
+        "gate_checked_at": now_utc.isoformat(),
+        "symbol": symbol,
+        "resolution": resolution,
+        "websocket_stale_threshold_seconds": stale_threshold,
+        "last_processed_websocket_candle_timestamp_utc": _iso(last_processed),
+    }
+    try:
+        with connect(args.postgres_dsn) as conn:
+            latest_quote = conn.execute(
+                """
+                SELECT updated_at, timestamp_utc, source
+                FROM live_quotes
+                WHERE symbol = %s
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (symbol,),
+            ).fetchone()
+            latest_websocket_candle = conn.execute(
+                """
+                SELECT timestamp_utc, updated_at
+                FROM ohlcv_candles
+                WHERE symbol = %s AND resolution = %s AND source = 'websocket_ohlc'
+                ORDER BY timestamp_utc DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (symbol, resolution),
+            ).fetchone()
+            websocket_state = conn.execute(
+                """
+                SELECT status, updated_at
+                FROM service_heartbeats
+                WHERE service_name = 'websocket_stream'
+                """
+            ).fetchone()
+    except Exception as exc:  # noqa: BLE001
+        details.update({"state": "paused_websocket_gate", "gate_reason": "websocket_health_unavailable", "error": str(exc)})
+        return WebSocketPredictionGate(
+            allow=False,
+            reason="websocket_health_unavailable",
+            details=details,
+        )
+
+    quote_updated_at = _to_utc_timestamp((latest_quote or {}).get("updated_at"))
+    quote_timestamp_utc = _to_utc_timestamp((latest_quote or {}).get("timestamp_utc"))
+    quote_ref = quote_updated_at or quote_timestamp_utc
+    websocket_candle_timestamp = _to_utc_timestamp((latest_websocket_candle or {}).get("timestamp_utc"))
+    websocket_candle_updated_at = _to_utc_timestamp((latest_websocket_candle or {}).get("updated_at"))
+    websocket_candidates = [v for v in [quote_ref, websocket_candle_updated_at, websocket_candle_timestamp] if v is not None]
+    websocket_ref = max(websocket_candidates) if websocket_candidates else None
+    websocket_stale_seconds = _seconds_since(websocket_ref, now=now_utc)
+
+    websocket_stream_status = str((websocket_state or {}).get("status") or "MISSING").upper()
+    websocket_stream_updated_at = _to_utc_timestamp((websocket_state or {}).get("updated_at"))
+
+    details.update(
+        {
+            "websocket_stream_status": websocket_stream_status,
+            "websocket_stream_updated_at": _iso(websocket_stream_updated_at),
+            "websocket_quote_updated_at": _iso(quote_updated_at),
+            "websocket_quote_timestamp_utc": _iso(quote_timestamp_utc),
+            "latest_websocket_candle_timestamp_utc": _iso(websocket_candle_timestamp),
+            "latest_websocket_candle_updated_at": _iso(websocket_candle_updated_at),
+            "websocket_last_update_utc": _iso(websocket_ref),
+            "websocket_stale_seconds": websocket_stale_seconds,
+        }
+    )
+
+    if websocket_stream_status in WEBSOCKET_STREAM_PAUSE_STATUSES:
+        details.update({"state": "paused_websocket_gate", "gate_reason": "websocket_stream_not_ready"})
+        return WebSocketPredictionGate(
+            allow=False,
+            reason="websocket_stream_not_ready",
+            details=details,
+            latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+        )
+    if websocket_candle_timestamp is None:
+        details.update({"state": "paused_websocket_gate", "gate_reason": "websocket_candle_missing"})
+        return WebSocketPredictionGate(
+            allow=False,
+            reason="websocket_candle_missing",
+            details=details,
+        )
+    if websocket_stale_seconds is None or websocket_stale_seconds > stale_threshold:
+        details.update({"state": "paused_websocket_gate", "gate_reason": "websocket_stale"})
+        return WebSocketPredictionGate(
+            allow=False,
+            reason="websocket_stale",
+            details=details,
+            latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+        )
+    if last_processed is not None and websocket_candle_timestamp <= last_processed:
+        details.update({"state": "paused_websocket_gate", "gate_reason": "no_new_websocket_candle"})
+        return WebSocketPredictionGate(
+            allow=False,
+            reason="no_new_websocket_candle",
+            details=details,
+            latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+        )
+
+    details.update({"state": "websocket_gate_passed", "gate_reason": "ok"})
+    return WebSocketPredictionGate(
+        allow=True,
+        reason="ok",
+        details=details,
+        latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+    )
+
+
 def _heartbeat(name: str, status: str, details: dict, dsn: str | None) -> None:
     try:
-        with connect(dsn) as conn:
-            conn.execute(
-                """
-                INSERT INTO service_heartbeats(service_name, status, details, updated_at)
-                VALUES (%s, %s, %s, now())
-                ON CONFLICT(service_name) DO UPDATE SET status = EXCLUDED.status, details = EXCLUDED.details, updated_at = now()
-                """,
-                (name, status, Jsonb(details)),
-            )
+        write_heartbeat(name, status, details, dsn)
     except Exception:  # noqa: BLE001
         LOGGER.debug("Unable to write scheduler heartbeat", exc_info=True)
 
@@ -159,6 +313,20 @@ def _run_cycle(args: argparse.Namespace) -> int:
     if args.postgres_dsn:
         cmd.extend(["--postgres-dsn", args.postgres_dsn])
     LOGGER.info("Starting scheduler cycle for %s %s", args.symbol, args.resolution)
+    gate = _websocket_prediction_gate(args)
+    if not gate.allow:
+        details = {
+            "returncode": 0,
+            "attempts": 0,
+            "symbol": args.symbol,
+            "resolution": args.resolution,
+            "interval_minutes": int(args.interval_minutes),
+            "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            **gate.details,
+        }
+        _heartbeat("prediction_scheduler", "PAUSED", details, args.postgres_dsn)
+        LOGGER.warning("Scheduler cycle paused: %s", gate.reason)
+        return 0
     try:
         attempt = 0
         max_attempts = 2
@@ -196,10 +364,19 @@ def _run_cycle(args: argparse.Namespace) -> int:
             "resolution": args.resolution,
             "interval_minutes": int(args.interval_minutes),
             "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+            **gate.details,
         }
         if result.returncode != 0 and output_tail:
             details["output_tail"] = output_tail
-        _heartbeat("prediction_scheduler", "OK" if result.returncode == 0 else "ERROR", details, args.postgres_dsn)
+        heartbeat_status = "OK" if result.returncode == 0 else ("COOLDOWN" if _looks_like_rate_limit(output_tail) else "ERROR")
+        if heartbeat_status == "COOLDOWN":
+            details["state"] = "cooldown"
+        _heartbeat("prediction_scheduler", heartbeat_status, details, args.postgres_dsn)
+        if result.returncode == 0 and gate.latest_candle_timestamp_utc:
+            key = _websocket_key(args)
+            parsed = _to_utc_timestamp(gate.latest_candle_timestamp_utc)
+            if parsed is not None:
+                _LAST_PROCESSED_WEBSOCKET_CANDLE[key] = parsed
         LOGGER.info("Scheduler cycle finished with return code %s", result.returncode)
         return result.returncode
     except Exception as exc:  # noqa: BLE001

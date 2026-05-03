@@ -9,10 +9,11 @@ import time
 from pathlib import Path
 
 import pandas as pd
-from psycopg.types.json import Jsonb
 
 from config import configure_logging
 from db import connect
+from prediction_store import refresh_shadow_prediction_statuses
+from service_runtime import write_heartbeat
 
 LOGGER = logging.getLogger(__name__)
 
@@ -39,7 +40,17 @@ def _due_runs(dsn: str | None, limit: int = 5) -> list[dict]:
                   FROM prediction_outcomes o
                   WHERE o.run_id = prediction_runs.run_id
                     AND o.status = 'PENDING'
-                    AND o.forecast_timestamp_utc <= now()
+                    AND o.forecast_timestamp_utc + CASE prediction_runs.resolution
+                          WHEN 'MINUTE'    THEN INTERVAL '1 minute'
+                          WHEN 'MINUTE_5'  THEN INTERVAL '5 minutes'
+                          WHEN 'MINUTE_15' THEN INTERVAL '15 minutes'
+                          WHEN 'MINUTE_30' THEN INTERVAL '30 minutes'
+                          WHEN 'HOUR'      THEN INTERVAL '1 hour'
+                          WHEN 'HOUR_4'    THEN INTERVAL '4 hours'
+                          WHEN 'DAY'       THEN INTERVAL '1 day'
+                          WHEN 'WEEK'      THEN INTERVAL '7 days'
+                          ELSE             INTERVAL '5 minutes'
+                        END <= now()
               )
             ORDER BY updated_at ASC, forecast_end_timestamp_utc ASC
             LIMIT %s
@@ -50,15 +61,7 @@ def _due_runs(dsn: str | None, limit: int = 5) -> list[dict]:
 
 def _heartbeat(status: str, details: dict, dsn: str | None) -> None:
     try:
-        with connect(dsn) as conn:
-            conn.execute(
-                """
-                INSERT INTO service_heartbeats(service_name, status, details, updated_at)
-                VALUES ('validation_worker', %s, %s, now())
-                ON CONFLICT(service_name) DO UPDATE SET status = EXCLUDED.status, details = EXCLUDED.details, updated_at = now()
-                """,
-                (status, Jsonb(details)),
-            )
+        write_heartbeat("validation_worker", status, details, dsn)
     except Exception:  # noqa: BLE001
         LOGGER.debug("Unable to write validation heartbeat", exc_info=True)
 
@@ -148,11 +151,16 @@ def _run_validation_cycle(args: argparse.Namespace) -> dict:
             rate_limited = True
             LOGGER.warning("Validation cycle hit Capital.com rate limit; stopping this cycle early.")
             break
+    shadow_status = refresh_shadow_prediction_statuses(dsn=args.postgres_dsn, limit=max(10, int(args.batch_size) * 10))
+    if shadow_status["errors"]:
+        errors += int(shadow_status["errors"])
+        last_error = f"shadow status refresh errors: {shadow_status['errors']}"
     return {
         "due_runs": len(due),
         "errors": errors,
         "last_error": last_error,
         "rate_limited": rate_limited,
+        "shadow_status": shadow_status,
     }
 
 
@@ -165,6 +173,7 @@ def main() -> None:
             "errors": 0,
             "last_error": None,
             "rate_limited": False,
+            "shadow_status": {"checked": 0, "updated": 0, "pending": 0, "errors": 0},
         }
         try:
             details = _run_validation_cycle(args)
@@ -173,13 +182,16 @@ def main() -> None:
             details["errors"] = int(details.get("errors") or 0) + 1
             details["last_error"] = str(exc)
             LOGGER.exception("Validation worker cycle crashed")
+        heartbeat_status = "OK" if details["errors"] == 0 else ("COOLDOWN" if details.get("rate_limited") else "ERROR")
         _heartbeat(
-            "OK" if details["errors"] == 0 else "ERROR",
+            heartbeat_status,
             {
                 "due_runs": details["due_runs"],
                 "errors": details["errors"],
                 "last_error": details["last_error"],
                 "rate_limited": details["rate_limited"],
+                "state": "cooldown" if heartbeat_status == "COOLDOWN" else "running",
+                "shadow_status": details["shadow_status"],
                 "batch_size": max(1, int(args.batch_size)),
                 "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
             },

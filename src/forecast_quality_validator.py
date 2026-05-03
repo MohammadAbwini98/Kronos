@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import math
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
+from forecast_scoring import DEFAULT_SCORING_VERSION, direction_from_move_pct, score_forecast_against_actuals
 from trading_usefulness import analyze_trading_usefulness
 from time_utils import display_timezone_name, format_local_timestamp
 
@@ -25,12 +25,6 @@ SUPPORTED_RESOLUTIONS = {
 
 class ForecastQualityError(ValueError):
     """Raised when forecast quality validation cannot be performed."""
-
-
-def direction_from_move_pct(move_pct: float, flat_threshold_pct: float = 0.02) -> str:
-    if abs(move_pct) < flat_threshold_pct:
-        return "FLAT"
-    return "UP" if move_pct > 0 else "DOWN"
 
 
 def validate_ohlc_df(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -102,6 +96,7 @@ def validate_forecast_quality(
     flat_threshold_pct: float = 0.02,
     acceptable_mape_pct: float = 0.25,
     cost_threshold_pct: float = 0.05,
+    last_input_close: float | None = None,
 ) -> dict[str, Any]:
     if resolution not in SUPPORTED_RESOLUTIONS:
         raise ForecastQualityError(f"Unsupported resolution: {resolution}")
@@ -125,6 +120,7 @@ def validate_forecast_quality(
             "resolution": resolution,
             "price_side": price_side,
             "display_timezone": display_timezone_name(),
+            "scoring_version": DEFAULT_SCORING_VERSION,
             "forecast_horizon_candles": int(len(forecast)),
             "forecast_horizon_minutes": int(len(forecast) * SUPPORTED_RESOLUTIONS[resolution]),
             "matched_candles": matched_candles,
@@ -157,32 +153,24 @@ def validate_forecast_quality(
         )
         return metrics
 
-    error = matched["close_forecast"] - matched["close_actual"]
-    abs_error = error.abs()
-    pct_error = _safe_mape(abs_error, matched["close_actual"])
-    mae = float(abs_error.mean())
-    rmse = float(math.sqrt(float((error**2).mean())))
-    mape_pct = float(pct_error.mean())
-    max_abs_error = float(abs_error.max())
-    max_abs_percentage_error = float(pct_error.max())
-    average_forecast_error = float(error.mean())
-
-    actual_with_prev = actual_available[["timestamps", "close"]].rename(columns={"close": "previous_actual_close"})
-    actual_with_prev["previous_actual_close"] = actual_with_prev["previous_actual_close"].shift(1)
-    matched = matched.merge(actual_with_prev, on="timestamps", how="left")
-    direction_rows = matched.dropna(subset=["previous_actual_close"]).copy()
-    direction_accuracy_pct: float | None = None
-    expected_movement_pct: float | None = None
-    direction_matches = 0
-    direction_total = int(len(direction_rows))
-    if direction_total > 0:
-        forecast_move_pct = ((direction_rows["close_forecast"] / direction_rows["previous_actual_close"]) - 1.0) * 100.0
-        actual_move_pct = ((direction_rows["close_actual"] / direction_rows["previous_actual_close"]) - 1.0) * 100.0
-        forecast_dir = forecast_move_pct.apply(lambda value: direction_from_move_pct(float(value), flat_threshold_pct))
-        actual_dir = actual_move_pct.apply(lambda value: direction_from_move_pct(float(value), flat_threshold_pct))
-        direction_matches = int((forecast_dir == actual_dir).sum())
-        direction_accuracy_pct = float((direction_matches / direction_total) * 100.0)
-        expected_movement_pct = float(forecast_move_pct.abs().mean())
+    score = score_forecast_against_actuals(
+        forecast,
+        actual_available,
+        last_input_close=last_input_close,
+        flat_threshold_pct=flat_threshold_pct,
+        cost_threshold_pct=cost_threshold_pct,
+    )
+    summary = score["summary"]
+    mae = summary["mae"]
+    rmse = summary["rmse"]
+    mape_pct = summary["mape_pct"]
+    max_abs_error = summary["max_abs_error"]
+    max_abs_percentage_error = summary["max_abs_percentage_error"]
+    average_forecast_error = summary["average_forecast_error"]
+    direction_accuracy_pct = summary["direction_accuracy_pct"]
+    direction_matches = summary["direction_matches"]
+    direction_total = summary["direction_comparable_candles"]
+    expected_movement_pct = summary["expected_movement_pct"]
 
     neutral_threshold = max(float(matched["close_actual"].mean()) * acceptable_mape_pct / 100.0 * 0.1, 1e-9)
     report.update(

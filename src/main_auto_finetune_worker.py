@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from psycopg.types.json import Jsonb
 
 from config import configure_logging, load_settings
 from db import connect
+from dataset_snapshots import create_dataset_snapshot
+from model_registry import register_model_version
+from service_runtime import write_heartbeat
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,18 +71,7 @@ def parse_args() -> argparse.Namespace:
 
 def _heartbeat(status: str, details: dict[str, Any], dsn: str | None) -> None:
     try:
-        with connect(dsn) as conn:
-            conn.execute(
-                """
-                INSERT INTO service_heartbeats(service_name, status, details, updated_at)
-                VALUES ('auto_finetune_worker', %s, %s, now())
-                ON CONFLICT(service_name) DO UPDATE
-                SET status = EXCLUDED.status,
-                    details = EXCLUDED.details,
-                    updated_at = now()
-                """,
-                (status, Jsonb(details)),
-            )
+        write_heartbeat("auto_finetune_worker", status, details, dsn)
     except Exception:  # noqa: BLE001
         LOGGER.debug("Unable to write auto-finetune heartbeat", exc_info=True)
 
@@ -189,6 +180,15 @@ def _promotion_decision(
     min_matched: int,
     previous_promoted_accuracy: float | None,
 ) -> tuple[str, str]:
+    """
+    Pre-flight check before formal candidate evaluation.
+
+    This function must NEVER return 'approved'.  Final approval requires
+    running evaluate_promotion(model_version_id) in model_registry, which
+    uses candidate-specific shadow evaluations and walk-forward results.
+    Using incumbent live-metric thresholds here as an approval gate is a
+    confound: incumbent performance says nothing about the new candidate.
+    """
     if not model_ready:
         return "not_ready", "model_artifacts_missing"
     matched = int(metrics.get("matched_candles") or 0)
@@ -196,12 +196,10 @@ def _promotion_decision(
     if matched < min_matched:
         return "pending_review", f"matched_candles_below_threshold ({matched}/{min_matched})"
     if accuracy is None:
-        return "pending_review", "direction_accuracy_unavailable"
-    if float(accuracy) < float(min_accuracy):
-        return "pending_review", f"direction_accuracy_below_threshold ({accuracy:.2f}/{min_accuracy:.2f})"
-    if previous_promoted_accuracy is not None and float(accuracy) <= float(previous_promoted_accuracy):
-        return "pending_review", f"direction_accuracy_not_improved ({accuracy:.2f}/{float(previous_promoted_accuracy):.2f})"
-    return "approved", "promotion_criteria_met"
+        return "pending_evaluation", "candidate_ready_for_evaluation"
+    # Even when live metrics look good, we still only flag pending_evaluation.
+    # The caller must invoke evaluate_promotion() to formally approve.
+    return "pending_evaluation", "candidate_ready_for_evaluation"
 
 
 def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) -> None:
@@ -229,6 +227,46 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
     websocket_rows = int(source_counts.get("websocket_ohlc", 0))
     historical_rows = max(0, row_count - websocket_rows)
     newest_ts = None if df.empty else df["timestamps"].iloc[-1].isoformat()
+    training_dataset_id = previous.get("training_dataset_id")
+    evaluation_dataset_id = previous.get("evaluation_dataset_id")
+    if not df.empty:
+        try:
+            # Split dataset: oldest 80% for training, newest 20% for validation holdout.
+            # Using the same snapshot for both training and evaluation would leak
+            # in-sample data into the promotion decision.
+            split_idx = max(1, int(len(df) * 0.8))
+            train_df = df.iloc[:split_idx]
+            eval_df = df.iloc[split_idx:]
+            if not train_df.empty:
+                train_snap = create_dataset_snapshot(
+                    dataset_role="train",
+                    symbol=args.symbol,
+                    resolution=args.resolution,
+                    price_side=args.price_side,
+                    start_timestamp_utc=train_df["timestamps"].iloc[0].isoformat(),
+                    end_timestamp_utc=train_df["timestamps"].iloc[-1].isoformat(),
+                    feature_set_id="raw-ohlcv-v1",
+                    source_filter={},
+                    quality_filter={},
+                    dsn=args.postgres_dsn,
+                )
+                training_dataset_id = train_snap["dataset_id"]
+            if not eval_df.empty:
+                eval_snap = create_dataset_snapshot(
+                    dataset_role="validation",
+                    symbol=args.symbol,
+                    resolution=args.resolution,
+                    price_side=args.price_side,
+                    start_timestamp_utc=eval_df["timestamps"].iloc[0].isoformat(),
+                    end_timestamp_utc=eval_df["timestamps"].iloc[-1].isoformat(),
+                    feature_set_id="raw-ohlcv-v1",
+                    source_filter={},
+                    quality_filter={},
+                    dsn=args.postgres_dsn,
+                )
+                evaluation_dataset_id = eval_snap["dataset_id"]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Unable to register auto-finetune dataset snapshot: %s", exc)
     websocket_df = df[df["source"] == "websocket_ohlc"] if "source" in df.columns else pd.DataFrame()
     newest_websocket_ts = None if websocket_df.empty else websocket_df["timestamps"].iloc[-1].isoformat()
     model_is_ready = _model_ready(model_dir)
@@ -259,6 +297,9 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
         "latest_websocket_timestamp_utc": newest_websocket_ts,
         "active_model_path": str(model_dir) if model_is_ready else None,
         "active_model_ready": model_is_ready,
+        "training_dataset_id": training_dataset_id,
+        "evaluation_dataset_id": evaluation_dataset_id,
+        "candidate_model_version_id": None,
         "finetune_command_configured": bool(args.command),
         "promotion_status": promotion_status,
         "promotion_reason": promotion_reason,
@@ -267,6 +308,27 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
         "promoted_direction_accuracy_pct": previous_promoted_accuracy,
         "latest_live_metrics": metrics,
     }
+    if model_is_ready:
+        try:
+            registered = register_model_version(
+                model_name="Kronos-auto-finetuned",
+                model_path=str(model_dir),
+                symbol=args.symbol,
+                resolution=args.resolution,
+                lookback=int(args.limit),
+                pred_len=int(os.getenv("SIGNAL_PRED_LEN", "12")),
+                training_dataset_id=training_dataset_id,
+                validation_dataset_id=evaluation_dataset_id,
+                # Never auto-approve: final promotion requires evaluate_promotion()
+                # which uses candidate-specific shadow and walk-forward evidence.
+                promotion_status="pending_evaluation",
+                promotion_reason=promotion_reason,
+                approval_metrics={"latest_live_metrics": metrics},
+                dsn=args.postgres_dsn,
+            )
+            status["candidate_model_version_id"] = registered["model_version_id"]
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Unable to register candidate model version: %s", exc)
 
     if row_count < args.min_rows:
         status.update(
@@ -334,8 +396,8 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
         previous_promoted_accuracy=previous_promoted_accuracy,
     )
     promoted_direction_accuracy = previous_promoted_accuracy
-    if promotion_status == "approved" and metrics.get("direction_accuracy_pct") is not None:
-        promoted_direction_accuracy = float(metrics.get("direction_accuracy_pct"))
+    # No longer elevate promoted_direction_accuracy from incumbent metrics here;
+    # approval must come through evaluate_promotion() in model_registry.
     output_tail = ((result.stdout or "") + "\n" + (result.stderr or "")).strip()[-4000:]
     status.update(
         {

@@ -4,11 +4,7 @@ from typing import Any
 
 import pandas as pd
 
-
-def _direction_from_move_pct(move_pct: float, flat_threshold_pct: float) -> str:
-    if abs(move_pct) < flat_threshold_pct:
-        return "FLAT"
-    return "UP" if move_pct > 0 else "DOWN"
+from forecast_scoring import direction_from_move_pct
 
 
 def analyze_trading_usefulness(
@@ -46,8 +42,8 @@ def analyze_trading_usefulness(
         }
     forecast_move = ((rows["close_forecast"] / rows["previous_actual_close"]) - 1.0) * 100.0
     actual_move = ((rows["close_actual"] / rows["previous_actual_close"]) - 1.0) * 100.0
-    rows["forecast_direction"] = forecast_move.apply(lambda value: _direction_from_move_pct(float(value), flat_threshold_pct))
-    rows["actual_direction"] = actual_move.apply(lambda value: _direction_from_move_pct(float(value), flat_threshold_pct))
+    rows["forecast_direction"] = forecast_move.apply(lambda value: direction_from_move_pct(float(value), flat_threshold_pct))
+    rows["actual_direction"] = actual_move.apply(lambda value: direction_from_move_pct(float(value), flat_threshold_pct))
     rows["actionable"] = forecast_move.abs() >= cost_threshold_pct
     actionable = rows[rows["actionable"]].copy()
     hold_rows = int((~rows["actionable"]).sum())

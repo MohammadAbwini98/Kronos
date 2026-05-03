@@ -94,6 +94,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN for saved prediction records.")
     parser.add_argument("--prediction-db", default=None, help="Deprecated alias for --postgres-dsn.")
     parser.add_argument("--no-save-prediction-db", action="store_true", help="Skip saving forecast rows to the prediction DB.")
+    parser.add_argument(
+        "--run-stamp",
+        default=None,
+        help="Pre-generated run timestamp (YYYYMMDDTHHMMSSz). If provided, overrides internal timestamp generation so the caller can predict artifact paths without globbing.",
+    )
     return parser.parse_args()
 
 
@@ -187,8 +192,11 @@ def _select_feature_columns(df: pd.DataFrame, feature_set: str) -> list[str]:
     if feature_set == "ohlcva":
         return ["open", "high", "low", "close", "volume", "amount"]
 
-    amount_is_unavailable = bool((df["amount"].abs() < 1e-12).all())
-    volume_is_available = bool((df["volume"].abs() > 1e-12).any())
+    # NaN-aware checks: None/NaN volume means the data source doesn't provide it.
+    amount_col = pd.to_numeric(df["amount"], errors="coerce")
+    volume_col = pd.to_numeric(df["volume"], errors="coerce")
+    amount_is_unavailable = bool(amount_col.isna().all() or (amount_col.fillna(0).abs() < 1e-12).all())
+    volume_is_available = bool(volume_col.notna().any() and (volume_col.fillna(0).abs() > 1e-12).any())
     if amount_is_unavailable and volume_is_available:
         return ["open", "high", "low", "close", "volume"]
     if amount_is_unavailable:
@@ -511,7 +519,7 @@ def main() -> None:
     repo_dir = Path(args.repo_dir or _env("KRONOS_REPO_DIR", r"C:\AI\Kronos"))
     tokenizer_dir = Path(args.tokenizer_dir or _env("KRONOS_TOKENIZER_DIR", r"C:\AI\Models\Kronos\Kronos-Tokenizer-base"))
     device = args.device or _env("KRONOS_DEVICE", "auto")
-    run_timestamp = _utc_file_timestamp()
+    run_timestamp = args.run_stamp if args.run_stamp else _utc_file_timestamp()
     epic = args.epic or _infer_epic(Path(args.input), args.resolution)
     safe_epic = _safe_name(epic)
     output_dir = Path(args.output_dir)
@@ -570,6 +578,7 @@ def main() -> None:
         prediction_db=Path(args.postgres_dsn or args.prediction_db) if (args.postgres_dsn or args.prediction_db) else None,
         save_prediction_db=not args.no_save_prediction_db,
     )
+    print(f"METADATA_PATH:{metadata_output}")
     print("\nKronos forecast complete")
     print(f"Input: {Path(args.input)}")
     print(f"Timestamped input copy: {input_copy_output}")

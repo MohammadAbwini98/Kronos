@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import re
 from typing import Any
 
 from db import connect, healthcheck
+from rate_limit_state import list_rate_limit_states
+from supervisor_lease import current_supervisor_lease
 from prediction_store import prediction_summary
 
 
@@ -13,6 +16,7 @@ ALLOWED_RUN_STATUSES = {"PENDING", "PARTIAL", "VALIDATED", "ERROR"}
 ALLOWED_SIGNALS = {"LONG", "SHORT", "HOLD"}
 DISPLAY_TIMEZONE = "Asia/Amman"
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+WEBSOCKET_STALE_THRESHOLD_SECONDS = max(30, int(os.getenv("SIGNAL_WEBSOCKET_STALE_SECONDS", "90")))
 
 
 def _looks_like_date_only(value: str | None) -> bool:
@@ -60,12 +64,8 @@ def _seconds_since(timestamp_value: Any) -> int | None:
 
 
 def _effective_signal_status(row: dict[str, Any]) -> str:
-    wins = _to_int(row.get("outcomes_wins"))
-    losses = _to_int(row.get("outcomes_losses"))
-    status = str(row.get("status") or "PENDING").upper()
-    if wins + losses > 0:
-        return "WIN" if wins >= losses else "LOSS"
-    return status
+    status = str(row.get("status") or row.get("status_raw") or "PENDING").upper()
+    return status if status in ALLOWED_SIGNAL_STATUSES else "PENDING"
 
 
 def _enrich_signal_levels(row: dict[str, Any]) -> dict[str, Any]:
@@ -107,7 +107,7 @@ def query_signals(
     status: str | None = None,
     signal_id: str | None = None,
     page: int = 1,
-    page_size: int = 20,
+    page_size: int = 10,
     dsn: str | None = None,
 ) -> dict[str, Any]:
     page = max(int(page), 1)
@@ -120,14 +120,7 @@ def query_signals(
     where = ["1=1"]
     params: list[Any] = []
     effective_status_sql = """
-        CASE
-            WHEN COALESCE(o.outcomes_wins, 0) + COALESCE(o.outcomes_losses, 0) > 0
-            THEN CASE
-                WHEN COALESCE(o.outcomes_wins, 0) >= COALESCE(o.outcomes_losses, 0) THEN 'WIN'
-                ELSE 'LOSS'
-            END
-            ELSE s.status
-        END
+        COALESCE(NULLIF(s.status, ''), 'PENDING')
     """
 
     if symbol:
@@ -171,7 +164,31 @@ def query_signals(
     base_from = """
         FROM signals s
         JOIN prediction_runs r ON r.run_id = s.run_id
-        LEFT JOIN signal_shadow_predictions shp ON shp.active_run_id = s.run_id
+        LEFT JOIN LATERAL (
+            SELECT
+                sp.active_run_id,
+                sp.shadow_run_id,
+                sp.model_name,
+                sp.shadow_model_version_id,
+                sp.scoring_version,
+                sp.model_path,
+                sp.signal,
+                sp.status,
+                sp.disagreement,
+                sp.direction,
+                sp.confidence,
+                sp.expected_move_pct,
+                sp.entry_price,
+                sp.tp_price,
+                sp.sl_price,
+                sp.reason,
+                sp.generated_at_utc,
+                sp.outcome_updated_at
+            FROM signal_shadow_predictions sp
+            WHERE sp.active_run_id = s.run_id
+            ORDER BY sp.generated_at_utc DESC NULLS LAST
+            LIMIT 1
+        ) shp ON TRUE
         LEFT JOIN (
             SELECT
                 run_id,
@@ -204,6 +221,10 @@ def query_signals(
                 s.confidence,
                 s.expected_move_pct,
                 s.cost_threshold_pct,
+                s.scoring_version,
+                s.actionable,
+                s.quality_grade,
+                s.movement_after_cost_pct,
                 s.entry_price,
                 s.tp_price,
                 s.sl_price,
@@ -214,8 +235,12 @@ def query_signals(
                 r.run_status,
                 shp.shadow_run_id,
                 shp.model_name AS shadow_model_name,
+                shp.shadow_model_version_id,
+                shp.scoring_version AS shadow_scoring_version,
                 shp.model_path AS shadow_model_path,
                 shp.signal AS shadow_signal,
+                shp.status AS shadow_status,
+                shp.disagreement,
                 shp.direction AS shadow_direction,
                 shp.confidence AS shadow_confidence,
                 shp.expected_move_pct AS shadow_expected_move_pct,
@@ -224,6 +249,7 @@ def query_signals(
                 shp.sl_price AS shadow_sl_price,
                 shp.reason AS shadow_reason,
                 shp.generated_at_utc AS shadow_generated_at_utc,
+                shp.outcome_updated_at AS shadow_outcome_updated_at,
                 COALESCE(o.outcomes_wins, 0)::int AS outcomes_wins,
                 COALESCE(o.outcomes_losses, 0)::int AS outcomes_losses,
                 COALESCE(o.outcomes_pending, 0)::int AS outcomes_pending
@@ -310,6 +336,85 @@ def latest_validation_metrics(*, symbol: str, resolution: str, dsn: str | None =
     }
 
 
+def _model_status_snapshot(*, symbol: str, resolution: str, dsn: str | None = None) -> dict[str, Any]:
+    try:
+        with connect(dsn) as conn:
+            active = conn.execute(
+                """
+                SELECT model_version_id, model_name, promotion_status, promotion_reason, artifact_manifest, updated_at
+                FROM model_versions
+                WHERE symbol = %s
+                  AND resolution = %s
+                  AND promotion_status = 'promoted'
+                ORDER BY updated_at DESC
+                LIMIT 1
+                """,
+                (symbol, resolution),
+            ).fetchone()
+            shadow = conn.execute(
+                """
+                SELECT
+                    mv.model_version_id,
+                    mv.model_name,
+                    mv.promotion_status,
+                    COUNT(se.id)::int AS samples,
+                    COALESCE(SUM(se.shadow_wins), 0)::int AS wins,
+                    COALESCE(SUM(se.shadow_losses), 0)::int AS losses
+                FROM model_versions mv
+                LEFT JOIN shadow_evaluations se ON se.shadow_model_version_id = mv.model_version_id
+                WHERE mv.symbol = %s
+                  AND mv.resolution = %s
+                  AND mv.promotion_status IN ('pending_review', 'shadow', 'approved')
+                GROUP BY mv.model_version_id
+                ORDER BY mv.updated_at DESC
+                LIMIT 1
+                """,
+                (symbol, resolution),
+            ).fetchone()
+        return {
+            "active_model": dict(active) if active else None,
+            "shadow_model": dict(shadow) if shadow else None,
+        }
+    except Exception:  # noqa: BLE001
+        return {"active_model": None, "shadow_model": None}
+
+
+def horizon_metric_summary(*, symbol: str, resolution: str, dsn: str | None = None) -> list[dict[str, Any]]:
+    try:
+        with connect(dsn) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    hm.horizon_index,
+                    COUNT(*) FILTER (WHERE hm.status IN ('WIN','LOSS'))::int AS samples,
+                    COALESCE(SUM(CASE WHEN hm.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
+                    COALESCE(SUM(CASE WHEN hm.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
+                    AVG(ABS(hm.close_error)) FILTER (WHERE hm.status IN ('WIN','LOSS'))::double precision AS mae,
+                    AVG(ABS(hm.close_error_pct)) FILTER (WHERE hm.status IN ('WIN','LOSS'))::double precision AS mape_pct
+                FROM forecast_horizon_metrics hm
+                JOIN prediction_runs r ON r.run_id = hm.run_id
+                WHERE r.symbol = %s AND r.resolution = %s
+                GROUP BY hm.horizon_index
+                ORDER BY hm.horizon_index
+                LIMIT 96
+                """,
+                (symbol, resolution),
+            ).fetchall()
+        payload = []
+        for row in rows:
+            samples = _to_int(row.get("samples"))
+            wins = _to_int(row.get("wins"))
+            payload.append(
+                {
+                    **dict(row),
+                    "direction_accuracy_pct": None if samples == 0 else (wins / samples) * 100.0,
+                }
+            )
+        return payload
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MINUTE_5", dsn: str | None = None) -> dict[str, Any]:
     health = healthcheck(dsn)
     if not health["ok"]:
@@ -345,18 +450,15 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                 s.timestamp_utc,
                 s.signal,
                 s.direction,
-                CASE
-                    WHEN COALESCE(o.outcomes_wins, 0) + COALESCE(o.outcomes_losses, 0) > 0
-                    THEN CASE
-                        WHEN COALESCE(o.outcomes_wins, 0) >= COALESCE(o.outcomes_losses, 0) THEN 'WIN'
-                        ELSE 'LOSS'
-                    END
-                    ELSE s.status
-                END AS status,
+                COALESCE(NULLIF(s.status, ''), 'PENDING') AS status,
                 s.status AS status_raw,
                 s.confidence,
                 s.expected_move_pct,
                 s.cost_threshold_pct,
+                s.scoring_version,
+                s.actionable,
+                s.quality_grade,
+                s.movement_after_cost_pct,
                 s.entry_price,
                 s.tp_price,
                 s.sl_price,
@@ -367,8 +469,12 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                 r.run_status,
                 shp.shadow_run_id,
                 shp.model_name AS shadow_model_name,
+                shp.shadow_model_version_id,
+                shp.scoring_version AS shadow_scoring_version,
                 shp.model_path AS shadow_model_path,
                 shp.signal AS shadow_signal,
+                shp.status AS shadow_status,
+                shp.disagreement,
                 shp.direction AS shadow_direction,
                 shp.confidence AS shadow_confidence,
                 shp.expected_move_pct AS shadow_expected_move_pct,
@@ -377,12 +483,37 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                 shp.sl_price AS shadow_sl_price,
                 shp.reason AS shadow_reason,
                 shp.generated_at_utc AS shadow_generated_at_utc,
+                shp.outcome_updated_at AS shadow_outcome_updated_at,
                 COALESCE(o.outcomes_wins, 0)::int AS outcomes_wins,
                 COALESCE(o.outcomes_losses, 0)::int AS outcomes_losses,
                 COALESCE(o.outcomes_pending, 0)::int AS outcomes_pending
             FROM signals s
             JOIN prediction_runs r ON r.run_id = s.run_id
-            LEFT JOIN signal_shadow_predictions shp ON shp.active_run_id = s.run_id
+            LEFT JOIN LATERAL (
+                SELECT
+                    sp.active_run_id,
+                    sp.shadow_run_id,
+                    sp.model_name,
+                    sp.shadow_model_version_id,
+                    sp.scoring_version,
+                    sp.model_path,
+                    sp.signal,
+                    sp.status,
+                    sp.disagreement,
+                    sp.direction,
+                    sp.confidence,
+                    sp.expected_move_pct,
+                    sp.entry_price,
+                    sp.tp_price,
+                    sp.sl_price,
+                    sp.reason,
+                    sp.generated_at_utc,
+                    sp.outcome_updated_at
+                FROM signal_shadow_predictions sp
+                WHERE sp.active_run_id = s.run_id
+                ORDER BY sp.generated_at_utc DESC NULLS LAST
+                LIMIT 1
+            ) shp ON TRUE
             LEFT JOIN outcome_rollup o ON o.run_id = s.run_id
             WHERE s.symbol = %s AND s.resolution = %s
             ORDER BY s.timestamp_utc DESC
@@ -471,6 +602,15 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
         if status_text == "OK" and stale_alert:
             state["status"] = "STALE"
 
+    model_status = _model_status_snapshot(symbol=symbol, resolution=resolution, dsn=dsn)
+    try:
+        latest_validation = latest_validation_metrics(symbol=symbol, resolution=resolution, dsn=dsn)
+    except Exception:  # noqa: BLE001
+        latest_validation = None
+    try:
+        supervisor = current_supervisor_lease(dsn=dsn)
+    except Exception:  # noqa: BLE001
+        supervisor = None
     return {
         "postgres": health,
         "candles": [dict(row) for row in reversed(candles)],
@@ -480,12 +620,17 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
             "websocket_quote": websocket_row,
             "websocket_last_update_utc": websocket_ref,
             "websocket_stale_seconds": websocket_stale_seconds,
-            "websocket_stale_alert": websocket_stale_seconds is None or websocket_stale_seconds > 90,
-            "alert_threshold_seconds": 90,
+            "websocket_stale_alert": websocket_stale_seconds is None or websocket_stale_seconds > WEBSOCKET_STALE_THRESHOLD_SECONDS,
+            "alert_threshold_seconds": WEBSOCKET_STALE_THRESHOLD_SECONDS,
         },
-        "latest_validation": latest_validation_metrics(symbol=symbol, resolution=resolution, dsn=dsn),
+        "latest_validation": latest_validation,
+        "horizon_metrics": horizon_metric_summary(symbol=symbol, resolution=resolution, dsn=dsn),
         "outcomes": [dict(row) for row in outcomes],
         "heartbeats": [dict(row) for row in heartbeats],
         "worker_statuses": worker_statuses,
+        "active_model": model_status.get("active_model"),
+        "shadow_model": model_status.get("shadow_model"),
+        "rate_limits": list_rate_limit_states(dsn=dsn),
+        "supervisor_lease": supervisor,
         "prediction_db": prediction_summary(dsn, limit=20),
     }

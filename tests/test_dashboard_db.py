@@ -193,5 +193,55 @@ class WorkerStaleDerivationTests(unittest.TestCase):
         self.assertFalse(snapshot["live_health"]["websocket_stale_alert"])
 
 
+class SignalStatusDerivationTests(unittest.TestCase):
+    def test_effective_signal_status_uses_persisted_status(self):
+        row = {
+            "status": "LOSS",
+            "status_raw": "WIN",
+            "outcomes_wins": 5,
+            "outcomes_losses": 0,
+        }
+        self.assertEqual("LOSS", dashboard_db._effective_signal_status(row))
+
+    def test_effective_signal_status_unknown_value_defaults_pending(self):
+        self.assertEqual("PENDING", dashboard_db._effective_signal_status({"status": "UNKNOWN"}))
+
+    def test_query_signals_keeps_stored_status(self):
+        now = datetime.now(timezone.utc)
+        query_rows = [
+            [{"total": 1}],
+            [
+                {
+                    "signal_id": "sig_1",
+                    "run_id": "run_1",
+                    "symbol": "ETHUSD",
+                    "epic": "ETHUSD",
+                    "resolution": "MINUTE_5",
+                    "timestamp_utc": now,
+                    "signal": "LONG",
+                    "direction": "UP",
+                    "status": "LOSS",
+                    "status_raw": "LOSS",
+                    "confidence": 0.6,
+                    "expected_move_pct": 0.2,
+                    "cost_threshold_pct": 0.05,
+                    "entry_price": 2300.0,
+                    "tp_price": 2302.0,
+                    "sl_price": 2298.5,
+                    "last_input_close": 2300.0,
+                    "outcomes_wins": 10,
+                    "outcomes_losses": 0,
+                    "outcomes_pending": 0,
+                }
+            ],
+        ]
+
+        with patch("dashboard_db.connect", return_value=_FakeConnection(query_rows)):
+            result = dashboard_db.query_signals(symbol="ETHUSD", resolution="MINUTE_5", page=1, page_size=10)
+
+        self.assertEqual(1, result["pagination"]["total"])
+        self.assertEqual("LOSS", result["rows"][0]["status"])
+
+
 if __name__ == "__main__":
     unittest.main()

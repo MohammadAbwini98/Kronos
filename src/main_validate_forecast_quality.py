@@ -25,6 +25,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-update-prediction-db", action="store_true", help="Skip updating saved prediction records.")
     parser.add_argument("--flat-threshold-pct", type=float, default=0.02)
     parser.add_argument("--cost-threshold-pct", type=float, default=0.05)
+    parser.add_argument("--scoring-version", default="v1")
     return parser.parse_args()
 
 
@@ -53,6 +54,10 @@ def _unique_path(path: Path) -> Path:
 
 def main() -> None:
     args = parse_args()
+    metadata_payload = {}
+    if args.metadata and Path(args.metadata).exists():
+        metadata_payload = json.loads(Path(args.metadata).read_text(encoding="utf-8"))
+    last_input_close = metadata_payload.get("last_input_close")
     report = validate_forecast_quality(
         args.forecast,
         args.actual,
@@ -60,6 +65,7 @@ def main() -> None:
         args.price_side,
         flat_threshold_pct=args.flat_threshold_pct,
         cost_threshold_pct=args.cost_threshold_pct,
+        last_input_close=None if last_input_close is None else float(last_input_close),
     )
     summary = report["forecast_quality_validation"]
     epic = args.epic or _infer_epic(Path(args.forecast), args.resolution)
@@ -81,6 +87,7 @@ def main() -> None:
             actual_csv_path=args.actual,
             db_path=args.postgres_dsn or args.prediction_db,
             flat_threshold_pct=args.flat_threshold_pct,
+            scoring_version=args.scoring_version,
         )
 
     status = summary["quality_status"]

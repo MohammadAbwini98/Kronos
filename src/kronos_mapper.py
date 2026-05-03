@@ -140,8 +140,11 @@ def ws_ohlc_to_kronos_row(event_payload: dict[str, Any]) -> dict[str, Any]:
         "high": _coerce_ws_number(high_raw),
         "low": _coerce_ws_number(low_raw),
         "close": _coerce_ws_number(close_raw),
-        "volume": 0.0,
-        "amount": 0.0,
+        # Volume and amount are not provided by the Capital.com WebSocket OHLC feed.
+        # Use None (NaN in DataFrame) so downstream code can distinguish
+        # "not available" from an actual zero-volume candle.
+        "volume": None,
+        "amount": None,
     }
 
 

@@ -7,13 +7,13 @@ import os
 from pathlib import Path
 
 import websockets
-from psycopg.types.json import Jsonb
 
 from capital_auth import CapitalAuthenticator
 from capital_rest_client import CapitalRestClient
 from capital_ws_ohlc_client import CapitalOhlcWebSocketClient, CapitalWebSocketError
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
-from db import connect
+from rate_limit_state import RateLimitCooldownError
+from service_runtime import write_heartbeat
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,18 +34,7 @@ def parse_args() -> argparse.Namespace:
 
 def _heartbeat(status: str, details: dict, dsn: str | None) -> None:
     try:
-        with connect(dsn) as conn:
-            conn.execute(
-                """
-                INSERT INTO service_heartbeats(service_name, status, details, updated_at)
-                VALUES ('websocket_stream', %s, %s, now())
-                ON CONFLICT(service_name) DO UPDATE
-                SET status = EXCLUDED.status,
-                    details = EXCLUDED.details,
-                    updated_at = now()
-                """,
-                (status, Jsonb(details)),
-            )
+        write_heartbeat("websocket_stream", status, details, dsn)
     except Exception:  # noqa: BLE001
         LOGGER.debug("Unable to write websocket heartbeat", exc_info=True)
 
@@ -88,6 +77,7 @@ async def async_main() -> None:
     while True:
         ws_client: CapitalOhlcWebSocketClient | None = None
         epic = args.epic or args.market or settings.default_epic
+        sleep_status = "RECONNECTING"
         try:
             authenticator = CapitalAuthenticator(settings)
             rest_client = CapitalRestClient(settings, authenticator=authenticator)
@@ -153,11 +143,12 @@ async def async_main() -> None:
             print(f"Kronos rolling CSV: {settings.output_dir / f'kronos_stream_input_{safe_epic_for_filename(epic)}_{resolution}.csv'}")
             return
         except Exception as exc:  # noqa: BLE001
-            status = "RECONNECTING" if _is_transient_websocket_error(exc) else "ERROR"
+            status = "COOLDOWN" if isinstance(exc, RateLimitCooldownError) else ("RECONNECTING" if _is_transient_websocket_error(exc) else "ERROR")
+            sleep_status = status
             _heartbeat(
                 status,
                 {
-                    "state": "error",
+                    "state": "cooldown" if status == "COOLDOWN" else "error",
                     "epic": epic,
                     "resolution": resolution,
                     "error": str(exc),
@@ -169,9 +160,9 @@ async def async_main() -> None:
 
         await _sleep_with_heartbeat(
             total_seconds=retry_seconds,
-            status="RECONNECTING",
+            status="COOLDOWN" if sleep_status == "COOLDOWN" else "RECONNECTING",
             details={
-                "state": "retry_sleep",
+                "state": "cooldown" if sleep_status == "COOLDOWN" else "retry_sleep",
                 "epic": epic,
                 "resolution": resolution,
             },
