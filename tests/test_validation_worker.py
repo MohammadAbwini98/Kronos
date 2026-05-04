@@ -99,7 +99,7 @@ class ValidationCycleTests(unittest.TestCase):
                 return_value={"checked": 0, "updated": 0, "pending": 0, "errors": 0},
             ),
         ):
-            details = main_validation_worker._run_validation_cycle(args)
+            details = main_validation_worker._run_validation_cycle(args, "val_test_cycle")
 
         self.assertEqual(1, validate.call_count)
         self.assertEqual(1, details["errors"])
@@ -116,7 +116,7 @@ class ValidationCycleTests(unittest.TestCase):
                 return_value={"checked": 0, "updated": 0, "pending": 0, "errors": 0},
             ),
         ):
-            details = main_validation_worker._run_validation_cycle(args)
+            details = main_validation_worker._run_validation_cycle(args, "val_test_cycle")
 
         self.assertEqual(1, details["errors"])
         self.assertFalse(details["rate_limited"])

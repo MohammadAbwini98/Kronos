@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -20,6 +21,7 @@ from config import (
     validate_resolution,
 )
 from kronos_mapper import capital_prices_to_kronos_df, save_kronos_csv
+from logging_utils import log_event, output_tail, safe_log_dict
 from rate_limit_state import (
     RateLimitCooldownError,
     clear_cooldown,
@@ -52,6 +54,16 @@ def save_json(data: Any, path: str | Path) -> Path:
     return target
 
 
+def _params_summary(params: dict[str, Any] | None) -> dict[str, Any] | None:
+    if params is None:
+        return None
+    safe = safe_log_dict(params)
+    if len(safe) <= 12:
+        return safe
+    keys = sorted(safe.keys())[:12]
+    return {key: safe[key] for key in keys}
+
+
 class CapitalRestClient:
     def __init__(
         self,
@@ -78,6 +90,16 @@ class CapitalRestClient:
         endpoint_class = endpoint_class_for_path(path)
         ensure_not_cooling_down(endpoint_class)
         url = f"{self.settings.base_url}{path}"
+        request_started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "capital.rest.request.start",
+            method=method,
+            path=path,
+            endpoint_class=endpoint_class,
+            params_summary=_params_summary(params),
+        )
         self._rate_limiter.wait()
         response = self.http.request(
             method=method,
@@ -87,7 +109,15 @@ class CapitalRestClient:
             timeout=30,
         )
         if response.status_code in {401, 403}:
-            LOGGER.warning("Authenticated request returned HTTP %s; refreshing session once", response.status_code)
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "capital.rest.request.retry_auth",
+                method=method,
+                path=path,
+                endpoint_class=endpoint_class,
+                status_code=response.status_code,
+            )
             self.authenticator.refresh()
             self._rate_limiter.wait()
             response = self.http.request(
@@ -112,19 +142,86 @@ class CapitalRestClient:
                 )
             except Exception:  # noqa: BLE001
                 LOGGER.debug("Unable to persist Capital.com cooldown state", exc_info=True)
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "capital.rest.request.rate_limited",
+                method=method,
+                path=path,
+                endpoint_class=endpoint_class,
+                status_code=429,
+                retry_after_seconds=retry_after_seconds,
+                duration_ms=int((time.perf_counter() - request_started) * 1000),
+                response_size_bytes=len(response.content or b""),
+                output_tail=output_tail(response.text),
+            )
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "capital.rest.request.cooldown",
+                endpoint_class=endpoint_class,
+                retry_after_seconds=retry_after_seconds,
+            )
             raise RateLimitCooldownError(
                 f"Capital.com endpoint class {endpoint_class} entered COOLDOWN after HTTP 429: {response.text}"
             )
         if response.status_code in {408, 425, 500, 502, 503, 504}:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "capital.rest.request.transient_error",
+                method=method,
+                path=path,
+                endpoint_class=endpoint_class,
+                status_code=response.status_code,
+                duration_ms=int((time.perf_counter() - request_started) * 1000),
+                response_size_bytes=len(response.content or b""),
+                output_tail=output_tail(response.text),
+            )
             raise TransientCapitalApiError(f"Transient Capital.com HTTP {response.status_code}: {response.text}")
         if response.status_code >= 400:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "capital.rest.request.error",
+                method=method,
+                path=path,
+                endpoint_class=endpoint_class,
+                status_code=response.status_code,
+                duration_ms=int((time.perf_counter() - request_started) * 1000),
+                response_size_bytes=len(response.content or b""),
+                output_tail=output_tail(response.text),
+            )
             raise CapitalApiError(f"Capital.com HTTP {response.status_code} for {path}: {response.text}")
         clear_cooldown(endpoint_class)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "capital.rest.request.success",
+            method=method,
+            path=path,
+            endpoint_class=endpoint_class,
+            status_code=response.status_code,
+            duration_ms=int((time.perf_counter() - request_started) * 1000),
+            response_size_bytes=len(response.content or b""),
+            params_summary=_params_summary(params),
+        )
         if not response.content:
             return {}
         try:
             return response.json()
         except ValueError as exc:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "capital.rest.response.non_json",
+                method=method,
+                path=path,
+                endpoint_class=endpoint_class,
+                status_code=response.status_code,
+                duration_ms=int((time.perf_counter() - request_started) * 1000),
+                response_size_bytes=len(response.content or b""),
+            )
             raise CapitalApiError(f"Capital.com returned non-JSON response for {path}") from exc
 
     def ping(self) -> Any:

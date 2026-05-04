@@ -3,10 +3,10 @@ from __future__ import annotations
 import logging
 import os
 import time
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
 from typing import Literal
+import json
 
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
@@ -96,6 +96,73 @@ class RateLimiter:
             self._last_call = time.monotonic()
 
 
+class _JsonLineFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S"),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+        }
+        return json.dumps(payload, ensure_ascii=True)
+
+
+class _DailyLogFileHandler(logging.FileHandler):
+    """Write to logs/log_DDMMYYYY.log and switch files when the day changes."""
+
+    def __init__(self, log_dir: Path, encoding: str = "utf-8") -> None:
+        self._log_dir = log_dir
+        self._current_day = self._day_token()
+        self._log_dir.mkdir(parents=True, exist_ok=True)
+        super().__init__(self._path_for_day(self._current_day), mode="a", encoding=encoding)
+
+    @staticmethod
+    def _day_token() -> str:
+        return time.strftime("%d%m%Y")
+
+    def _path_for_day(self, day_token: str) -> Path:
+        return self._log_dir / f"log_{day_token}.log"
+
+    def _rollover_if_needed(self) -> None:
+        day_token = self._day_token()
+        if day_token == self._current_day:
+            return
+        self.acquire()
+        try:
+            day_token = self._day_token()
+            if day_token == self._current_day:
+                return
+            self._current_day = day_token
+            self.baseFilename = os.fspath(self._path_for_day(day_token))
+            if self.stream:
+                self.stream.close()
+                self.stream = None
+            self.stream = self._open()
+        finally:
+            self.release()
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._rollover_if_needed()
+        super().emit(record)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _resolve_log_level(level: int | str | None) -> int:
+    if isinstance(level, int):
+        return level
+    if isinstance(level, str):
+        candidate = level.strip().upper()
+    else:
+        candidate = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+    return logging._nameToLevel.get(candidate, logging.INFO)
+
+
 def load_settings(env_override: str | None = None) -> BridgeSettings:
     env = env_override or os.getenv("CAPITAL_ENV", "demo")
     return BridgeSettings(
@@ -113,29 +180,52 @@ def load_settings(env_override: str | None = None) -> BridgeSettings:
     )
 
 
-def configure_logging(level: int = logging.INFO, service_name: str | None = None) -> None:
-    handlers: list[logging.Handler] = [RichHandler(markup=True, rich_tracebacks=True, show_path=False)]
-    if service_name:
-        output_dir = Path(os.getenv("CAPITAL_OUTPUT_DIR", "output"))
-        log_dir = Path(os.getenv("CAPITAL_LOG_DIR", str(output_dir / "logs")))
-        log_dir.mkdir(parents=True, exist_ok=True)
-        max_bytes = int(os.getenv("CAPITAL_LOG_MAX_BYTES", str(5 * 1024 * 1024)))
-        backup_count = int(os.getenv("CAPITAL_LOG_BACKUP_COUNT", "5"))
-        file_handler = RotatingFileHandler(
-            log_dir / f"{service_name}.log",
-            maxBytes=max(1024, max_bytes),
-            backupCount=max(1, backup_count),
-            encoding="utf-8",
-        )
-        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+def configure_logging(level: int | str | None = None, service_name: str | None = None) -> None:
+    resolved_level = _resolve_log_level(level)
+    log_dir = Path(os.getenv("CAPITAL_LOG_DIR", "logs"))
+    log_json = _env_flag("LOG_JSON", False)
+    log_to_console = _env_flag("LOG_TO_CONSOLE", True)
+    log_to_file_default = bool(service_name)
+    log_to_file = _env_flag("LOG_TO_FILE", log_to_file_default)
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(resolved_level)
+
+    # Remove only handlers managed by this function to avoid duplicates on repeated calls.
+    for handler in list(root_logger.handlers):
+        if getattr(handler, "_capital_managed", False):
+            root_logger.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    handlers: list[logging.Handler] = []
+
+    if log_to_console:
+        console_handler = RichHandler(markup=True, rich_tracebacks=True, show_path=False)
+        console_handler.setFormatter(logging.Formatter("%(message)s"))
+        setattr(console_handler, "_capital_managed", True)
+        handlers.append(console_handler)
+
+    if service_name and log_to_file:
+        file_handler = _DailyLogFileHandler(log_dir, encoding="utf-8")
+        if log_json:
+            file_handler.setFormatter(_JsonLineFormatter())
+        else:
+            file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        setattr(file_handler, "_capital_managed", True)
         handlers.append(file_handler)
-    logging.basicConfig(
-        level=level,
-        format="%(message)s",
-        datefmt="[%X]",
-        handlers=handlers,
-        force=True,
-    )
+
+    if not handlers:
+        fallback_handler = logging.StreamHandler()
+        fallback_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        setattr(fallback_handler, "_capital_managed", True)
+        handlers.append(fallback_handler)
+
+    for handler in handlers:
+        handler.setLevel(resolved_level)
+        root_logger.addHandler(handler)
 
 
 def validate_resolution(resolution: str) -> str:

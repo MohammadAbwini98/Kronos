@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import logging
 from pathlib import Path
+import time
 
 import pandas as pd
 
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
 from kronos_mapper import save_kronos_csv
+from logging_utils import log_event, new_correlation_id
 from prediction_store import upsert_instrument, upsert_ohlcv_df
 from time_utils import format_local_timestamp
 
@@ -22,6 +25,9 @@ RESOLUTION_TO_MINUTES = {
     "DAY": 1440,
     "WEEK": 10080,
 }
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,83 +58,129 @@ def _default_window(months: int) -> tuple[pd.Timestamp, pd.Timestamp]:
 
 
 def main() -> None:
-    configure_logging()
+    configure_logging(service_name="fetch_historical_range")
     args = parse_args()
-    resolution = validate_resolution(args.resolution)
-    price_side = validate_price_side(args.price_side)
-    if args.chunk_points <= 0 or args.chunk_points > 1000:
-        raise ValueError("--chunk-points must be between 1 and 1000")
+    request_id = new_correlation_id("req")
+    started = time.perf_counter()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "fetch_historical_range.start",
+        request_id=request_id,
+        market=args.market,
+        epic=args.epic,
+        symbol=args.symbol,
+        resolution=args.resolution,
+        months=args.months,
+        chunk_points=args.chunk_points,
+    )
+    try:
+        resolution = validate_resolution(args.resolution)
+        price_side = validate_price_side(args.price_side)
+        if args.chunk_points <= 0 or args.chunk_points > 1000:
+            raise ValueError("--chunk-points must be between 1 and 1000")
 
-    settings = load_settings(args.env)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-    client = CapitalRestClient(settings)
-    client.authenticate()
-    selected = client.resolve_market(args.market, args.epic, streaming=False)
-    epic = selected["epic"]
-    symbol = args.symbol or args.market or epic
-    client.save_market_details(epic)
+        settings = load_settings(args.env)
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+        client = CapitalRestClient(settings)
+        client.authenticate()
+        selected = client.resolve_market(args.market, args.epic, streaming=False)
+        epic = selected["epic"]
+        symbol = args.symbol or args.market or epic
+        client.save_market_details(epic)
 
-    default_start, default_end = _default_window(args.months)
-    start = pd.to_datetime(args.from_utc, utc=True) if args.from_utc else default_start
-    end = pd.to_datetime(args.to_utc, utc=True) if args.to_utc else default_end
-    if start >= end:
-        raise ValueError("Start time must be before end time")
+        default_start, default_end = _default_window(args.months)
+        start = pd.to_datetime(args.from_utc, utc=True) if args.from_utc else default_start
+        end = pd.to_datetime(args.to_utc, utc=True) if args.to_utc else default_end
+        if start >= end:
+            raise ValueError("Start time must be before end time")
 
-    step = pd.Timedelta(minutes=RESOLUTION_TO_MINUTES[resolution] * args.chunk_points)
-    cursor = start
-    frames: list[pd.DataFrame] = []
-    while cursor < end:
-        chunk_end = min(cursor + step, end)
-        df = client.get_historical_prices(
+        step = pd.Timedelta(minutes=RESOLUTION_TO_MINUTES[resolution] * args.chunk_points)
+        cursor = start
+        frames: list[pd.DataFrame] = []
+        while cursor < end:
+            chunk_end = min(cursor + step, end)
+            df = client.get_historical_prices(
+                epic=epic,
+                resolution=resolution,
+                max_points=args.chunk_points,
+                from_utc=_capital_time(cursor),
+                to_utc=_capital_time(chunk_end),
+                price_side=price_side,
+                save_outputs=False,
+                min_rows=1,
+            )
+            frames.append(df)
+            print(f"Fetched {len(df)} rows: {format_local_timestamp(cursor)} -> {format_local_timestamp(chunk_end)}")
+            cursor = chunk_end
+
+        combined = pd.concat(frames, ignore_index=True)
+        combined["timestamps"] = pd.to_datetime(combined["timestamps"], utc=True)
+        combined = combined.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+        output = (
+            Path(args.output)
+            if args.output
+            else settings.output_dir
+            / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}_{args.months}months.csv"
+        )
+        save_kronos_csv(combined, output, min_rows=1)
+        upsert_instrument(
+            symbol=symbol,
+            epic=epic,
+            market_name=selected.get("instrumentName", ""),
+            price_side=price_side,
+            metadata=selected,
+            dsn=args.postgres_dsn,
+        )
+        upserted_rows = upsert_ohlcv_df(
+            combined,
+            symbol=symbol,
             epic=epic,
             resolution=resolution,
-            max_points=args.chunk_points,
-            from_utc=_capital_time(cursor),
-            to_utc=_capital_time(chunk_end),
             price_side=price_side,
-            save_outputs=False,
-            min_rows=1,
+            source="historical",
+            dsn=args.postgres_dsn,
         )
-        frames.append(df)
-        print(f"Fetched {len(df)} rows: {format_local_timestamp(cursor)} -> {format_local_timestamp(chunk_end)}")
-        cursor = chunk_end
-
-    combined = pd.concat(frames, ignore_index=True)
-    combined["timestamps"] = pd.to_datetime(combined["timestamps"], utc=True)
-    combined = combined.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
-    output = (
-        Path(args.output)
-        if args.output
-        else settings.output_dir
-        / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}_{args.months}months.csv"
-    )
-    save_kronos_csv(combined, output, min_rows=1)
-    upsert_instrument(
-        symbol=symbol,
-        epic=epic,
-        market_name=selected.get("instrumentName", ""),
-        price_side=price_side,
-        metadata=selected,
-        dsn=args.postgres_dsn,
-    )
-    upserted_rows = upsert_ohlcv_df(
-        combined,
-        symbol=symbol,
-        epic=epic,
-        resolution=resolution,
-        price_side=price_side,
-        source="historical",
-        dsn=args.postgres_dsn,
-    )
-    print("\nHistorical range fetch complete")
-    print(f"Epic: {epic}")
-    print(f"Market: {selected.get('instrumentName', '')}")
-    print(f"Resolution: {resolution}")
-    print(f"Rows: {len(combined)}")
-    print(f"PostgreSQL candles upserted: {upserted_rows}")
-    print(f"Start: {format_local_timestamp(combined['timestamps'].iloc[0])}")
-    print(f"End: {format_local_timestamp(combined['timestamps'].iloc[-1])}")
-    print(f"CSV: {output}")
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "fetch_historical_range.completed",
+            request_id=request_id,
+            market=args.market,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            start=str(start),
+            end=str(end),
+            rows=len(combined),
+            upserted_rows=upserted_rows,
+            output_path=str(output),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        print("\nHistorical range fetch complete")
+        print(f"Epic: {epic}")
+        print(f"Market: {selected.get('instrumentName', '')}")
+        print(f"Resolution: {resolution}")
+        print(f"Rows: {len(combined)}")
+        print(f"PostgreSQL candles upserted: {upserted_rows}")
+        print(f"Start: {format_local_timestamp(combined['timestamps'].iloc[0])}")
+        print(f"End: {format_local_timestamp(combined['timestamps'].iloc[-1])}")
+        print(f"CSV: {output}")
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "fetch_historical_range.error",
+            request_id=request_id,
+            market=args.market,
+            epic=args.epic,
+            symbol=args.symbol,
+            resolution=args.resolution,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 if __name__ == "__main__":

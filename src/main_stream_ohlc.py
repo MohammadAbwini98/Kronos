@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import time
 
 import websockets
 
@@ -12,6 +13,7 @@ from capital_auth import CapitalAuthenticator
 from capital_rest_client import CapitalRestClient
 from capital_ws_ohlc_client import CapitalOhlcWebSocketClient, CapitalWebSocketError
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
+from logging_utils import log_event, new_correlation_id
 from rate_limit_state import RateLimitCooldownError
 from service_runtime import write_heartbeat
 
@@ -36,7 +38,13 @@ def _heartbeat(status: str, details: dict, dsn: str | None) -> None:
     try:
         write_heartbeat("websocket_stream", status, details, dsn)
     except Exception:  # noqa: BLE001
-        LOGGER.debug("Unable to write websocket heartbeat", exc_info=True)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "websocket.heartbeat.write.failed",
+            status=status,
+            details=details,
+        )
 
 
 def _is_transient_websocket_error(exc: BaseException) -> bool:
@@ -73,11 +81,24 @@ async def async_main() -> None:
     validate_price_side(args.price_side or settings.default_price_side)
     retry_seconds = max(5, args.retry_seconds)
     max_retry_seconds = max(retry_seconds, args.max_retry_seconds)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "websocket.service.start",
+        symbol=args.symbol,
+        market=args.market,
+        resolution=resolution,
+        env=args.env or settings.env,
+        retry_seconds=retry_seconds,
+        max_retry_seconds=max_retry_seconds,
+    )
 
     while True:
+        loop_started = time.perf_counter()
         ws_client: CapitalOhlcWebSocketClient | None = None
         epic = args.epic or args.market or settings.default_epic
         sleep_status = "RECONNECTING"
+        websocket_session_id = new_correlation_id("ws")
         try:
             authenticator = CapitalAuthenticator(settings)
             rest_client = CapitalRestClient(settings, authenticator=authenticator)
@@ -94,6 +115,7 @@ async def async_main() -> None:
                 price_side=args.price_side or settings.default_price_side,
                 postgres_dsn=args.postgres_dsn,
                 heartbeat_callback=lambda status, details: _heartbeat(status, details, args.postgres_dsn),
+                websocket_session_id=websocket_session_id,
             )
 
             _heartbeat(
@@ -107,12 +129,34 @@ async def async_main() -> None:
                 },
                 args.postgres_dsn,
             )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "websocket.connect.start",
+                websocket_session_id=websocket_session_id,
+                symbol=ws_client.symbol,
+                epic=epic,
+                resolution=resolution,
+                price_side=args.price_side or settings.default_price_side,
+            )
             print(f"Selected epic: {epic}")
             print(f"Instrument: {selected.get('instrumentName', '')}")
             print(f"Market details: {Path(market_details_path)}")
             print(f"Streaming files: {ws_client.events_path}, {ws_client.csv_path}")
             print("Press Ctrl+C to unsubscribe and stop.")
             await ws_client.stream_forever()
+
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "websocket.reconnect.scheduled",
+                websocket_session_id=websocket_session_id,
+                symbol=ws_client.symbol,
+                epic=epic,
+                resolution=resolution,
+                retry_in_seconds=retry_seconds,
+                duration_ms=int((time.perf_counter() - loop_started) * 1000),
+            )
 
             _heartbeat(
                 "RECONNECTING",
@@ -128,6 +172,16 @@ async def async_main() -> None:
         except KeyboardInterrupt:
             if ws_client is not None:
                 await ws_client.stop()
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "websocket.service.stopped",
+                websocket_session_id=websocket_session_id,
+                symbol=args.symbol or args.market,
+                epic=epic,
+                resolution=resolution,
+                duration_ms=int((time.perf_counter() - loop_started) * 1000),
+            )
             _heartbeat(
                 "OK",
                 {
@@ -145,6 +199,18 @@ async def async_main() -> None:
         except Exception as exc:  # noqa: BLE001
             status = "COOLDOWN" if isinstance(exc, RateLimitCooldownError) else ("RECONNECTING" if _is_transient_websocket_error(exc) else "ERROR")
             sleep_status = status
+            log_event(
+                LOGGER,
+                logging.WARNING if status != "ERROR" else logging.ERROR,
+                "websocket.cooldown" if status == "COOLDOWN" else "websocket.error",
+                websocket_session_id=websocket_session_id,
+                symbol=args.symbol or args.market,
+                epic=epic,
+                resolution=resolution,
+                retry_in_seconds=retry_seconds,
+                duration_ms=int((time.perf_counter() - loop_started) * 1000),
+                error=str(exc),
+            )
             _heartbeat(
                 status,
                 {
@@ -157,6 +223,18 @@ async def async_main() -> None:
                 args.postgres_dsn,
             )
             LOGGER.exception("WebSocket stream failed; retrying in %s seconds", retry_seconds)
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "websocket.reconnect.scheduled",
+            websocket_session_id=websocket_session_id,
+            symbol=args.symbol or args.market,
+            epic=epic,
+            resolution=resolution,
+            retry_in_seconds=retry_seconds,
+            state="cooldown" if sleep_status == "COOLDOWN" else "retry_sleep",
+        )
 
         await _sleep_with_heartbeat(
             total_seconds=retry_seconds,

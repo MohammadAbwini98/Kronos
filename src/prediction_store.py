@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import time
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +21,10 @@ from forecast_scoring import (
     signal_status_from_counts,
 )
 from model_registry import associate_run_model_version, model_version_id_for_path, register_model_version
+from logging_utils import log_event, new_correlation_id
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 PREDICTION_COLUMNS = ["timestamps", "open", "high", "low", "close", "volume", "amount"]
@@ -499,233 +505,281 @@ def save_prediction_run(
     flat_threshold_pct: float = 0.02,
     cost_threshold_pct: float = 0.05,
     min_confidence: float = 0.55,
+    prediction_request_id: str | None = None,
 ) -> dict[str, Any]:
     if db_path is not None and dsn is None:
         dsn = str(db_path)
+    request_id = prediction_request_id or new_correlation_id("pred")
+    started = time.perf_counter()
     metadata_source = Path(metadata_path)
-    metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
-    forecast = _load_ohlcv_csv(metadata["forecast_csv_path"], "forecast")
     run_id = run_id_from_metadata_path(metadata_source)
-    symbol = _safe_symbol(metadata)
-    epic = str(metadata["epic"])
-    price_side = str(metadata.get("price_side", "mid"))
-    provider = str(metadata.get("source_provider", "Capital.com"))
-    last_input_close = float(metadata["last_input_close"])
-    final_close = float(forecast["close"].iloc[-1])
-    signal = _signal_from_forecast(
-        last_input_close=last_input_close,
-        final_close=final_close,
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "prediction_store.save_prediction_run.start",
+        prediction_request_id=request_id,
+        run_id=run_id,
+        metadata_path=str(metadata_source),
+        dsn=masked_postgres_dsn(dsn),
+        flat_threshold_pct=flat_threshold_pct,
         cost_threshold_pct=cost_threshold_pct,
         min_confidence=min_confidence,
-        forecast_closes=list(forecast["close"]),
-        recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
     )
-    data_quality = metadata.get("data_quality") or {}
-    data_quality_grade = data_quality.get("quality_grade")
-    model_name = str(metadata.get("model_name", "Kronos"))
-    model_path = metadata.get("model_path") or ""
-    tokenizer_path = metadata.get("tokenizer_path")
-    model_version = register_model_version(
-        model_version_id=metadata.get("model_version_id"),
-        model_name=model_name,
-        model_path=str(model_path or model_name),
-        tokenizer_path=tokenizer_path,
-        symbol=symbol,
-        resolution=str(metadata["resolution"]),
-        lookback=int(metadata.get("input_rows_used") or metadata.get("lookback") or 512),
-        pred_len=int(metadata.get("forecast_rows") or 12),
-        promotion_status="pending_review",
-        dsn=dsn,
-    )
-    model_version_id = model_version["model_version_id"]
-    trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
-    upsert_instrument(
-        symbol=symbol,
-        epic=epic,
-        market_name=str(metadata.get("market_name", "")),
-        price_side=price_side,
-        provider=provider,
-        metadata=metadata,
-        dsn=dsn,
-    )
-    with connect(dsn) as conn:
-        _ensure_scoring_version(conn, scoring_version=DEFAULT_SCORING_VERSION, flat_threshold_pct=flat_threshold_pct, cost_threshold_pct=cost_threshold_pct)
-        conn.execute(
-            """
-            INSERT INTO prediction_runs(
-                run_id, provider, symbol, epic, market_name, resolution, price_side, source_provider,
-                model_name, model_path, tokenizer_path, generated_at_utc,
-                input_start_timestamp_utc, input_end_timestamp_utc,
-                forecast_start_timestamp_utc, forecast_end_timestamp_utc,
-                input_rows_used, forecast_rows, forecast_horizon_minutes, last_input_close,
-                metadata_path, input_csv_path, forecast_csv_path, validation_report_path,
-                scoring_version, data_quality_grade, model_version_id, run_status, updated_at
-            )
-            VALUES (
-                %(run_id)s, %(provider)s, %(symbol)s, %(epic)s, %(market_name)s, %(resolution)s, %(price_side)s, %(source_provider)s,
-                %(model_name)s, %(model_path)s, %(tokenizer_path)s, %(generated_at_utc)s,
-                %(input_start)s, %(input_end)s, %(forecast_start)s, %(forecast_end)s,
-                %(input_rows_used)s, %(forecast_rows)s, %(forecast_horizon_minutes)s, %(last_input_close)s,
-                %(metadata_path)s, %(input_csv_path)s, %(forecast_csv_path)s, %(validation_report_path)s,
-                %(scoring_version)s, %(data_quality_grade)s, %(model_version_id)s, 'PENDING', now()
-            )
-            ON CONFLICT(run_id) DO UPDATE SET
-                forecast_rows = EXCLUDED.forecast_rows,
-                forecast_end_timestamp_utc = EXCLUDED.forecast_end_timestamp_utc,
-                last_input_close = EXCLUDED.last_input_close,
-                metadata_path = EXCLUDED.metadata_path,
-                input_csv_path = EXCLUDED.input_csv_path,
-                forecast_csv_path = EXCLUDED.forecast_csv_path,
-                validation_report_path = EXCLUDED.validation_report_path,
-                scoring_version = EXCLUDED.scoring_version,
-                data_quality_grade = EXCLUDED.data_quality_grade,
-                model_version_id = EXCLUDED.model_version_id,
-                updated_at = now()
-            """,
-            {
-                "run_id": run_id,
-                "provider": provider,
-                "symbol": symbol,
-                "epic": epic,
-                "market_name": metadata.get("market_name", ""),
-                "resolution": metadata["resolution"],
-                "price_side": price_side,
-                "source_provider": provider,
-                "model_name": model_name,
-                "model_path": model_path,
-                "tokenizer_path": tokenizer_path,
-                "generated_at_utc": _to_utc_iso(metadata["generated_at_utc"]),
-                "input_start": _metadata_utc(metadata, "input_start_timestamp", "input_start_timestamp_utc"),
-                "input_end": _metadata_utc(metadata, "input_end_timestamp", "input_end_timestamp_utc"),
-                "forecast_start": _metadata_utc(metadata, "forecast_start_timestamp", "forecast_start_timestamp_utc"),
-                "forecast_end": _metadata_utc(metadata, "forecast_end_timestamp", "forecast_end_timestamp_utc"),
-                "input_rows_used": int(metadata["input_rows_used"]),
-                "forecast_rows": int(metadata["forecast_rows"]),
-                "forecast_horizon_minutes": int(metadata["forecast_horizon_minutes"]),
-                "last_input_close": last_input_close,
-                "metadata_path": str(metadata_source),
-                "input_csv_path": str(metadata.get("input_csv_path") or ""),
-                "forecast_csv_path": str(metadata.get("forecast_csv_path") or ""),
-                "validation_report_path": str(metadata.get("validation_report_path") or ""),
-                "scoring_version": DEFAULT_SCORING_VERSION,
-                "data_quality_grade": data_quality_grade,
-                "model_version_id": model_version_id,
-            },
+    try:
+        metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
+        forecast = _load_ohlcv_csv(metadata["forecast_csv_path"], "forecast")
+        symbol = _safe_symbol(metadata)
+        epic = str(metadata["epic"])
+        price_side = str(metadata.get("price_side", "mid"))
+        provider = str(metadata.get("source_provider", "Capital.com"))
+        last_input_close = float(metadata["last_input_close"])
+        final_close = float(forecast["close"].iloc[-1])
+        signal = _signal_from_forecast(
+            last_input_close=last_input_close,
+            final_close=final_close,
+            cost_threshold_pct=cost_threshold_pct,
+            min_confidence=min_confidence,
+            forecast_closes=list(forecast["close"]),
+            recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
         )
-        anchor_close = last_input_close
-        saved = 0
-        for index, row in forecast.iterrows():
-            close = _safe_float(row["close"])
-            inserted = conn.execute(
-                """
-                INSERT INTO forecast_candles(
-                    run_id, horizon_index, timestamp_utc, open, high, low, close, volume, amount,
-                    anchor_close, predicted_direction, updated_at
-                )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
-                ON CONFLICT(run_id, horizon_index) DO UPDATE SET
-                    timestamp_utc = EXCLUDED.timestamp_utc,
-                    open = EXCLUDED.open,
-                    high = EXCLUDED.high,
-                    low = EXCLUDED.low,
-                    close = EXCLUDED.close,
-                    volume = EXCLUDED.volume,
-                    amount = EXCLUDED.amount,
-                    anchor_close = EXCLUDED.anchor_close,
-                    predicted_direction = EXCLUDED.predicted_direction,
-                    updated_at = now()
-                RETURNING id
-                """,
-                (
-                    run_id,
-                    int(index) + 1,
-                    _to_utc_iso(row["timestamps"]),
-                    _safe_float(row["open"]),
-                    _safe_float(row["high"]),
-                    _safe_float(row["low"]),
-                    close,
-                    _safe_float(row["volume"]),
-                    _safe_float(row["amount"]),
-                    anchor_close,
-                    direction_from_prices(anchor_close, close, flat_threshold_pct),
-                ),
-            ).fetchone()
+        data_quality = metadata.get("data_quality") or {}
+        data_quality_grade = data_quality.get("quality_grade")
+        model_name = str(metadata.get("model_name", "Kronos"))
+        model_path = metadata.get("model_path") or ""
+        tokenizer_path = metadata.get("tokenizer_path")
+        model_version = register_model_version(
+            model_version_id=metadata.get("model_version_id"),
+            model_name=model_name,
+            model_path=str(model_path or model_name),
+            tokenizer_path=tokenizer_path,
+            symbol=symbol,
+            resolution=str(metadata["resolution"]),
+            lookback=int(metadata.get("input_rows_used") or metadata.get("lookback") or 512),
+            pred_len=int(metadata.get("forecast_rows") or 12),
+            promotion_status="pending_review",
+            dsn=dsn,
+        )
+        model_version_id = model_version["model_version_id"]
+        trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
+        upsert_instrument(
+            symbol=symbol,
+            epic=epic,
+            market_name=str(metadata.get("market_name", "")),
+            price_side=price_side,
+            provider=provider,
+            metadata=metadata,
+            dsn=dsn,
+        )
+        with connect(dsn) as conn:
+            _ensure_scoring_version(conn, scoring_version=DEFAULT_SCORING_VERSION, flat_threshold_pct=flat_threshold_pct, cost_threshold_pct=cost_threshold_pct)
             conn.execute(
                 """
-                INSERT INTO prediction_outcomes(
-                    run_id, forecast_candle_id, forecast_timestamp_utc, predicted_direction, forecast_close, status, updated_at
+                INSERT INTO prediction_runs(
+                    run_id, provider, symbol, epic, market_name, resolution, price_side, source_provider,
+                    model_name, model_path, tokenizer_path, generated_at_utc,
+                    input_start_timestamp_utc, input_end_timestamp_utc,
+                    forecast_start_timestamp_utc, forecast_end_timestamp_utc,
+                    input_rows_used, forecast_rows, forecast_horizon_minutes, last_input_close,
+                    metadata_path, input_csv_path, forecast_csv_path, validation_report_path,
+                    scoring_version, data_quality_grade, model_version_id, run_status, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, 'PENDING', now())
-                ON CONFLICT(run_id, forecast_candle_id) DO UPDATE SET
-                    forecast_timestamp_utc = EXCLUDED.forecast_timestamp_utc,
-                    predicted_direction = EXCLUDED.predicted_direction,
-                    forecast_close = EXCLUDED.forecast_close,
+                VALUES (
+                    %(run_id)s, %(provider)s, %(symbol)s, %(epic)s, %(market_name)s, %(resolution)s, %(price_side)s, %(source_provider)s,
+                    %(model_name)s, %(model_path)s, %(tokenizer_path)s, %(generated_at_utc)s,
+                    %(input_start)s, %(input_end)s, %(forecast_start)s, %(forecast_end)s,
+                    %(input_rows_used)s, %(forecast_rows)s, %(forecast_horizon_minutes)s, %(last_input_close)s,
+                    %(metadata_path)s, %(input_csv_path)s, %(forecast_csv_path)s, %(validation_report_path)s,
+                    %(scoring_version)s, %(data_quality_grade)s, %(model_version_id)s, 'PENDING', now()
+                )
+                ON CONFLICT(run_id) DO UPDATE SET
+                    forecast_rows = EXCLUDED.forecast_rows,
+                    forecast_end_timestamp_utc = EXCLUDED.forecast_end_timestamp_utc,
+                    last_input_close = EXCLUDED.last_input_close,
+                    metadata_path = EXCLUDED.metadata_path,
+                    input_csv_path = EXCLUDED.input_csv_path,
+                    forecast_csv_path = EXCLUDED.forecast_csv_path,
+                    validation_report_path = EXCLUDED.validation_report_path,
+                    scoring_version = EXCLUDED.scoring_version,
+                    data_quality_grade = EXCLUDED.data_quality_grade,
+                    model_version_id = EXCLUDED.model_version_id,
+                    updated_at = now()
+                """,
+                {
+                    "run_id": run_id,
+                    "provider": provider,
+                    "symbol": symbol,
+                    "epic": epic,
+                    "market_name": metadata.get("market_name", ""),
+                    "resolution": metadata["resolution"],
+                    "price_side": price_side,
+                    "source_provider": provider,
+                    "model_name": model_name,
+                    "model_path": model_path,
+                    "tokenizer_path": tokenizer_path,
+                    "generated_at_utc": _to_utc_iso(metadata["generated_at_utc"]),
+                    "input_start": _metadata_utc(metadata, "input_start_timestamp", "input_start_timestamp_utc"),
+                    "input_end": _metadata_utc(metadata, "input_end_timestamp", "input_end_timestamp_utc"),
+                    "forecast_start": _metadata_utc(metadata, "forecast_start_timestamp", "forecast_start_timestamp_utc"),
+                    "forecast_end": _metadata_utc(metadata, "forecast_end_timestamp", "forecast_end_timestamp_utc"),
+                    "input_rows_used": int(metadata["input_rows_used"]),
+                    "forecast_rows": int(metadata["forecast_rows"]),
+                    "forecast_horizon_minutes": int(metadata["forecast_horizon_minutes"]),
+                    "last_input_close": last_input_close,
+                    "metadata_path": str(metadata_source),
+                    "input_csv_path": str(metadata.get("input_csv_path") or ""),
+                    "forecast_csv_path": str(metadata.get("forecast_csv_path") or ""),
+                    "validation_report_path": str(metadata.get("validation_report_path") or ""),
+                    "scoring_version": DEFAULT_SCORING_VERSION,
+                    "data_quality_grade": data_quality_grade,
+                    "model_version_id": model_version_id,
+                },
+            )
+            anchor_close = last_input_close
+            saved = 0
+            for index, row in forecast.iterrows():
+                close = _safe_float(row["close"])
+                inserted = conn.execute(
+                    """
+                    INSERT INTO forecast_candles(
+                        run_id, horizon_index, timestamp_utc, open, high, low, close, volume, amount,
+                        anchor_close, predicted_direction, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                    ON CONFLICT(run_id, horizon_index) DO UPDATE SET
+                        timestamp_utc = EXCLUDED.timestamp_utc,
+                        open = EXCLUDED.open,
+                        high = EXCLUDED.high,
+                        low = EXCLUDED.low,
+                        close = EXCLUDED.close,
+                        volume = EXCLUDED.volume,
+                        amount = EXCLUDED.amount,
+                        anchor_close = EXCLUDED.anchor_close,
+                        predicted_direction = EXCLUDED.predicted_direction,
+                        updated_at = now()
+                    RETURNING id
+                    """,
+                    (
+                        run_id,
+                        int(index) + 1,
+                        _to_utc_iso(row["timestamps"]),
+                        _safe_float(row["open"]),
+                        _safe_float(row["high"]),
+                        _safe_float(row["low"]),
+                        close,
+                        _safe_float(row["volume"]),
+                        _safe_float(row["amount"]),
+                        anchor_close,
+                        direction_from_prices(anchor_close, close, flat_threshold_pct),
+                    ),
+                ).fetchone()
+                conn.execute(
+                    """
+                    INSERT INTO prediction_outcomes(
+                        run_id, forecast_candle_id, forecast_timestamp_utc, predicted_direction, forecast_close, status, updated_at
+                    )
+                    VALUES (%s, %s, %s, %s, %s, 'PENDING', now())
+                    ON CONFLICT(run_id, forecast_candle_id) DO UPDATE SET
+                        forecast_timestamp_utc = EXCLUDED.forecast_timestamp_utc,
+                        predicted_direction = EXCLUDED.predicted_direction,
+                        forecast_close = EXCLUDED.forecast_close,
+                        updated_at = now()
+                    """,
+                    (
+                        run_id,
+                        inserted["id"],
+                        _to_utc_iso(row["timestamps"]),
+                        direction_from_prices(anchor_close, close, flat_threshold_pct),
+                        close,
+                    ),
+                )
+                anchor_close = close
+                saved += 1
+            conn.execute(
+                """
+                INSERT INTO signals(
+                    run_id, signal_id, symbol, epic, resolution, timestamp_utc, signal, direction, confidence,
+                    expected_move_pct, cost_threshold_pct, entry_price, tp_price, sl_price,
+                    scoring_version, actionable, quality_grade, status, reason, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
+                ON CONFLICT(run_id) DO UPDATE SET
+                    signal_id = EXCLUDED.signal_id,
+                    signal = EXCLUDED.signal,
+                    direction = EXCLUDED.direction,
+                    confidence = EXCLUDED.confidence,
+                    expected_move_pct = EXCLUDED.expected_move_pct,
+                    cost_threshold_pct = EXCLUDED.cost_threshold_pct,
+                    entry_price = EXCLUDED.entry_price,
+                    tp_price = EXCLUDED.tp_price,
+                    sl_price = EXCLUDED.sl_price,
+                    scoring_version = EXCLUDED.scoring_version,
+                    actionable = EXCLUDED.actionable,
+                    quality_grade = EXCLUDED.quality_grade,
+                    status = EXCLUDED.status,
+                    reason = EXCLUDED.reason,
                     updated_at = now()
                 """,
                 (
                     run_id,
-                    inserted["id"],
-                    _to_utc_iso(row["timestamps"]),
-                    direction_from_prices(anchor_close, close, flat_threshold_pct),
-                    close,
+                    run_id,
+                    symbol,
+                    epic,
+                    metadata["resolution"],
+                    _to_utc_iso(metadata["generated_at_utc"]),
+                    signal["signal"],
+                    signal["direction"],
+                    signal["confidence"],
+                    signal["expected_move_pct"],
+                    cost_threshold_pct,
+                    trade_levels["entry_price"],
+                    trade_levels["tp_price"],
+                    trade_levels["sl_price"],
+                    DEFAULT_SCORING_VERSION,
+                    signal["signal"] in {"LONG", "SHORT"},
+                    data_quality_grade,
+                    signal["reason"],
                 ),
             )
-            anchor_close = close
-            saved += 1
-        conn.execute(
-            """
-            INSERT INTO signals(
-                run_id, signal_id, symbol, epic, resolution, timestamp_utc, signal, direction, confidence,
-                expected_move_pct, cost_threshold_pct, entry_price, tp_price, sl_price,
-                scoring_version, actionable, quality_grade, status, reason, updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
-            ON CONFLICT(run_id) DO UPDATE SET
-                signal_id = EXCLUDED.signal_id,
-                signal = EXCLUDED.signal,
-                direction = EXCLUDED.direction,
-                confidence = EXCLUDED.confidence,
-                expected_move_pct = EXCLUDED.expected_move_pct,
-                cost_threshold_pct = EXCLUDED.cost_threshold_pct,
-                entry_price = EXCLUDED.entry_price,
-                tp_price = EXCLUDED.tp_price,
-                sl_price = EXCLUDED.sl_price,
-                scoring_version = EXCLUDED.scoring_version,
-                actionable = EXCLUDED.actionable,
-                quality_grade = EXCLUDED.quality_grade,
-                status = EXCLUDED.status,
-                reason = EXCLUDED.reason,
-                updated_at = now()
-            """,
-            (
-                run_id,
-                run_id,
-                symbol,
-                epic,
-                metadata["resolution"],
-                _to_utc_iso(metadata["generated_at_utc"]),
-                signal["signal"],
-                signal["direction"],
-                signal["confidence"],
-                signal["expected_move_pct"],
-                cost_threshold_pct,
-                trade_levels["entry_price"],
-                trade_levels["tp_price"],
-                trade_levels["sl_price"],
-                DEFAULT_SCORING_VERSION,
-                signal["signal"] in {"LONG", "SHORT"},
-                data_quality_grade,
-                signal["reason"],
-            ),
+        associate_run_model_version(run_id=run_id, model_version_id=model_version_id, role="active", dsn=dsn)
+        summary = {
+            "dsn": masked_postgres_dsn(dsn),
+            "run_id": run_id,
+            "saved_records": saved,
+            "signal": signal,
+            "model_version_id": model_version_id,
+        }
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "prediction_store.save_prediction_run.completed",
+            prediction_request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=metadata.get("resolution"),
+            saved_records=saved,
+            signal=signal.get("signal"),
+            direction=signal.get("direction"),
+            confidence=signal.get("confidence"),
+            expected_move_pct=signal.get("expected_move_pct"),
+            model_version_id=model_version_id,
+            duration_ms=int((time.perf_counter() - started) * 1000),
         )
-    associate_run_model_version(run_id=run_id, model_version_id=model_version_id, role="active", dsn=dsn)
-    return {
-        "dsn": masked_postgres_dsn(dsn),
-        "run_id": run_id,
-        "saved_records": saved,
-        "signal": signal,
-        "model_version_id": model_version_id,
-    }
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "prediction_store.save_prediction_run.error",
+            prediction_request_id=request_id,
+            run_id=run_id,
+            metadata_path=str(metadata_source),
+            dsn=masked_postgres_dsn(dsn),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 def save_shadow_prediction(
@@ -736,100 +790,142 @@ def save_shadow_prediction(
     cost_threshold_pct: float = 0.05,
     min_confidence: float = 0.55,
     shadow_model_version_id: str | None = None,
+    prediction_request_id: str | None = None,
 ) -> dict[str, Any]:
+    request_id = prediction_request_id or new_correlation_id("pred")
+    started = time.perf_counter()
     metadata_source = Path(metadata_path)
-    metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
-    forecast = _load_ohlcv_csv(metadata["forecast_csv_path"], "shadow forecast")
-    last_input_close = float(metadata["last_input_close"])
-    final_close = float(forecast["close"].iloc[-1])
-    signal = _signal_from_forecast(
-        last_input_close=last_input_close,
-        final_close=final_close,
-        cost_threshold_pct=cost_threshold_pct,
-        min_confidence=min_confidence,
-        forecast_closes=list(forecast["close"]),
-        recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "prediction_store.save_shadow_prediction.start",
+        prediction_request_id=request_id,
+        active_run_id=active_run_id,
+        metadata_path=str(metadata_source),
+        dsn=masked_postgres_dsn(dsn),
     )
-    trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
-    shadow_run_id = metadata_source.stem
-    model_name = str(metadata.get("model_name", "Kronos-shadow"))
-    model_path = str(metadata.get("model_path") or model_name)
-    registered = register_model_version(
-        model_version_id=shadow_model_version_id or metadata.get("model_version_id"),
-        model_name=model_name,
-        model_path=model_path,
-        tokenizer_path=metadata.get("tokenizer_path"),
-        symbol=str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD"),
-        resolution=str(metadata.get("resolution") or "MINUTE_5"),
-        lookback=int(metadata.get("input_rows_used") or 512),
-        pred_len=int(metadata.get("forecast_rows") or 12),
-        promotion_status="shadow",
-        dsn=dsn,
-    )
-    shadow_model_version_id = registered["model_version_id"]
-    with connect(dsn) as conn:
-        _ensure_scoring_version(conn, scoring_version=DEFAULT_SCORING_VERSION, cost_threshold_pct=cost_threshold_pct)
-        conn.execute(
-            """
-            INSERT INTO signal_shadow_predictions(
-                active_run_id, shadow_run_id, model_name, model_path, generated_at_utc,
-                signal, direction, confidence, expected_move_pct, cost_threshold_pct,
-                entry_price, tp_price, sl_price, reason, metadata_path, forecast_csv_path,
-                validation_report_path, shadow_model_version_id, scoring_version, status, updated_at
-            )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', now())
-            ON CONFLICT(active_run_id) DO UPDATE SET
-                shadow_run_id = EXCLUDED.shadow_run_id,
-                model_name = EXCLUDED.model_name,
-                model_path = EXCLUDED.model_path,
-                generated_at_utc = EXCLUDED.generated_at_utc,
-                signal = EXCLUDED.signal,
-                direction = EXCLUDED.direction,
-                confidence = EXCLUDED.confidence,
-                expected_move_pct = EXCLUDED.expected_move_pct,
-                cost_threshold_pct = EXCLUDED.cost_threshold_pct,
-                entry_price = EXCLUDED.entry_price,
-                tp_price = EXCLUDED.tp_price,
-                sl_price = EXCLUDED.sl_price,
-                reason = EXCLUDED.reason,
-                metadata_path = EXCLUDED.metadata_path,
-                forecast_csv_path = EXCLUDED.forecast_csv_path,
-                validation_report_path = EXCLUDED.validation_report_path,
-                shadow_model_version_id = EXCLUDED.shadow_model_version_id,
-                scoring_version = EXCLUDED.scoring_version,
-                status = 'PENDING',
-                outcome_updated_at = NULL,
-                updated_at = now()
-            """,
-            (
-                active_run_id,
-                shadow_run_id,
-                str(metadata.get("model_name", "Kronos-shadow")),
-                metadata.get("model_path"),
-                _to_utc_iso(metadata["generated_at_utc"]),
-                signal["signal"],
-                signal["direction"],
-                signal["confidence"],
-                signal["expected_move_pct"],
-                cost_threshold_pct,
-                trade_levels["entry_price"],
-                trade_levels["tp_price"],
-                trade_levels["sl_price"],
-                signal["reason"],
-                str(metadata_source),
-                str(metadata.get("forecast_csv_path") or ""),
-                str(metadata.get("validation_report_path") or ""),
-                shadow_model_version_id,
-                DEFAULT_SCORING_VERSION,
-            ),
+    try:
+        metadata = json.loads(metadata_source.read_text(encoding="utf-8"))
+        forecast = _load_ohlcv_csv(metadata["forecast_csv_path"], "shadow forecast")
+        last_input_close = float(metadata["last_input_close"])
+        final_close = float(forecast["close"].iloc[-1])
+        signal = _signal_from_forecast(
+            last_input_close=last_input_close,
+            final_close=final_close,
+            cost_threshold_pct=cost_threshold_pct,
+            min_confidence=min_confidence,
+            forecast_closes=list(forecast["close"]),
+            recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
         )
-    return {
-        "dsn": masked_postgres_dsn(dsn),
-        "active_run_id": active_run_id,
-        "shadow_run_id": shadow_run_id,
-        "shadow_model_version_id": shadow_model_version_id,
-        "signal": signal,
-    }
+        trade_levels = _trade_levels_from_signal(entry_price=last_input_close, signal=signal, cost_threshold_pct=cost_threshold_pct)
+        shadow_run_id = metadata_source.stem
+        model_name = str(metadata.get("model_name", "Kronos-shadow"))
+        model_path = str(metadata.get("model_path") or model_name)
+        registered = register_model_version(
+            model_version_id=shadow_model_version_id or metadata.get("model_version_id"),
+            model_name=model_name,
+            model_path=model_path,
+            tokenizer_path=metadata.get("tokenizer_path"),
+            symbol=str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD"),
+            resolution=str(metadata.get("resolution") or "MINUTE_5"),
+            lookback=int(metadata.get("input_rows_used") or 512),
+            pred_len=int(metadata.get("forecast_rows") or 12),
+            promotion_status="shadow",
+            dsn=dsn,
+        )
+        shadow_model_version_id = registered["model_version_id"]
+        with connect(dsn) as conn:
+            _ensure_scoring_version(conn, scoring_version=DEFAULT_SCORING_VERSION, cost_threshold_pct=cost_threshold_pct)
+            conn.execute(
+                """
+                INSERT INTO signal_shadow_predictions(
+                    active_run_id, shadow_run_id, model_name, model_path, generated_at_utc,
+                    signal, direction, confidence, expected_move_pct, cost_threshold_pct,
+                    entry_price, tp_price, sl_price, reason, metadata_path, forecast_csv_path,
+                    validation_report_path, shadow_model_version_id, scoring_version, status, updated_at
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', now())
+                ON CONFLICT(active_run_id) DO UPDATE SET
+                    shadow_run_id = EXCLUDED.shadow_run_id,
+                    model_name = EXCLUDED.model_name,
+                    model_path = EXCLUDED.model_path,
+                    generated_at_utc = EXCLUDED.generated_at_utc,
+                    signal = EXCLUDED.signal,
+                    direction = EXCLUDED.direction,
+                    confidence = EXCLUDED.confidence,
+                    expected_move_pct = EXCLUDED.expected_move_pct,
+                    cost_threshold_pct = EXCLUDED.cost_threshold_pct,
+                    entry_price = EXCLUDED.entry_price,
+                    tp_price = EXCLUDED.tp_price,
+                    sl_price = EXCLUDED.sl_price,
+                    reason = EXCLUDED.reason,
+                    metadata_path = EXCLUDED.metadata_path,
+                    forecast_csv_path = EXCLUDED.forecast_csv_path,
+                    validation_report_path = EXCLUDED.validation_report_path,
+                    shadow_model_version_id = EXCLUDED.shadow_model_version_id,
+                    scoring_version = EXCLUDED.scoring_version,
+                    status = 'PENDING',
+                    outcome_updated_at = NULL,
+                    updated_at = now()
+                """,
+                (
+                    active_run_id,
+                    shadow_run_id,
+                    str(metadata.get("model_name", "Kronos-shadow")),
+                    metadata.get("model_path"),
+                    _to_utc_iso(metadata["generated_at_utc"]),
+                    signal["signal"],
+                    signal["direction"],
+                    signal["confidence"],
+                    signal["expected_move_pct"],
+                    cost_threshold_pct,
+                    trade_levels["entry_price"],
+                    trade_levels["tp_price"],
+                    trade_levels["sl_price"],
+                    signal["reason"],
+                    str(metadata_source),
+                    str(metadata.get("forecast_csv_path") or ""),
+                    str(metadata.get("validation_report_path") or ""),
+                    shadow_model_version_id,
+                    DEFAULT_SCORING_VERSION,
+                ),
+            )
+        summary = {
+            "dsn": masked_postgres_dsn(dsn),
+            "active_run_id": active_run_id,
+            "shadow_run_id": shadow_run_id,
+            "shadow_model_version_id": shadow_model_version_id,
+            "signal": signal,
+        }
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "prediction_store.save_shadow_prediction.completed",
+            prediction_request_id=request_id,
+            active_run_id=active_run_id,
+            shadow_run_id=shadow_run_id,
+            shadow_model_version_id=shadow_model_version_id,
+            signal=signal.get("signal"),
+            direction=signal.get("direction"),
+            confidence=signal.get("confidence"),
+            expected_move_pct=signal.get("expected_move_pct"),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "prediction_store.save_shadow_prediction.error",
+            prediction_request_id=request_id,
+            active_run_id=active_run_id,
+            metadata_path=str(metadata_source),
+            dsn=masked_postgres_dsn(dsn),
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 def _shadow_validation_summary(

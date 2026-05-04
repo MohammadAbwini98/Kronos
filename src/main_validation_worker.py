@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -12,8 +11,10 @@ import pandas as pd
 
 from config import configure_logging
 from db import connect
+from logging_utils import log_event, new_correlation_id, output_tail
 from prediction_store import refresh_shadow_prediction_statuses
 from service_runtime import write_heartbeat
+from subprocess_utils import run_logged_subprocess
 
 LOGGER = logging.getLogger(__name__)
 
@@ -63,7 +64,13 @@ def _heartbeat(status: str, details: dict, dsn: str | None) -> None:
     try:
         write_heartbeat("validation_worker", status, details, dsn)
     except Exception:  # noqa: BLE001
-        LOGGER.debug("Unable to write validation heartbeat", exc_info=True)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "validation.heartbeat.write.failed",
+            status=status,
+            details=details,
+        )
 
 
 def _stamp_from_run_id(run_id: str, resolution: str) -> str:
@@ -84,11 +91,27 @@ def _looks_like_rate_limit(output: str) -> bool:
 
 
 def _run_command(cmd: list[str]) -> tuple[int, str]:
-    result = subprocess.run(cmd, cwd=Path.cwd(), text=True, capture_output=True)
-    return int(result.returncode), _combined_output(result)[-2000:]
+    result = run_logged_subprocess(
+        cmd,
+        logger=LOGGER,
+        event_prefix="validation.subprocess",
+        cwd=Path.cwd(),
+    )
+    return int(result.returncode), output_tail(_combined_output(result))
 
 
-def _validate_run(run: dict, args: argparse.Namespace) -> tuple[int, str]:
+def _validate_run(run: dict, args: argparse.Namespace, validation_cycle_id: str) -> tuple[int, str]:
+    run_id = str(run["run_id"])
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "validation.run.start",
+        validation_cycle_id=validation_cycle_id,
+        run_id=run_id,
+        epic=run.get("epic"),
+        resolution=run.get("resolution"),
+        price_side=run.get("price_side"),
+    )
     stamp = _stamp_from_run_id(run["run_id"], run["resolution"])
     actual = Path("output") / f"actual_for_forecast_{run['epic']}_{run['resolution']}_{stamp}.csv"
     fetch_cmd = [
@@ -125,72 +148,198 @@ def _validate_run(run: dict, args: argparse.Namespace) -> tuple[int, str]:
     if args.postgres_dsn:
         fetch_cmd.extend(["--postgres-dsn", args.postgres_dsn])
         validate_cmd.extend(["--postgres-dsn", args.postgres_dsn])
-    LOGGER.info("Validation worker fetching actuals for run %s", run["run_id"])
-    first_code, first_output = _run_command(fetch_cmd)
+    first_result = run_logged_subprocess(
+        fetch_cmd,
+        logger=LOGGER,
+        event_prefix="validation.fetch_actual.subprocess",
+        cwd=Path.cwd(),
+        context={
+            "validation_cycle_id": validation_cycle_id,
+            "run_id": run_id,
+            "epic": run.get("epic"),
+            "resolution": run.get("resolution"),
+            "price_side": run.get("price_side"),
+        },
+    )
+    first_code = int(first_result.returncode)
+    first_output = output_tail(_combined_output(first_result))
     if first_code != 0:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "validation.run.error",
+            validation_cycle_id=validation_cycle_id,
+            run_id=run_id,
+            returncode=first_code,
+            output_tail=first_output,
+        )
         return first_code, first_output
-    LOGGER.info("Validation worker validating forecast quality for run %s", run["run_id"])
-    return _run_command(validate_cmd)
+    validate_result = run_logged_subprocess(
+        validate_cmd,
+        logger=LOGGER,
+        event_prefix="validation.quality.subprocess",
+        cwd=Path.cwd(),
+        context={
+            "validation_cycle_id": validation_cycle_id,
+            "run_id": run_id,
+            "epic": run.get("epic"),
+            "resolution": run.get("resolution"),
+            "price_side": run.get("price_side"),
+        },
+    )
+    final_code = int(validate_result.returncode)
+    final_output = output_tail(_combined_output(validate_result))
+    if final_code == 0:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "validation.run.completed",
+            validation_cycle_id=validation_cycle_id,
+            run_id=run_id,
+            returncode=0,
+        )
+    else:
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "validation.run.error",
+            validation_cycle_id=validation_cycle_id,
+            run_id=run_id,
+            returncode=final_code,
+            output_tail=final_output,
+        )
+    return final_code, final_output
 
 
-def _run_validation_cycle(args: argparse.Namespace) -> dict:
+def _run_validation_cycle(args: argparse.Namespace, validation_cycle_id: str) -> dict:
+    cycle_started = time.perf_counter()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "validation.cycle.start",
+        validation_cycle_id=validation_cycle_id,
+        batch_size=max(1, int(args.batch_size)),
+    )
     errors = 0
     last_error = None
     rate_limited = False
     due = _due_runs(args.postgres_dsn, limit=args.batch_size)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "validation.due_runs.loaded",
+        validation_cycle_id=validation_cycle_id,
+        due_runs=len(due),
+        batch_size=max(1, int(args.batch_size)),
+    )
     for run in due:
-        returncode, output_tail = _validate_run(run, args)
+        returncode, run_output_tail = _validate_run(run, args, validation_cycle_id)
         if returncode == 0:
             continue
         errors += 1
         last_error = f"{run['run_id']} failed with exit code {returncode}"
-        if output_tail:
-            last_error = f"{last_error}: {output_tail}"
-            LOGGER.warning("Validation child failed for %s: %s", run["run_id"], output_tail)
-        if _looks_like_rate_limit(output_tail):
+        if run_output_tail:
+            last_error = f"{last_error}: {run_output_tail}"
+            LOGGER.warning("Validation child failed for %s: %s", run["run_id"], run_output_tail)
+        if _looks_like_rate_limit(run_output_tail):
             rate_limited = True
             LOGGER.warning("Validation cycle hit Capital.com rate limit; stopping this cycle early.")
             break
+    shadow_started = time.perf_counter()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "validation.shadow_status.start",
+        validation_cycle_id=validation_cycle_id,
+    )
     shadow_status = refresh_shadow_prediction_statuses(dsn=args.postgres_dsn, limit=max(10, int(args.batch_size) * 10))
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "validation.shadow_status.completed",
+        validation_cycle_id=validation_cycle_id,
+        checked=int(shadow_status.get("checked") or 0),
+        updated=int(shadow_status.get("updated") or 0),
+        pending=int(shadow_status.get("pending") or 0),
+        errors=int(shadow_status.get("errors") or 0),
+        duration_ms=int((time.perf_counter() - shadow_started) * 1000),
+    )
     if shadow_status["errors"]:
         errors += int(shadow_status["errors"])
         last_error = f"shadow status refresh errors: {shadow_status['errors']}"
-    return {
+    payload = {
         "due_runs": len(due),
         "errors": errors,
         "last_error": last_error,
         "rate_limited": rate_limited,
         "shadow_status": shadow_status,
+        "validation_cycle_id": validation_cycle_id,
+        "duration_ms": int((time.perf_counter() - cycle_started) * 1000),
     }
+    log_event(
+        LOGGER,
+        logging.INFO if errors == 0 else logging.ERROR,
+        "validation.cycle.completed",
+        validation_cycle_id=validation_cycle_id,
+        due_runs=len(due),
+        errors=errors,
+        rate_limited=rate_limited,
+        duration_ms=payload["duration_ms"],
+        last_error=last_error,
+    )
+    return payload
 
 
 def main() -> None:
     configure_logging(service_name="validation_worker")
     args = parse_args()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "validation.service.start",
+        poll_seconds=int(args.poll_seconds),
+        batch_size=max(1, int(args.batch_size)),
+        env=args.env,
+    )
     while True:
+        validation_cycle_id = new_correlation_id("val")
         details = {
             "due_runs": 0,
             "errors": 0,
             "last_error": None,
             "rate_limited": False,
+            "validation_cycle_id": validation_cycle_id,
             "shadow_status": {"checked": 0, "updated": 0, "pending": 0, "errors": 0},
         }
         try:
-            details = _run_validation_cycle(args)
+            details = _run_validation_cycle(args, validation_cycle_id)
             LOGGER.info("Validation worker cycle complete: due_runs=%s errors=%s", details["due_runs"], details["errors"])
         except Exception as exc:  # noqa: BLE001
             details["errors"] = int(details.get("errors") or 0) + 1
             details["last_error"] = str(exc)
+            details["duration_ms"] = 0
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "validation.cycle.error",
+                validation_cycle_id=validation_cycle_id,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
             LOGGER.exception("Validation worker cycle crashed")
         heartbeat_status = "OK" if details["errors"] == 0 else ("COOLDOWN" if details.get("rate_limited") else "ERROR")
         _heartbeat(
             heartbeat_status,
             {
+                "state": "cooldown" if heartbeat_status == "COOLDOWN" else "running",
+                "current_operation": "validation_cycle",
                 "due_runs": details["due_runs"],
                 "errors": details["errors"],
                 "last_error": details["last_error"],
                 "rate_limited": details["rate_limited"],
-                "state": "cooldown" if heartbeat_status == "COOLDOWN" else "running",
+                "last_duration_ms": details.get("duration_ms"),
+                "last_success_at_utc": pd.Timestamp.now(tz="UTC").isoformat() if details["errors"] == 0 else None,
+                "validation_cycle_id": details.get("validation_cycle_id") or validation_cycle_id,
                 "shadow_status": details["shadow_status"],
                 "batch_size": max(1, int(args.batch_size)),
                 "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
@@ -199,6 +348,13 @@ def main() -> None:
         )
         if args.once:
             return
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "validation.sleep.start",
+            validation_cycle_id=validation_cycle_id,
+            poll_seconds=int(args.poll_seconds),
+        )
         time.sleep(args.poll_seconds)
 
 

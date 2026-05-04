@@ -2,18 +2,23 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-import subprocess
-import sys
 from pathlib import Path
+import time
 
 import pandas as pd
 
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
 from data_quality import analyze_ohlcv_quality, grade_meets_minimum, persist_prediction_run_quality
+from logging_utils import log_event, new_correlation_id, output_tail, safe_command_for_log
 from prediction_store import run_id_from_metadata_path, save_shadow_prediction, upsert_instrument, upsert_ohlcv_df
+from subprocess_utils import run_logged_subprocess
 from time_utils import format_local_timestamp
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 def parse_args() -> argparse.Namespace:
@@ -34,11 +39,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN. Defaults to POSTGRES_DSN.")
     parser.add_argument("--disable-shadow-model", action="store_true", help="Skip candidate-model shadow prediction.")
     return parser.parse_args()
-
-
-def _read_window(csv_path: Path) -> tuple[str, str]:
-    df = pd.read_csv(csv_path)
-    return str(df.iloc[0]["timestamps"]), str(df.iloc[-1]["timestamps"])
 
 
 def _flag_enabled(name: str, default: bool = True) -> bool:
@@ -86,7 +86,11 @@ def _run_shadow_prediction(
     model_dir: Path,
     shadow_model_version_id: str | None,
     dsn: str | None,
-) -> None:
+    prediction_request_id: str,
+    resolution: str,
+    symbol: str,
+    epic: str,
+) -> bool:
     active_run_id = run_id_from_metadata_path(active_metadata)
     stamp = active_metadata.stem.replace("forecast_metadata_", "", 1)
     shadow_forecast = output_dir / f"shadow_kronos_forecast_{stamp}.csv"
@@ -109,153 +113,485 @@ def _run_shadow_prediction(
         str(shadow_validation),
         "--no-save-prediction-db",
     ]
-    result = subprocess.run(cmd, cwd=Path.cwd(), text=True)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.shadow.start",
+        prediction_request_id=prediction_request_id,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        shadow_model_version_id=shadow_model_version_id,
+        command=safe_command_for_log(cmd),
+    )
+    result = run_logged_subprocess(
+        cmd,
+        logger=LOGGER,
+        event_prefix="forecast_latest.shadow.subprocess",
+        cwd=Path.cwd(),
+        context={
+            "prediction_request_id": prediction_request_id,
+            "symbol": symbol,
+            "epic": epic,
+            "resolution": resolution,
+            "shadow_model_version_id": shadow_model_version_id,
+        },
+    )
     if result.returncode != 0:
         print(f"Shadow model prediction failed with exit code {result.returncode}.")
-        return
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "forecast_latest.shadow.completed",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            shadow_model_version_id=shadow_model_version_id,
+            status="failed",
+            subprocess_returncode=int(result.returncode),
+            subprocess_output_tail=output_tail((result.stdout or "") + ("\n" + result.stderr if result.stderr else "")),
+        )
+        return False
     save_shadow_prediction(
         active_run_id=active_run_id,
         metadata_path=shadow_metadata,
         dsn=dsn,
         shadow_model_version_id=shadow_model_version_id,
+        prediction_request_id=prediction_request_id,
     )
     print(f"Shadow model signal recorded for active run {active_run_id}.")
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.shadow.completed",
+        prediction_request_id=prediction_request_id,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        shadow_model_version_id=shadow_model_version_id,
+        status="success",
+        active_run_id=active_run_id,
+    )
+    return True
 
 
 def main() -> None:
-    configure_logging()
+    configure_logging(service_name="forecast_latest")
     args = parse_args()
-    resolution = validate_resolution(args.resolution)
-    price_side = validate_price_side(args.price_side)
-    settings = load_settings(args.env)
-    settings.output_dir = Path(args.output_dir)
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
-
-    client = CapitalRestClient(settings)
-    client.authenticate()
-    selected = client.resolve_market(args.market, args.epic, streaming=False)
-    epic = selected["epic"]
-    symbol = args.symbol or args.market or epic
-    market_name = selected.get("instrumentName") or ""
-    client.save_market_details(epic)
-    df = client.get_historical_prices(
-        epic=epic,
-        resolution=resolution,
+    prediction_request_id = new_correlation_id("pred")
+    started = time.perf_counter()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.start",
+        prediction_request_id=prediction_request_id,
+        market=args.market,
+        symbol=args.symbol,
+        resolution=args.resolution,
+        price_side=args.price_side,
+        env=args.env,
         max_points=args.max_points,
-        price_side=price_side,
-        save_outputs=True,
-        min_rows=min(args.lookback, args.max_points, 50),
+        lookback=args.lookback,
+        pred_len=args.pred_len,
+        output_dir=args.output_dir,
     )
-    data_quality = analyze_ohlcv_quality(
-        df,
-        resolution=resolution,
-        expected_rows=args.lookback,
-    )
-    min_quality_grade = os.getenv("MIN_PREDICTION_QUALITY_GRADE")
-    quality_action = os.getenv("PREDICTION_QUALITY_ACTION", "downgrade").strip().lower()
-    if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
-        message = f"Prediction input quality {data_quality.quality_grade} is below minimum {min_quality_grade}."
-        if quality_action == "block":
-            raise SystemExit(message)
-        print(f"WARNING: {message} Signal quality will be downgraded in metadata.")
-    upsert_instrument(
-        symbol=symbol,
-        epic=epic,
-        market_name=market_name,
-        price_side=price_side,
-        metadata=selected,
-        dsn=args.postgres_dsn,
-    )
-    stored_rows = upsert_ohlcv_df(
-        df,
-        symbol=symbol,
-        epic=epic,
-        resolution=resolution,
-        price_side=price_side,
-        source="latest_fetch",
-        dsn=args.postgres_dsn,
-    )
-    input_path = settings.output_dir / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}.csv"
-    last_input = df["timestamps"].iloc[-1]
-    print("\nLatest input fetched")
-    print(f"Epic: {epic}")
-    print(f"Market: {market_name}")
-    print(f"Rows: {len(df)}")
-    print(f"PostgreSQL candles upserted: {stored_rows}")
-    print(f"Last input candle: {format_local_timestamp(last_input)}")
-
-    # Generate run_stamp here so we can construct artifact paths deterministically
-    # instead of globbing for the lexicographic latest file after the subprocess.
-    run_stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
-    cmd = [
-        args.kronos_python,
-        str(Path("src") / "main_run_kronos_predict.py"),
-        "--input",
-        str(input_path),
-        "--resolution",
-        resolution,
-        "--lookback",
-        str(args.lookback),
-        "--pred-len",
-        str(args.pred_len),
-        "--epic",
-        epic,
-        "--market-name",
-        market_name,
-        "--price-side",
-        price_side,
-        "--feature-set",
-        args.feature_set,
-        "--output-dir",
-        str(settings.output_dir),
-        "--postgres-dsn",
-        args.postgres_dsn or "",
-        "--run-stamp",
-        run_stamp,
-    ]
-    if args.repair_ohlc:
-        cmd.append("--repair-ohlc")
-
-    result = subprocess.run(cmd, cwd=Path.cwd(), text=True)
-    if result.returncode != 0 and not args.repair_ohlc:
-        print("\nRaw Kronos output failed validation. Retrying with --repair-ohlc.")
-        result = subprocess.run([*cmd, "--repair-ohlc"], cwd=Path.cwd(), text=True)
-    if result.returncode != 0:
-        raise SystemExit(result.returncode)
-
-    latest_metadata = settings.output_dir / f"forecast_metadata_{safe_epic_for_filename(epic)}_{resolution}_{run_stamp}.json"
-    metadata = json.loads(latest_metadata.read_text(encoding="utf-8"))
-    metadata["data_quality"] = data_quality.to_dict()
-    if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
-        metadata["data_quality"]["quality_gate_action"] = quality_action
-        metadata["data_quality"]["minimum_grade"] = min_quality_grade
-    latest_metadata.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
     try:
-        persist_prediction_run_quality(
-            run_id_from_metadata_path(latest_metadata),
-            data_quality,
+        resolution = validate_resolution(args.resolution)
+        price_side = validate_price_side(args.price_side)
+        settings = load_settings(args.env)
+        settings.output_dir = Path(args.output_dir)
+        settings.output_dir.mkdir(parents=True, exist_ok=True)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.settings.loaded",
+            prediction_request_id=prediction_request_id,
+            env=settings.env,
+            output_dir=str(settings.output_dir),
+            resolution=resolution,
+            price_side=price_side,
+        )
+
+        client = CapitalRestClient(settings)
+        client.authenticate()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.market.resolve.start",
+            prediction_request_id=prediction_request_id,
+            market=args.market,
+            symbol=args.symbol,
+            resolution=resolution,
+            env=args.env,
+        )
+        selected = client.resolve_market(args.market, args.epic, streaming=False)
+        epic = selected["epic"]
+        symbol = args.symbol or args.market or epic
+        market_name = selected.get("instrumentName") or ""
+        client.save_market_details(epic)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.market.resolved",
+            prediction_request_id=prediction_request_id,
+            market=args.market,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+        )
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.prices.fetch.start",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            max_points=args.max_points,
+        )
+        df = client.get_historical_prices(
+            epic=epic,
+            resolution=resolution,
+            max_points=args.max_points,
+            price_side=price_side,
+            save_outputs=True,
+            min_rows=min(args.lookback, args.max_points, 50),
+        )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.prices.fetch.completed",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            rows=len(df),
+            window_start=str(df["timestamps"].iloc[0]) if not df.empty else None,
+            window_end=str(df["timestamps"].iloc[-1]) if not df.empty else None,
+        )
+
+        data_quality = analyze_ohlcv_quality(
+            df,
+            resolution=resolution,
+            expected_rows=args.lookback,
+        )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.data_quality.completed",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            quality_grade=data_quality.quality_grade,
+            expected_rows=args.lookback,
+        )
+
+        min_quality_grade = os.getenv("MIN_PREDICTION_QUALITY_GRADE")
+        quality_action = os.getenv("PREDICTION_QUALITY_ACTION", "downgrade").strip().lower()
+        if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
+            message = f"Prediction input quality {data_quality.quality_grade} is below minimum {min_quality_grade}."
+            if quality_action == "block":
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "forecast_latest.error",
+                    prediction_request_id=prediction_request_id,
+                    symbol=symbol,
+                    epic=epic,
+                    resolution=resolution,
+                    error=message,
+                )
+                raise SystemExit(message)
+            print(f"WARNING: {message} Signal quality will be downgraded in metadata.")
+
+        upsert_instrument(
+            symbol=symbol,
+            epic=epic,
+            market_name=market_name,
+            price_side=price_side,
+            metadata=selected,
             dsn=args.postgres_dsn,
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"WARNING: data quality report could not be persisted: {exc}")
-    shadow_model = None if args.disable_shadow_model else _shadow_candidate_model(settings.output_dir)
-    if shadow_model is not None and _flag_enabled("ENABLE_SHADOW_MODEL", True):
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.db.instrument_upserted",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+        )
+
+        stored_rows = upsert_ohlcv_df(
+            df,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+            source="latest_fetch",
+            dsn=args.postgres_dsn,
+        )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.db.ohlcv_upserted",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+            stored_rows=stored_rows,
+        )
+
+        input_path = settings.output_dir / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}.csv"
+        last_input = df["timestamps"].iloc[-1]
+        print("\nLatest input fetched")
+        print(f"Epic: {epic}")
+        print(f"Market: {market_name}")
+        print(f"Rows: {len(df)}")
+        print(f"PostgreSQL candles upserted: {stored_rows}")
+        print(f"Last input candle: {format_local_timestamp(last_input)}")
+
+        # Generate run_stamp here so we can construct artifact paths deterministically
+        # instead of globbing for the lexicographic latest file after the subprocess.
+        run_stamp = pd.Timestamp.now(tz="UTC").strftime("%Y%m%dT%H%M%SZ")
+        cmd = [
+            args.kronos_python,
+            str(Path("src") / "main_run_kronos_predict.py"),
+            "--input",
+            str(input_path),
+            "--resolution",
+            resolution,
+            "--lookback",
+            str(args.lookback),
+            "--pred-len",
+            str(args.pred_len),
+            "--epic",
+            epic,
+            "--market-name",
+            market_name,
+            "--price-side",
+            price_side,
+            "--feature-set",
+            args.feature_set,
+            "--output-dir",
+            str(settings.output_dir),
+            "--postgres-dsn",
+            args.postgres_dsn or "",
+            "--run-stamp",
+            run_stamp,
+        ]
+        if args.repair_ohlc:
+            cmd.append("--repair-ohlc")
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.kronos.subprocess.start",
+            prediction_request_id=prediction_request_id,
+            market=args.market,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+            lookback=args.lookback,
+            pred_len=args.pred_len,
+            max_points=args.max_points,
+            command=safe_command_for_log(cmd),
+            input_path=str(input_path),
+        )
+        result = run_logged_subprocess(
+            cmd,
+            logger=LOGGER,
+            event_prefix="forecast_latest.kronos.subprocess",
+            cwd=Path.cwd(),
+            context={
+                "prediction_request_id": prediction_request_id,
+                "market": args.market,
+                "symbol": symbol,
+                "epic": epic,
+                "resolution": resolution,
+                "price_side": price_side,
+                "lookback": args.lookback,
+                "pred_len": args.pred_len,
+            },
+        )
+        if result.returncode != 0 and not args.repair_ohlc:
+            print("\nRaw Kronos output failed validation. Retrying with --repair-ohlc.")
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "forecast_latest.kronos.retry_repair_ohlc",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                subprocess_returncode=int(result.returncode),
+                subprocess_output_tail=output_tail((result.stdout or "") + ("\n" + result.stderr if result.stderr else "")),
+            )
+            result = run_logged_subprocess(
+                [*cmd, "--repair-ohlc"],
+                logger=LOGGER,
+                event_prefix="forecast_latest.kronos.subprocess",
+                cwd=Path.cwd(),
+                context={
+                    "prediction_request_id": prediction_request_id,
+                    "market": args.market,
+                    "symbol": symbol,
+                    "epic": epic,
+                    "resolution": resolution,
+                    "price_side": price_side,
+                    "lookback": args.lookback,
+                    "pred_len": args.pred_len,
+                    "retry_mode": "repair_ohlc",
+                },
+            )
+        log_event(
+            LOGGER,
+            logging.INFO if result.returncode == 0 else logging.ERROR,
+            "forecast_latest.kronos.subprocess.completed",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            subprocess_returncode=int(result.returncode),
+            subprocess_output_tail=output_tail((result.stdout or "") + ("\n" + result.stderr if result.stderr else "")) if result.returncode != 0 else None,
+        )
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+
+        latest_metadata = settings.output_dir / f"forecast_metadata_{safe_epic_for_filename(epic)}_{resolution}_{run_stamp}.json"
+        metadata = json.loads(latest_metadata.read_text(encoding="utf-8"))
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.metadata.loaded",
+            prediction_request_id=prediction_request_id,
+            metadata_path=str(latest_metadata),
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+        )
+        metadata["data_quality"] = data_quality.to_dict()
+        if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
+            metadata["data_quality"]["quality_gate_action"] = quality_action
+            metadata["data_quality"]["minimum_grade"] = min_quality_grade
+        latest_metadata.write_text(json.dumps(metadata, indent=2, default=str), encoding="utf-8")
         try:
-            _run_shadow_prediction(
-                base_cmd=cmd,
-                active_metadata=latest_metadata,
-                output_dir=settings.output_dir,
-                model_dir=Path(shadow_model["model_dir"]),
-                shadow_model_version_id=shadow_model.get("model_version_id"),
+            persist_prediction_run_quality(
+                run_id_from_metadata_path(latest_metadata),
+                data_quality,
                 dsn=args.postgres_dsn,
             )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.data_quality.persisted",
+                prediction_request_id=prediction_request_id,
+                run_id=run_id_from_metadata_path(latest_metadata),
+                symbol=symbol,
+                resolution=resolution,
+                quality_grade=data_quality.quality_grade,
+            )
         except Exception as exc:  # noqa: BLE001
-            print(f"Shadow model prediction could not be recorded: {exc}")
-    print("\nCurrent/future forecast ready")
-    print(f"Forecast start: {metadata['forecast_start_timestamp']}")
-    print(f"Forecast end: {metadata['forecast_end_timestamp']}")
-    print(f"Forecast CSV: {metadata['forecast_csv_path']}")
-    print(f"Metadata: {latest_metadata}")
+            print(f"WARNING: data quality report could not be persisted: {exc}")
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "forecast_latest.data_quality.persisted",
+                prediction_request_id=prediction_request_id,
+                run_id=run_id_from_metadata_path(latest_metadata),
+                symbol=symbol,
+                resolution=resolution,
+                quality_grade=data_quality.quality_grade,
+                error=str(exc),
+            )
+
+        shadow_model = None if args.disable_shadow_model else _shadow_candidate_model(settings.output_dir)
+        if shadow_model is not None and _flag_enabled("ENABLE_SHADOW_MODEL", True):
+            try:
+                _run_shadow_prediction(
+                    base_cmd=cmd,
+                    active_metadata=latest_metadata,
+                    output_dir=settings.output_dir,
+                    model_dir=Path(shadow_model["model_dir"]),
+                    shadow_model_version_id=shadow_model.get("model_version_id"),
+                    dsn=args.postgres_dsn,
+                    prediction_request_id=prediction_request_id,
+                    resolution=resolution,
+                    symbol=symbol,
+                    epic=epic,
+                )
+            except Exception as exc:  # noqa: BLE001
+                print(f"Shadow model prediction could not be recorded: {exc}")
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "forecast_latest.shadow.completed",
+                    prediction_request_id=prediction_request_id,
+                    symbol=symbol,
+                    epic=epic,
+                    resolution=resolution,
+                    shadow_model_version_id=shadow_model.get("model_version_id"),
+                    status="failed",
+                    error=str(exc),
+                )
+        else:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.shadow.skipped",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                reason="disabled_or_no_candidate",
+            )
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.completed",
+            prediction_request_id=prediction_request_id,
+            market=args.market,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+            max_points=args.max_points,
+            lookback=args.lookback,
+            pred_len=args.pred_len,
+            output_dir=str(settings.output_dir),
+            input_path=str(input_path),
+            metadata_path=str(latest_metadata),
+            stored_rows=stored_rows,
+            quality_grade=data_quality.quality_grade,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+
+        print("\nCurrent/future forecast ready")
+        print(f"Forecast start: {metadata['forecast_start_timestamp']}")
+        print(f"Forecast end: {metadata['forecast_end_timestamp']}")
+        print(f"Forecast CSV: {metadata['forecast_csv_path']}")
+        print(f"Metadata: {latest_metadata}")
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "forecast_latest.error",
+            prediction_request_id=prediction_request_id,
+            market=args.market,
+            symbol=args.symbol,
+            resolution=args.resolution,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 if __name__ == "__main__":

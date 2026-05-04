@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -14,10 +16,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
+from config import configure_logging
 from dashboard_db import postgres_dashboard_snapshot, query_signals
 from dashboard_ui import dashboard_html
 from dataset_snapshots import create_dataset_snapshot
 from db import connect
+from logging_utils import log_event, new_correlation_id, output_tail, safe_command_for_log
 from model_registry import evaluate_promotion, list_model_versions, model_performance
 from prediction_store import prediction_summary
 from prediction_log_report import generate_prediction_log_report
@@ -27,6 +31,7 @@ from walk_forward import create_walk_forward_experiment, get_walk_forward_experi
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "output"
 SUPPORTED_RESOLUTIONS = {"MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4", "DAY", "WEEK"}
+LOGGER = logging.getLogger(__name__)
 
 
 def _latest_file(pattern: str) -> Path | None:
@@ -139,6 +144,7 @@ def _merge_validation(primary: dict, fallback: dict) -> dict:
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     body = json.dumps(payload, indent=2, default=str).encode("utf-8")
+    setattr(handler, "_response_status", status)
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
@@ -153,6 +159,7 @@ def _error_response(
     message: str,
     details: dict | None = None,
 ) -> None:
+    request_id = str(getattr(handler, "_request_id", str(uuid.uuid4())))
     _json_response(
         handler,
         status,
@@ -161,7 +168,7 @@ def _error_response(
                 "code": code,
                 "message": message,
                 "details": details or {},
-                "request_id": str(uuid.uuid4()),
+                "request_id": request_id,
                 "timestamp_utc": pd.Timestamp.now(tz="UTC").isoformat(),
             }
         },
@@ -197,9 +204,50 @@ def _resolve_path_within_root(path_value: str | Path) -> Path:
     return resolved
 
 
-def _run(cmd: list[str], timeout: int = 420) -> dict:
-    result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
+def _run(
+    cmd: list[str],
+    timeout: int = 420,
+    *,
+    request_id: str | None = None,
+    endpoint: str | None = None,
+) -> dict:
+    started = time.perf_counter()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "dashboard.subprocess.start",
+        request_id=request_id,
+        endpoint=endpoint,
+        timeout_seconds=timeout,
+        command=safe_command_for_log(cmd),
+    )
+    try:
+        result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "dashboard.subprocess.error",
+            request_id=request_id,
+            endpoint=endpoint,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            command=safe_command_for_log(cmd),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
     output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+    log_event(
+        LOGGER,
+        logging.INFO if result.returncode == 0 else logging.WARNING,
+        "dashboard.subprocess.completed",
+        request_id=request_id,
+        endpoint=endpoint,
+        duration_ms=int((time.perf_counter() - started) * 1000),
+        returncode=int(result.returncode),
+        output_tail=output_tail(output),
+        command=safe_command_for_log(cmd),
+    )
     return {"returncode": result.returncode, "output": output}
 
 
@@ -375,202 +423,270 @@ def _html() -> str:
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
+    def _begin_request(self, method: str) -> None:
+        request_id = self.headers.get("X-Request-ID") or new_correlation_id("req")
+        self._request_id = request_id
+        self._request_started = time.perf_counter()
+        self._response_status = 500
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.request.start",
+            request_id=request_id,
+            method=method,
+            path=self.path,
+            client_ip=self.client_address[0] if self.client_address else None,
+            user_agent=self.headers.get("User-Agent"),
+        )
+
+    def _finish_request(self, method: str) -> None:
+        started = getattr(self, "_request_started", None)
+        duration_ms = int((time.perf_counter() - started) * 1000) if started is not None else None
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.request.completed",
+            request_id=getattr(self, "_request_id", None),
+            method=method,
+            path=self.path,
+            status_code=getattr(self, "_response_status", None),
+            duration_ms=duration_ms,
+        )
+
     def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        query = parse_qs(parsed.query)
-        if parsed.path == "/":
-            body = _html().encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        if parsed.path == "/api/status":
-            if not _require_auth(self):
+        self._begin_request("GET")
+        try:
+            parsed = urlparse(self.path)
+            query = parse_qs(parsed.query)
+            if parsed.path == "/":
+                body = _html().encode("utf-8")
+                self._response_status = 200
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
-            selected_symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
-            selected_resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
-            if selected_resolution not in SUPPORTED_RESOLUTIONS:
-                _error_response(self, 400, "VALIDATION_ERROR", "Invalid resolution", {"field": "resolution"})
-                return
-            metadata_path, metadata = _latest_metadata(selected_symbol, selected_resolution)
-            quality_path, quality_report = _quality_report_for_metadata(metadata_path, metadata)
-            forecast = _safe_csv(metadata.get("forecast_csv_path"))
-            input_tail = _safe_csv(metadata.get("input_csv_path"), limit=100)
-            latest_actual = _latest_file(f"actual_for_forecast_{metadata.get('epic', 'ETHUSD')}_{metadata.get('resolution', 'MINUTE_5')}_*.csv")
-            actual_tail = _safe_csv(latest_actual, limit=100) or input_tail
-            baseline_reports = sorted(OUTPUT_DIR.glob("forecast_quality_report_BASELINE_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-            baseline_summary = {p.stem: _safe_json(p).get("forecast_quality_validation", {}) for p in baseline_reports[:6]}
-            postgres_snapshot = _postgres_snapshot(selected_symbol, selected_resolution)
-            auto_finetune = _auto_finetune_status()
-            validation_from_db = postgres_snapshot.get("latest_validation") or {}
-            if quality_report:
-                validation_body = quality_report.get("forecast_quality_validation", quality_report)
-            else:
-                validation_body = {}
-            validation_body = _merge_validation(validation_body, validation_from_db)
-            postgres_candles = postgres_snapshot.get("candles") or []
-            market_tail = postgres_candles[-100:]
-            validation_source = "quality_report" if quality_path else ("prediction_outcomes" if validation_from_db else "none")
-            _json_response(
-                self,
-                200,
-                {
-                    "metadata": metadata,
-                    "validation": validation_body,
-                    "forecast": forecast,
-                    "input_tail": input_tail,
-                    "actual_tail": actual_tail,
-                    "market_tail": market_tail,
-                    "history": _history(),
-                    "prediction_db": postgres_snapshot.get("prediction_db", _prediction_db_summary()),
-                    "postgres_snapshot": postgres_snapshot,
-                    "live_quote": postgres_snapshot.get("live_quote"),
-                    "live_health": postgres_snapshot.get("live_health"),
-                    "worker_statuses": postgres_snapshot.get("worker_statuses"),
-                    "active_model": postgres_snapshot.get("active_model"),
-                    "shadow_model": postgres_snapshot.get("shadow_model"),
-                    "rate_limits": postgres_snapshot.get("rate_limits"),
-                    "supervisor_lease": postgres_snapshot.get("supervisor_lease"),
-                    "horizon_metrics": postgres_snapshot.get("horizon_metrics"),
-                    "auto_finetune": auto_finetune,
-                    "human_summary": _human_summary(metadata, validation_body, postgres_snapshot),
-                    "baseline_summary": baseline_summary,
-                    "validation_source": validation_source,
-                    "status_warnings": _status_warnings(postgres_snapshot),
-                    "selected_symbol": selected_symbol,
-                    "selected_resolution": selected_resolution,
-                    "files": {
-                        "metadata": str(metadata_path) if metadata_path else None,
-                        "input": metadata.get("input_csv_path"),
-                        "forecast": metadata.get("forecast_csv_path"),
-                        "validation": str(quality_path) if quality_path else metadata.get("validation_report_path"),
-                        "latest_actual": str(latest_actual) if latest_actual else None,
-                    },
-                },
-            )
-            return
-        if parsed.path == "/api/signals":
-            if not _require_auth(self):
-                return
-            symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
-            resolution = (query.get("timeframe", [query.get("resolution", [""])[0]])[0] or "").strip().upper() or None
-            date_from = (query.get("date_from", [""])[0] or "").strip() or None
-            date_to = (query.get("date_to", [""])[0] or "").strip() or None
-            direction = (query.get("direction", [""])[0] or "").strip() or None
-            status = (query.get("status", [""])[0] or "").strip() or None
-            signal_id = (query.get("signal_id", [""])[0] or "").strip() or None
-            try:
-                page = int((query.get("page", ["1"])[0] or "1").strip() or "1")
-            except ValueError:
-                page = 1
-            try:
-                page_size = int((query.get("page_size", ["10"])[0] or "10").strip() or "10")
-            except ValueError:
-                page_size = 10
-            _json_response(
-                self,
-                200,
-                query_signals(
-                    symbol=symbol,
-                    resolution=resolution,
-                    date_from=date_from,
-                    date_to=date_to,
-                    direction=direction,
-                    status=status,
-                    signal_id=signal_id,
-                    page=page,
-                    page_size=page_size,
-                ),
-            )
-            return
-        if parsed.path == "/api/model-performance":
-            if not _require_auth(self):
-                return
-            symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
-            resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
-            model_version_id = (query.get("model_version_id", [""])[0] or "").strip() or None
-            try:
+            if parsed.path == "/api/status":
+                if not _require_auth(self):
+                    return
+                selected_symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
+                selected_resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
+                if selected_resolution not in SUPPORTED_RESOLUTIONS:
+                    _error_response(self, 400, "VALIDATION_ERROR", "Invalid resolution", {"field": "resolution"})
+                    return
+                metadata_path, metadata = _latest_metadata(selected_symbol, selected_resolution)
+                quality_path, quality_report = _quality_report_for_metadata(metadata_path, metadata)
+                forecast = _safe_csv(metadata.get("forecast_csv_path"))
+                input_tail = _safe_csv(metadata.get("input_csv_path"), limit=100)
+                latest_actual = _latest_file(f"actual_for_forecast_{metadata.get('epic', 'ETHUSD')}_{metadata.get('resolution', 'MINUTE_5')}_*.csv")
+                actual_tail = _safe_csv(latest_actual, limit=100) or input_tail
+                baseline_reports = sorted(OUTPUT_DIR.glob("forecast_quality_report_BASELINE_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                baseline_summary = {p.stem: _safe_json(p).get("forecast_quality_validation", {}) for p in baseline_reports[:6]}
+                postgres_snapshot = _postgres_snapshot(selected_symbol, selected_resolution)
+                auto_finetune = _auto_finetune_status()
+                validation_from_db = postgres_snapshot.get("latest_validation") or {}
+                if quality_report:
+                    validation_body = quality_report.get("forecast_quality_validation", quality_report)
+                else:
+                    validation_body = {}
+                validation_body = _merge_validation(validation_body, validation_from_db)
+                postgres_candles = postgres_snapshot.get("candles") or []
+                market_tail = postgres_candles[-100:]
+                validation_source = "quality_report" if quality_path else ("prediction_outcomes" if validation_from_db else "none")
                 _json_response(
                     self,
                     200,
-                    model_performance(symbol=symbol, resolution=resolution, model_version_id=model_version_id),
+                    {
+                        "metadata": metadata,
+                        "validation": validation_body,
+                        "forecast": forecast,
+                        "input_tail": input_tail,
+                        "actual_tail": actual_tail,
+                        "market_tail": market_tail,
+                        "history": _history(),
+                        "prediction_db": postgres_snapshot.get("prediction_db", _prediction_db_summary()),
+                        "postgres_snapshot": postgres_snapshot,
+                        "live_quote": postgres_snapshot.get("live_quote"),
+                        "live_health": postgres_snapshot.get("live_health"),
+                        "worker_statuses": postgres_snapshot.get("worker_statuses"),
+                        "active_model": postgres_snapshot.get("active_model"),
+                        "shadow_model": postgres_snapshot.get("shadow_model"),
+                        "rate_limits": postgres_snapshot.get("rate_limits"),
+                        "supervisor_lease": postgres_snapshot.get("supervisor_lease"),
+                        "horizon_metrics": postgres_snapshot.get("horizon_metrics"),
+                        "auto_finetune": auto_finetune,
+                        "human_summary": _human_summary(metadata, validation_body, postgres_snapshot),
+                        "baseline_summary": baseline_summary,
+                        "validation_source": validation_source,
+                        "status_warnings": _status_warnings(postgres_snapshot),
+                        "selected_symbol": selected_symbol,
+                        "selected_resolution": selected_resolution,
+                        "files": {
+                            "metadata": str(metadata_path) if metadata_path else None,
+                            "input": metadata.get("input_csv_path"),
+                            "forecast": metadata.get("forecast_csv_path"),
+                            "validation": str(quality_path) if quality_path else metadata.get("validation_report_path"),
+                            "latest_actual": str(latest_actual) if latest_actual else None,
+                        },
+                    },
                 )
-            except Exception as exc:  # noqa: BLE001
-                _error_response(self, 503, "DATABASE_ERROR", "Unable to load model performance", {"reason": str(exc)})
-            return
-        if parsed.path == "/api/model-versions":
-            if not _require_auth(self):
                 return
-            try:
-                _json_response(self, 200, list_model_versions())
-            except Exception as exc:  # noqa: BLE001
-                _error_response(self, 503, "DATABASE_ERROR", "Unable to load model versions", {"reason": str(exc)})
-            return
-        if parsed.path.startswith("/api/walk-forward-experiments/"):
-            if not _require_auth(self):
-                return
-            experiment_id = parsed.path.rsplit("/", 1)[-1]
-            try:
-                payload = get_walk_forward_experiment(experiment_id)
-                if not payload:
-                    _error_response(self, 404, "NOT_FOUND", "Walk-forward experiment not found", {"experiment_id": experiment_id})
+            if parsed.path == "/api/signals":
+                if not _require_auth(self):
                     return
-                _json_response(self, 200, payload)
-            except Exception as exc:  # noqa: BLE001
-                _error_response(self, 503, "DATABASE_ERROR", "Unable to load walk-forward experiment", {"reason": str(exc)})
-            return
-        if parsed.path == "/file":
-            target = parse_qs(parsed.query).get("path", [""])[0]
-            try:
-                if not target:
-                    raise FileNotFoundError
-                resolved = _resolve_path_within_root(target)
-                body = resolved.read_bytes()
-            except (FileNotFoundError, ValueError):
-                self.send_error(404)
+                symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
+                resolution = (query.get("timeframe", [query.get("resolution", [""])[0]])[0] or "").strip().upper() or None
+                date_from = (query.get("date_from", [""])[0] or "").strip() or None
+                date_to = (query.get("date_to", [""])[0] or "").strip() or None
+                direction = (query.get("direction", [""])[0] or "").strip() or None
+                status = (query.get("status", [""])[0] or "").strip() or None
+                signal_id = (query.get("signal_id", [""])[0] or "").strip() or None
+                try:
+                    page = int((query.get("page", ["1"])[0] or "1").strip() or "1")
+                except ValueError:
+                    page = 1
+                try:
+                    page_size = int((query.get("page_size", ["10"])[0] or "10").strip() or "10")
+                except ValueError:
+                    page_size = 10
+                _json_response(
+                    self,
+                    200,
+                    query_signals(
+                        symbol=symbol,
+                        resolution=resolution,
+                        date_from=date_from,
+                        date_to=date_to,
+                        direction=direction,
+                        status=status,
+                        signal_id=signal_id,
+                        page=page,
+                        page_size=page_size,
+                    ),
+                )
                 return
-            self.send_response(200)
-            self.send_header("Content-Type", _content_type(resolved))
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-            return
-        self.send_error(404)
+            if parsed.path == "/api/model-performance":
+                if not _require_auth(self):
+                    return
+                symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
+                resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
+                model_version_id = (query.get("model_version_id", [""])[0] or "").strip() or None
+                try:
+                    _json_response(
+                        self,
+                        200,
+                        model_performance(symbol=symbol, resolution=resolution, model_version_id=model_version_id),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _error_response(self, 503, "DATABASE_ERROR", "Unable to load model performance", {"reason": str(exc)})
+                return
+            if parsed.path == "/api/model-versions":
+                if not _require_auth(self):
+                    return
+                try:
+                    _json_response(self, 200, list_model_versions())
+                except Exception as exc:  # noqa: BLE001
+                    _error_response(self, 503, "DATABASE_ERROR", "Unable to load model versions", {"reason": str(exc)})
+                return
+            if parsed.path.startswith("/api/walk-forward-experiments/"):
+                if not _require_auth(self):
+                    return
+                experiment_id = parsed.path.rsplit("/", 1)[-1]
+                try:
+                    payload = get_walk_forward_experiment(experiment_id)
+                    if not payload:
+                        _error_response(self, 404, "NOT_FOUND", "Walk-forward experiment not found", {"experiment_id": experiment_id})
+                        return
+                    _json_response(self, 200, payload)
+                except Exception as exc:  # noqa: BLE001
+                    _error_response(self, 503, "DATABASE_ERROR", "Unable to load walk-forward experiment", {"reason": str(exc)})
+                return
+            if parsed.path == "/file":
+                target = parse_qs(parsed.query).get("path", [""])[0]
+                try:
+                    if not target:
+                        raise FileNotFoundError
+                    resolved = _resolve_path_within_root(target)
+                    body = resolved.read_bytes()
+                except (FileNotFoundError, ValueError):
+                    self._response_status = 404
+                    self.send_error(404)
+                    return
+                self._response_status = 200
+                self.send_response(200)
+                self.send_header("Content-Type", _content_type(resolved))
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self._response_status = 404
+            self.send_error(404)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "dashboard.request.error",
+                request_id=getattr(self, "_request_id", None),
+                method="GET",
+                path=self.path,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            _error_response(self, 500, "INTERNAL_ERROR", "Unhandled server error", {"reason": str(exc)})
+        finally:
+            self._finish_request("GET")
 
     def do_POST(self) -> None:  # noqa: N802
-        if not _require_auth(self):
-            return
-        parsed = urlparse(self.path)
-        payload = _validated_payload(self)
-        if payload is None:
-            return
-        if parsed.path == "/api/predict":
-            self._predict(payload)
-            return
-        if parsed.path == "/api/fetch-actual":
-            self._fetch_actual(payload)
-            return
-        if parsed.path == "/api/validate-actual":
-            self._validate_actual(payload)
-            return
-        if parsed.path == "/api/baselines":
-            self._baselines(payload)
-            return
-        if parsed.path == "/api/dataset-snapshots":
-            self._dataset_snapshot(payload)
-            return
-        if parsed.path == "/api/walk-forward-experiments":
-            self._walk_forward(payload)
-            return
-        if parsed.path.startswith("/api/model-versions/") and parsed.path.endswith("/evaluate-promotion"):
-            model_version_id = parsed.path.split("/")[-2]
-            self._evaluate_promotion(model_version_id, payload)
-            return
-        self.send_error(404)
+        self._begin_request("POST")
+        try:
+            if not _require_auth(self):
+                return
+            parsed = urlparse(self.path)
+            payload = _validated_payload(self)
+            if payload is None:
+                return
+            if parsed.path == "/api/predict":
+                self._predict(payload)
+                return
+            if parsed.path == "/api/fetch-actual":
+                self._fetch_actual(payload)
+                return
+            if parsed.path == "/api/validate-actual":
+                self._validate_actual(payload)
+                return
+            if parsed.path == "/api/baselines":
+                self._baselines(payload)
+                return
+            if parsed.path == "/api/dataset-snapshots":
+                self._dataset_snapshot(payload)
+                return
+            if parsed.path == "/api/walk-forward-experiments":
+                self._walk_forward(payload)
+                return
+            if parsed.path.startswith("/api/model-versions/") and parsed.path.endswith("/evaluate-promotion"):
+                model_version_id = parsed.path.split("/")[-2]
+                self._evaluate_promotion(model_version_id, payload)
+                return
+            self._response_status = 404
+            self.send_error(404)
+        except Exception as exc:  # noqa: BLE001
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "dashboard.request.error",
+                request_id=getattr(self, "_request_id", None),
+                method="POST",
+                path=self.path,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            _error_response(self, 500, "INTERNAL_ERROR", "Unhandled server error", {"reason": str(exc)})
+        finally:
+            self._finish_request("POST")
 
     def _predict(self, payload: dict) -> None:
+        request_id = getattr(self, "_request_id", None)
         market = str(payload.get("market", "ETHUSD")).strip()
         symbol = str(payload.get("symbol") or market).strip()
         resolution = str(payload.get("resolution", "MINUTE_5")).strip().upper()
@@ -593,6 +709,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if feature_set not in {"auto", "ohlc", "ohlcv", "ohlcva"}:
             _error_response(self, 400, "VALIDATION_ERROR", "Unsupported feature_set", {"field": "feature_set"})
             return
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.action.predict.start",
+            request_id=request_id,
+            market=market,
+            symbol=symbol,
+            resolution=resolution,
+            feature_set=feature_set,
+        )
         pred_len = str(pred_len_int)
         lookback = str(lookback_int)
         repair = bool(payload.get("repair_ohlc", True))
@@ -623,7 +749,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             cmd.append("--repair-ohlc")
         if not run_shadow:
             cmd.append("--disable-shadow-model")
-        result = _run(cmd)
+        result = _run(cmd, request_id=request_id, endpoint="/api/predict")
         report_url = None
         report_path = None
         if result["returncode"] == 0:
@@ -636,6 +762,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 report_path = OUTPUT_DIR / f"prediction_log_report_{metadata['epic']}_{metadata['resolution']}_{stamp}.html"
                 generate_prediction_log_report(forecast_path, metadata_path, validation_path, report_path)
                 report_url = f"/file?path={report_path.relative_to(ROOT).as_posix()}"
+        log_event(
+            LOGGER,
+            logging.INFO if result["returncode"] == 0 else logging.WARNING,
+            "dashboard.action.predict.completed",
+            request_id=request_id,
+            market=market,
+            symbol=symbol,
+            resolution=resolution,
+            returncode=int(result["returncode"]),
+            report_path=str(report_path) if report_path else None,
+        )
         _json_response(
             self,
             200 if result["returncode"] == 0 else 500,
@@ -649,6 +786,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
 
     def _fetch_actual(self, payload: dict) -> None:
+        request_id = getattr(self, "_request_id", None)
         try:
             symbol, resolution = _action_context(payload)
         except ValueError as exc:
@@ -665,6 +803,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {"run_id": run_id, "symbol": symbol, "resolution": resolution},
             )
             return
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.action.fetch_actual.start",
+            request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            resolution=resolution,
+            metadata_path=str(metadata_path),
+        )
         result = _run(
             [
                 sys.executable,
@@ -680,10 +828,23 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "--allow-partial",
             ],
             timeout=180,
+            request_id=request_id,
+            endpoint="/api/fetch-actual",
+        )
+        log_event(
+            LOGGER,
+            logging.INFO if result["returncode"] == 0 else logging.WARNING,
+            "dashboard.action.fetch_actual.completed",
+            request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            resolution=resolution,
+            returncode=int(result["returncode"]),
         )
         _json_response(self, 200 if result["returncode"] == 0 else 500, {"status": "completed" if result["returncode"] == 0 else "failed", "run_id": run_id, **result})
 
     def _validate_actual(self, payload: dict) -> None:
+        request_id = getattr(self, "_request_id", None)
         try:
             symbol, resolution = _action_context(payload)
         except ValueError as exc:
@@ -729,13 +890,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
             validate_cmd.extend(["--run-id", run_id])
         if payload.get("scoring_version"):
             validate_cmd.extend(["--scoring-version", str(payload.get("scoring_version"))])
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.action.validate_actual.start",
+            request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            resolution=resolution,
+            metadata_path=str(metadata_path),
+            actual_path=str(actual),
+        )
         result = _run(
             validate_cmd,
             timeout=180,
+            request_id=request_id,
+            endpoint="/api/validate-actual",
+        )
+        log_event(
+            LOGGER,
+            logging.INFO if result["returncode"] == 0 else logging.WARNING,
+            "dashboard.action.validate_actual.completed",
+            request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            resolution=resolution,
+            returncode=int(result["returncode"]),
         )
         _json_response(self, 200 if result["returncode"] == 0 else 500, result)
 
     def _baselines(self, payload: dict) -> None:
+        request_id = getattr(self, "_request_id", None)
         try:
             symbol, resolution = _action_context(payload)
         except ValueError as exc:
@@ -758,6 +943,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         actual = OUTPUT_DIR / f"actual_for_forecast_{epic}_{resolution}_{stamp}.csv"
         methods = ["naive", "moving_average", "drift", "last_direction"]
         logs: list[str] = []
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.action.baselines.start",
+            request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            resolution=resolution,
+            methods=methods,
+        )
         for method in methods:
             baseline_csv = OUTPUT_DIR / f"baseline_{method}_{epic}_{resolution}_{stamp}.csv"
             generated = _run(
@@ -776,6 +971,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     str(baseline_csv),
                 ],
                 timeout=120,
+                request_id=request_id,
+                endpoint="/api/baselines",
             )
             logs.append(generated["output"])
             if generated["returncode"] == 0 and actual.exists():
@@ -797,8 +994,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         str(OUTPUT_DIR / f"forecast_quality_report_BASELINE_{method}_{epic}_{resolution}_{stamp}.json"),
                     ],
                     timeout=120,
+                    request_id=request_id,
+                    endpoint="/api/baselines",
                 )
                 logs.append(validated["output"])
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "dashboard.action.baselines.completed",
+            request_id=request_id,
+            run_id=run_id,
+            symbol=symbol,
+            resolution=resolution,
+            returncode=0,
+        )
         _json_response(self, 200, {"returncode": 0, "output": "\n".join(logs)})
 
     def _dataset_snapshot(self, payload: dict) -> None:
@@ -884,9 +1093,19 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    configure_logging(service_name="dashboard_server")
     args = parse_args()
     server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
     url = f"http://{args.host}:{args.port}"
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "dashboard.server.start",
+        host=args.host,
+        port=args.port,
+        url=url,
+        auto_open=not args.no_open,
+    )
     if not args.no_open:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
     print(f"Dashboard running at {url}")
@@ -894,9 +1113,10 @@ def main() -> None:
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        log_event(LOGGER, logging.INFO, "dashboard.server.stop", reason="KeyboardInterrupt")
     finally:
         server.server_close()
+        log_event(LOGGER, logging.INFO, "dashboard.server.stopped", host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

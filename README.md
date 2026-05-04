@@ -52,9 +52,13 @@ OUTCOME_ARCHIVE_INTERVAL_MINUTES=60
 NIGHTLY_BACKUP_HOUR_UTC=2
 BACKUP_RETENTION_DAYS=14
 
-CAPITAL_LOG_DIR=output\logs
+CAPITAL_LOG_DIR=logs
 CAPITAL_LOG_MAX_BYTES=5242880
 CAPITAL_LOG_BACKUP_COUNT=5
+LOG_LEVEL=INFO
+LOG_TO_CONSOLE=true
+LOG_TO_FILE=true
+LOG_JSON=false
 ```
 
 Auto-finetune command safety:
@@ -76,6 +80,36 @@ KRONOS_FINETUNE_COMMAND=C:\AI\capital_kronos_data_bridge\.venv\Scripts\python.ex
 - WebSocket URL: `wss://api-streaming-capital.backend-capital.com/connect`
 
 Set `CAPITAL_ENV=demo` or pass `--env demo` for demo. Use live only when you intentionally want live account data.
+
+## Logging and Observability
+
+Logging now emits structured JSON event payloads through `log_event(...)` across workers, forecast scripts, dashboard APIs, and database snapshot/query flows.
+
+Correlation IDs are attached to tie multi-step operations together:
+
+- `prediction_request_id` for prediction and forecast workflows
+- `scheduler_cycle_id` for scheduler loops
+- `validation_cycle_id` for validation loops
+- `request_id` for dashboard/API and one-off request flows
+
+Security protections in logs:
+
+- DSNs are masked
+- Secret-like keys (`password`, `token`, `authorization`, `cst`, `x-security-token`) are masked
+- Subprocess commands and output tails are sanitized before logging
+
+Common runtime events include:
+
+- `forecast_latest.*`, `kronos.*`, `prediction_store.*`
+- `scheduler.*`, `validation.*`, `websocket.*`
+- `dashboard.request.*`, `dashboard.action.*`, `dashboard.subprocess.*`
+- `dashboard_db.query_signals.*`, `dashboard_db.postgres_snapshot.*`
+
+Reference documentation:
+
+- `docs/LOGGING_AUDIT.md`
+- `docs/LOGGING_IMPLEMENTATION.md`
+- `docs/LOGGING_IMPLEMENTATION_SUMMARY.md`
 
 ## Historical Fetch
 

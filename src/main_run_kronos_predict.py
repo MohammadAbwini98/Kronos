@@ -2,14 +2,21 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from config import configure_logging
+from logging_utils import log_event, new_correlation_id
 from prediction_store import save_prediction_run
 from time_utils import display_timezone_name, format_local_timestamp
+
+
+LOGGER = logging.getLogger(__name__)
 
 SUPPORTED_RESOLUTIONS = {
     "MINUTE",
@@ -390,132 +397,363 @@ def run_prediction(
     signal_min_confidence: float,
     prediction_db: Path | None = None,
     save_prediction_db: bool = True,
+    prediction_request_id: str | None = None,
 ) -> pd.DataFrame:
-    if str(repo_dir) not in sys.path:
-        sys.path.insert(0, str(repo_dir))
-    _require_model_dir(model_dir, "Kronos model")
-    _require_model_dir(tokenizer_dir, "Kronos tokenizer")
+    request_id = prediction_request_id or new_correlation_id("pred")
+    started = time.perf_counter()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "kronos.prediction.start",
+        prediction_request_id=request_id,
+        input_path=str(input_csv),
+        output_path=str(output_csv),
+        metadata_path=str(metadata_output) if metadata_output else None,
+        validation_report_path=str(validation_report) if validation_report else None,
+        epic=epic,
+        market_name=market_name,
+        resolution=resolution,
+        price_side=price_side,
+        lookback=lookback,
+        pred_len=pred_len,
+        min_input_rows=min_input_rows,
+        preferred_input_rows=preferred_input_rows,
+        feature_set=feature_set,
+        model_name=model_name,
+        model_dir=str(model_dir),
+        tokenizer_dir=str(tokenizer_dir),
+        temperature=temperature,
+        top_p=top_p,
+        sample_count=sample_count,
+        repair_ohlc=repair_ohlc,
+    )
 
-    import torch
-    from model import Kronos, KronosPredictor, KronosTokenizer
+    try:
+        if str(repo_dir) not in sys.path:
+            sys.path.insert(0, str(repo_dir))
+        _require_model_dir(model_dir, "Kronos model")
+        _require_model_dir(tokenizer_dir, "Kronos tokenizer")
 
-    df = pd.read_csv(input_csv)
-    df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
-    df = df.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
-    _validate_kronos_df(df)
-    if len(df) < min_input_rows:
-        raise ValueError(f"Input has {len(df)} rows but minimum input rows is {min_input_rows}.")
-    input_rows_used = min(len(df), lookback)
-    if input_rows_used < preferred_input_rows:
-        print(
-            f"Warning: using {input_rows_used} input rows; preferred Kronos-base context is {preferred_input_rows}."
+        import torch
+        from model import Kronos, KronosPredictor, KronosTokenizer
+
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.input.read.start",
+            prediction_request_id=request_id,
+            input_path=str(input_csv),
+        )
+        df = pd.read_csv(input_csv)
+        df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
+        df = df.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.input.read.completed",
+            prediction_request_id=request_id,
+            input_path=str(input_csv),
+            input_rows=len(df),
+            window_start=str(df["timestamps"].iloc[0]) if not df.empty else None,
+            window_end=str(df["timestamps"].iloc[-1]) if not df.empty else None,
+        )
+        _validate_kronos_df(df)
+        if len(df) < min_input_rows:
+            raise ValueError(f"Input has {len(df)} rows but minimum input rows is {min_input_rows}.")
+        input_rows_used = min(len(df), lookback)
+        if input_rows_used < preferred_input_rows:
+            print(
+                f"Warning: using {input_rows_used} input rows; preferred Kronos-base context is {preferred_input_rows}."
+            )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.input.validated",
+            prediction_request_id=request_id,
+            input_rows=len(df),
+            input_rows_used=input_rows_used,
+            min_input_rows=min_input_rows,
+            preferred_input_rows=preferred_input_rows,
+            resolution=resolution,
+            price_side=price_side,
         )
 
-    feature_columns = _select_feature_columns(df, feature_set)
-    input_used_df = df.tail(input_rows_used).reset_index(drop=True)
-    x_df = input_used_df[feature_columns].reset_index(drop=True)
-    x_timestamp = input_used_df["timestamps"].reset_index(drop=True)
-    y_timestamp = _future_timestamps(x_timestamp.iloc[-1], resolution, pred_len)
-    device = _select_device(device_request)
+        feature_columns = _select_feature_columns(df, feature_set)
+        input_used_df = df.tail(input_rows_used).reset_index(drop=True)
+        x_df = input_used_df[feature_columns].reset_index(drop=True)
+        x_timestamp = input_used_df["timestamps"].reset_index(drop=True)
+        y_timestamp = _future_timestamps(x_timestamp.iloc[-1], resolution, pred_len)
+        device = _select_device(device_request)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.feature_columns.selected",
+            prediction_request_id=request_id,
+            feature_set=feature_set,
+            feature_columns=feature_columns,
+            input_rows_used=input_rows_used,
+            device=device,
+        )
 
-    print(f"Loading Kronos tokenizer: {tokenizer_dir}")
-    tokenizer = KronosTokenizer.from_pretrained(str(tokenizer_dir))
-    print(f"Loading Kronos model: {model_dir}")
-    model = Kronos.from_pretrained(str(model_dir))
-    predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
-    print(f"Running Kronos forecast on {device}; lookback={lookback}, pred_len={pred_len}")
-    print(f"Columns passed to Kronos: {', '.join(feature_columns)}")
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.model.loading",
+            prediction_request_id=request_id,
+            model_name=model_name,
+            model_dir=str(model_dir),
+            tokenizer_dir=str(tokenizer_dir),
+            device=device,
+        )
+        print(f"Loading Kronos tokenizer: {tokenizer_dir}")
+        tokenizer = KronosTokenizer.from_pretrained(str(tokenizer_dir))
+        print(f"Loading Kronos model: {model_dir}")
+        model = Kronos.from_pretrained(str(model_dir))
+        predictor = KronosPredictor(model, tokenizer, device=device, max_context=512)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.model.loaded",
+            prediction_request_id=request_id,
+            model_name=model_name,
+            model_dir=str(model_dir),
+            tokenizer_dir=str(tokenizer_dir),
+            device=device,
+        )
+        print(f"Running Kronos forecast on {device}; lookback={lookback}, pred_len={pred_len}")
+        print(f"Columns passed to Kronos: {', '.join(feature_columns)}")
 
-    with torch.no_grad():
-        pred_df = predictor.predict(
-            df=x_df,
-            x_timestamp=x_timestamp,
-            y_timestamp=y_timestamp,
+        predict_started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.predict.start",
+            prediction_request_id=request_id,
+            lookback=lookback,
             pred_len=pred_len,
-            T=temperature,
+            feature_columns=feature_columns,
+            temperature=temperature,
             top_p=top_p,
             sample_count=sample_count,
-            verbose=False,
+        )
+        with torch.no_grad():
+            pred_df = predictor.predict(
+                df=x_df,
+                x_timestamp=x_timestamp,
+                y_timestamp=y_timestamp,
+                pred_len=pred_len,
+                T=temperature,
+                top_p=top_p,
+                sample_count=sample_count,
+                verbose=False,
+            )
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.predict.completed",
+            prediction_request_id=request_id,
+            duration_ms=int((time.perf_counter() - predict_started) * 1000),
+            pred_len=pred_len,
         )
 
-    pred_df = pred_df.reset_index().rename(columns={"index": "timestamps"})
-    if "timestamps" not in pred_df.columns:
-        pred_df.insert(0, "timestamps", y_timestamp)
-    pred_df["timestamps"] = pd.to_datetime(pred_df["timestamps"], utc=True)
-    for col in KRONOS_COLUMNS:
-        if col not in pred_df.columns:
-            pred_df[col] = 0.0
-    pred_df = pred_df[KRONOS_COLUMNS]
-    if repair_ohlc:
-        pred_df = _repair_ohlc(pred_df)
-    report = _validate_forecast(
-        pred_df,
-        input_used_df,
-        resolution,
-        price_side,
-        source,
-        input_rows_used,
-        preferred_input_rows,
-        min_input_rows,
-        flat_threshold_pct,
-        movement_cost_threshold_pct,
-        max_close_move_pct,
-    )
-    if validation_report is not None:
-        validation_report.parent.mkdir(parents=True, exist_ok=True)
-        validation_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
-    if report["ohlc_invariant_violations"]:
-        raise ValueError(
-            f"Kronos forecast failed OHLC validation: {report['ohlc_invariant_violations']} invariant violation(s). "
-            "Re-run with --repair-ohlc to save a post-processed forecast."
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.forecast.postprocess.start",
+            prediction_request_id=request_id,
+            repair_ohlc=repair_ohlc,
         )
-    if report["null_numeric_values"] or report["negative_volume_rows"] or report["negative_amount_rows"]:
-        raise ValueError(f"Kronos forecast failed numeric validation: {report}")
-    output_csv.parent.mkdir(parents=True, exist_ok=True)
-    pred_df.to_csv(output_csv, index=False)
-    if input_copy_output is not None:
-        input_copy_output.parent.mkdir(parents=True, exist_ok=True)
-        input_used_df.to_csv(input_copy_output, index=False)
-    if metadata_output is not None:
-        _write_metadata(
-            metadata_output,
+        pred_df = pred_df.reset_index().rename(columns={"index": "timestamps"})
+        if "timestamps" not in pred_df.columns:
+            pred_df.insert(0, "timestamps", y_timestamp)
+        pred_df["timestamps"] = pd.to_datetime(pred_df["timestamps"], utc=True)
+        for col in KRONOS_COLUMNS:
+            if col not in pred_df.columns:
+                pred_df[col] = 0.0
+        pred_df = pred_df[KRONOS_COLUMNS]
+        if repair_ohlc:
+            pred_df = _repair_ohlc(pred_df)
+        report = _validate_forecast(
+            pred_df,
+            input_used_df,
+            resolution,
+            price_side,
+            source,
+            input_rows_used,
+            preferred_input_rows,
+            min_input_rows,
+            flat_threshold_pct,
+            movement_cost_threshold_pct,
+            max_close_move_pct,
+        )
+        if validation_report is not None:
+            validation_report.parent.mkdir(parents=True, exist_ok=True)
+            validation_report.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.forecast.validated",
+            prediction_request_id=request_id,
+            resolution=resolution,
+            price_side=price_side,
+            max_abs_close_move_pct=report.get("max_abs_close_move_pct"),
+            ohlc_invariant_violations=report.get("ohlc_invariant_violations"),
+            movement_after_cost_warning=report.get("movement_after_cost_warning"),
+            validation_report_path=str(validation_report) if validation_report else None,
+        )
+        if report["ohlc_invariant_violations"]:
+            raise ValueError(
+                f"Kronos forecast failed OHLC validation: {report['ohlc_invariant_violations']} invariant violation(s). "
+                "Re-run with --repair-ohlc to save a post-processed forecast."
+            )
+        if report["null_numeric_values"] or report["negative_volume_rows"] or report["negative_amount_rows"]:
+            raise ValueError(f"Kronos forecast failed numeric validation: {report}")
+
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        pred_df.to_csv(output_csv, index=False)
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.forecast.saved",
+            prediction_request_id=request_id,
+            output_path=str(output_csv),
+            forecast_rows=len(pred_df),
+            window_start=str(pred_df["timestamps"].iloc[0]) if not pred_df.empty else None,
+            window_end=str(pred_df["timestamps"].iloc[-1]) if not pred_df.empty else None,
+        )
+        if input_copy_output is not None:
+            input_copy_output.parent.mkdir(parents=True, exist_ok=True)
+            input_used_df.to_csv(input_copy_output, index=False)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "kronos.input_copy.saved",
+                prediction_request_id=request_id,
+                input_copy_path=str(input_copy_output),
+                input_rows_used=input_rows_used,
+            )
+
+        if metadata_output is not None:
+            _write_metadata(
+                metadata_output,
+                epic=epic,
+                market_name=market_name,
+                resolution=resolution,
+                price_side=price_side,
+                input_rows_used=input_rows_used,
+                forecast_rows=len(pred_df),
+                model_name=model_name,
+                model_dir=model_dir,
+                tokenizer_dir=tokenizer_dir,
+                source=source,
+                generated_at_utc=pd.Timestamp.now(tz="UTC").isoformat(),
+                input_df=input_used_df,
+                pred_df=pred_df,
+                forecast_csv=output_csv,
+                input_copy_csv=input_copy_output,
+                validation_report=validation_report,
+            )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "kronos.metadata.saved",
+                prediction_request_id=request_id,
+                metadata_path=str(metadata_output),
+                output_path=str(output_csv),
+                validation_report_path=str(validation_report) if validation_report else None,
+            )
+            if save_prediction_db:
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "kronos.prediction_db.save.start",
+                    prediction_request_id=request_id,
+                    metadata_path=str(metadata_output),
+                )
+                db_summary = save_prediction_run(
+                    metadata_output,
+                    db_path=prediction_db,
+                    flat_threshold_pct=flat_threshold_pct,
+                    cost_threshold_pct=movement_cost_threshold_pct,
+                    min_confidence=signal_min_confidence,
+                    prediction_request_id=request_id,
+                )
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "kronos.prediction_db.saved",
+                    prediction_request_id=request_id,
+                    db_saved_records=db_summary.get("saved_records"),
+                    db_run_id=db_summary.get("run_id"),
+                )
+                print(
+                    "Prediction DB saved: "
+                    f"{db_summary['saved_records']} rows, run_id={db_summary['run_id']}, dsn={db_summary['dsn']}"
+                )
+
+        print("Validation report:")
+        print(json.dumps(report, indent=2))
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "kronos.prediction.completed",
+            prediction_request_id=request_id,
+            output_path=str(output_csv),
+            metadata_path=str(metadata_output) if metadata_output else None,
+            validation_report_path=str(validation_report) if validation_report else None,
             epic=epic,
             market_name=market_name,
             resolution=resolution,
             price_side=price_side,
+            lookback=lookback,
+            pred_len=pred_len,
+            input_rows=len(df),
             input_rows_used=input_rows_used,
-            forecast_rows=len(pred_df),
+            feature_set=feature_set,
+            feature_columns=feature_columns,
             model_name=model_name,
-            model_dir=model_dir,
-            tokenizer_dir=tokenizer_dir,
-            source=source,
-            generated_at_utc=pd.Timestamp.now(tz="UTC").isoformat(),
-            input_df=input_used_df,
-            pred_df=pred_df,
-            forecast_csv=output_csv,
-            input_copy_csv=input_copy_output,
-            validation_report=validation_report,
+            model_dir=str(model_dir),
+            tokenizer_dir=str(tokenizer_dir),
+            device=device,
+            temperature=temperature,
+            top_p=top_p,
+            sample_count=sample_count,
+            repair_ohlc=repair_ohlc,
+            duration_ms=int((time.perf_counter() - started) * 1000),
         )
-        if save_prediction_db:
-            db_summary = save_prediction_run(
-                metadata_output,
-                db_path=prediction_db,
-                flat_threshold_pct=flat_threshold_pct,
-                cost_threshold_pct=movement_cost_threshold_pct,
-                min_confidence=signal_min_confidence,
-            )
-            print(
-                "Prediction DB saved: "
-                f"{db_summary['saved_records']} rows, run_id={db_summary['run_id']}, dsn={db_summary['dsn']}"
-            )
-    print("Validation report:")
-    print(json.dumps(report, indent=2))
-    return pred_df
+        return pred_df
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "kronos.prediction.error",
+            prediction_request_id=request_id,
+            input_path=str(input_csv),
+            output_path=str(output_csv),
+            metadata_path=str(metadata_output) if metadata_output else None,
+            validation_report_path=str(validation_report) if validation_report else None,
+            epic=epic,
+            market_name=market_name,
+            resolution=resolution,
+            price_side=price_side,
+            lookback=lookback,
+            pred_len=pred_len,
+            model_name=model_name,
+            model_dir=str(model_dir),
+            tokenizer_dir=str(tokenizer_dir),
+            repair_ohlc=repair_ohlc,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
+        raise
 
 
 def main() -> None:
+    configure_logging(service_name="kronos_predict")
     _load_dotenv_if_present()
     args = parse_args()
+    prediction_request_id = new_correlation_id("pred")
     repo_dir = Path(args.repo_dir or _env("KRONOS_REPO_DIR", r"C:\AI\Kronos"))
     tokenizer_dir = Path(args.tokenizer_dir or _env("KRONOS_TOKENIZER_DIR", r"C:\AI\Models\Kronos\Kronos-Tokenizer-base"))
     device = args.device or _env("KRONOS_DEVICE", "auto")
@@ -577,6 +815,7 @@ def main() -> None:
         signal_min_confidence=args.signal_min_confidence,
         prediction_db=Path(args.postgres_dsn or args.prediction_db) if (args.postgres_dsn or args.prediction_db) else None,
         save_prediction_db=not args.no_save_prediction_db,
+        prediction_request_id=prediction_request_id,
     )
     print(f"METADATA_PATH:{metadata_output}")
     print("\nKronos forecast complete")

@@ -14,6 +14,7 @@ import pandas as pd
 
 from config import configure_logging
 from db import connect
+from logging_utils import log_event, new_correlation_id, output_tail as sanitize_output_tail, safe_command_for_log
 from service_runtime import write_heartbeat
 
 LOGGER = logging.getLogger(__name__)
@@ -231,29 +232,57 @@ def _heartbeat(name: str, status: str, details: dict, dsn: str | None) -> None:
     try:
         write_heartbeat(name, status, details, dsn)
     except Exception:  # noqa: BLE001
-        LOGGER.debug("Unable to write scheduler heartbeat", exc_info=True)
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "scheduler.heartbeat.write.failed",
+            status=status,
+            details=details,
+        )
 
 
 def _sleep_to_next_boundary(args: argparse.Namespace, heartbeat_interval_seconds: int = 60) -> None:
+    scheduler_cycle_id = new_correlation_id("sched")
     now = pd.Timestamp.now(tz="UTC")
     interval_seconds = int(args.interval_minutes) * 60
     next_epoch = ((int(now.timestamp()) // interval_seconds) + 1) * interval_seconds
     remaining = max(0, next_epoch - int(now.timestamp()))
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scheduler.sleep.start",
+        scheduler_cycle_id=scheduler_cycle_id,
+        symbol=args.symbol,
+        resolution=args.resolution,
+        interval_minutes=int(args.interval_minutes),
+        seconds_until_next_cycle=int(remaining),
+    )
     while remaining > 0:
         chunk = min(max(1, int(heartbeat_interval_seconds)), remaining)
         time.sleep(chunk)
         remaining -= chunk
         if remaining <= 0:
             break
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "scheduler.sleep.heartbeat",
+            scheduler_cycle_id=scheduler_cycle_id,
+            symbol=args.symbol,
+            resolution=args.resolution,
+            seconds_until_next_cycle=int(remaining),
+        )
         _heartbeat(
             "prediction_scheduler",
             "OK",
             {
                 "state": "sleeping",
+                "current_operation": "sleep",
                 "seconds_until_next_cycle": int(remaining),
                 "symbol": args.symbol,
                 "resolution": args.resolution,
                 "interval_minutes": int(args.interval_minutes),
+                "scheduler_cycle_id": scheduler_cycle_id,
                 "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
             },
             args.postgres_dsn,
@@ -289,6 +318,8 @@ def _run_forecast_command(cmd: list[str], args: argparse.Namespace) -> subproces
 
 
 def _run_cycle(args: argparse.Namespace) -> int:
+    scheduler_cycle_id = new_correlation_id("sched")
+    cycle_started = time.perf_counter()
     cmd = [
         sys.executable,
         "src/main_forecast_latest.py",
@@ -312,35 +343,109 @@ def _run_cycle(args: argparse.Namespace) -> int:
     ]
     if args.postgres_dsn:
         cmd.extend(["--postgres-dsn", args.postgres_dsn])
-    LOGGER.info("Starting scheduler cycle for %s %s", args.symbol, args.resolution)
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scheduler.cycle.start",
+        scheduler_cycle_id=scheduler_cycle_id,
+        symbol=args.symbol,
+        market=args.market,
+        resolution=args.resolution,
+        interval_minutes=int(args.interval_minutes),
+        lookback=args.lookback,
+        pred_len=args.pred_len,
+        env=args.env,
+    )
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scheduler.websocket_gate.start",
+        scheduler_cycle_id=scheduler_cycle_id,
+        symbol=args.symbol,
+        resolution=args.resolution,
+    )
     gate = _websocket_prediction_gate(args)
     if not gate.allow:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "scheduler.websocket_gate.pause",
+            scheduler_cycle_id=scheduler_cycle_id,
+            symbol=args.symbol,
+            resolution=args.resolution,
+            websocket_gate_reason=gate.reason,
+            latest_websocket_candle_timestamp_utc=gate.latest_candle_timestamp_utc,
+        )
         details = {
             "returncode": 0,
             "attempts": 0,
             "symbol": args.symbol,
             "resolution": args.resolution,
             "interval_minutes": int(args.interval_minutes),
+            "scheduler_cycle_id": scheduler_cycle_id,
+            "current_operation": "paused",
+            "last_success_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
             "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
             **gate.details,
         }
         _heartbeat("prediction_scheduler", "PAUSED", details, args.postgres_dsn)
         LOGGER.warning("Scheduler cycle paused: %s", gate.reason)
         return 0
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scheduler.websocket_gate.pass",
+        scheduler_cycle_id=scheduler_cycle_id,
+        symbol=args.symbol,
+        resolution=args.resolution,
+        websocket_gate_reason=gate.reason,
+        latest_websocket_candle_timestamp_utc=gate.latest_candle_timestamp_utc,
+    )
     try:
         attempt = 0
         max_attempts = 2
         result: subprocess.CompletedProcess[str] | None = None
-        output_tail = ""
+        output_tail_text = ""
         while attempt < max_attempts:
             attempt += 1
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "scheduler.forecast.subprocess.start",
+                scheduler_cycle_id=scheduler_cycle_id,
+                attempts=attempt,
+                command=safe_command_for_log(cmd),
+                symbol=args.symbol,
+                resolution=args.resolution,
+            )
             result = _run_forecast_command(cmd, args)
             output = _combined_output(result)
-            output_tail = output[-2000:]
+            output_tail_text = sanitize_output_tail(output)
+            log_event(
+                LOGGER,
+                logging.INFO if result.returncode == 0 else logging.WARNING,
+                "scheduler.forecast.subprocess.completed",
+                scheduler_cycle_id=scheduler_cycle_id,
+                attempts=attempt,
+                returncode=int(result.returncode),
+                output_tail=output_tail_text if result.returncode != 0 else None,
+                symbol=args.symbol,
+                resolution=args.resolution,
+            )
             if result.returncode == 0:
                 break
             if attempt < max_attempts and _looks_like_rate_limit(output):
                 backoff_seconds = 10
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "scheduler.forecast.rate_limit_retry",
+                    scheduler_cycle_id=scheduler_cycle_id,
+                    attempts=attempt,
+                    retry_in_seconds=backoff_seconds,
+                    symbol=args.symbol,
+                    resolution=args.resolution,
+                )
                 LOGGER.warning(
                     "Scheduler cycle hit Capital.com rate limit (attempt %s/%s). Retrying in %ss.",
                     attempt,
@@ -354,8 +459,8 @@ def _run_cycle(args: argparse.Namespace) -> int:
         if result is None:
             raise RuntimeError("Scheduler did not execute forecast command")
 
-        if result.returncode != 0 and output_tail:
-            LOGGER.warning("Scheduler cycle failed output tail: %s", output_tail)
+        if result.returncode != 0 and output_tail_text:
+            LOGGER.warning("Scheduler cycle failed output tail: %s", output_tail_text)
 
         details = {
             "returncode": int(result.returncode),
@@ -363,27 +468,62 @@ def _run_cycle(args: argparse.Namespace) -> int:
             "symbol": args.symbol,
             "resolution": args.resolution,
             "interval_minutes": int(args.interval_minutes),
+            "scheduler_cycle_id": scheduler_cycle_id,
+            "current_operation": "cycle",
             "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
             **gate.details,
         }
-        if result.returncode != 0 and output_tail:
-            details["output_tail"] = output_tail
-        heartbeat_status = "OK" if result.returncode == 0 else ("COOLDOWN" if _looks_like_rate_limit(output_tail) else "ERROR")
+        if result.returncode != 0 and output_tail_text:
+            details["output_tail"] = output_tail_text
+        heartbeat_status = "OK" if result.returncode == 0 else ("COOLDOWN" if _looks_like_rate_limit(output_tail_text) else "ERROR")
         if heartbeat_status == "COOLDOWN":
             details["state"] = "cooldown"
+        details["last_duration_ms"] = int((time.perf_counter() - cycle_started) * 1000)
+        if result.returncode == 0:
+            details["last_success_at_utc"] = pd.Timestamp.now(tz="UTC").isoformat()
+            details["last_error"] = None
+        else:
+            details["last_error"] = output_tail_text if output_tail_text else f"returncode={result.returncode}"
         _heartbeat("prediction_scheduler", heartbeat_status, details, args.postgres_dsn)
         if result.returncode == 0 and gate.latest_candle_timestamp_utc:
             key = _websocket_key(args)
             parsed = _to_utc_timestamp(gate.latest_candle_timestamp_utc)
             if parsed is not None:
                 _LAST_PROCESSED_WEBSOCKET_CANDLE[key] = parsed
+        log_event(
+            LOGGER,
+            logging.INFO if result.returncode == 0 else logging.ERROR,
+            "scheduler.cycle.completed",
+            scheduler_cycle_id=scheduler_cycle_id,
+            symbol=args.symbol,
+            resolution=args.resolution,
+            attempts=attempt,
+            returncode=int(result.returncode),
+            duration_ms=int((time.perf_counter() - cycle_started) * 1000),
+            output_tail=output_tail_text if result.returncode != 0 else None,
+        )
         LOGGER.info("Scheduler cycle finished with return code %s", result.returncode)
         return result.returncode
     except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "scheduler.cycle.error",
+            scheduler_cycle_id=scheduler_cycle_id,
+            symbol=args.symbol,
+            resolution=args.resolution,
+            duration_ms=int((time.perf_counter() - cycle_started) * 1000),
+            error=str(exc),
+            error_type=type(exc).__name__,
+        )
         details = {
             "error": str(exc),
             "symbol": args.symbol,
             "resolution": args.resolution,
+            "scheduler_cycle_id": scheduler_cycle_id,
+            "current_operation": "cycle_error",
+            "last_error": str(exc),
+            "last_duration_ms": int((time.perf_counter() - cycle_started) * 1000),
             "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
         }
         _heartbeat("prediction_scheduler", "ERROR", details, args.postgres_dsn)
@@ -394,6 +534,18 @@ def _run_cycle(args: argparse.Namespace) -> int:
 def main() -> None:
     configure_logging(service_name="prediction_scheduler")
     args = parse_args()
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "scheduler.service.start",
+        symbol=args.symbol,
+        market=args.market,
+        resolution=args.resolution,
+        interval_minutes=int(args.interval_minutes),
+        lookback=args.lookback,
+        pred_len=args.pred_len,
+        env=args.env,
+    )
     while True:
         code = _run_cycle(args)
         if args.once:

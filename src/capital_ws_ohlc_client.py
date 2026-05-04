@@ -15,6 +15,7 @@ import websockets
 from capital_auth import CapitalAuthenticator
 from config import BridgeSettings, WS_URL, safe_epic_for_filename, validate_resolution
 from kronos_mapper import KRONOS_COLUMNS, KronosMappingError, ws_ohlc_to_kronos_row
+from logging_utils import log_event, new_correlation_id
 from prediction_store import insert_raw_market_event, upsert_live_quote, upsert_ohlcv_df
 
 LOGGER = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ class CapitalOhlcWebSocketClient:
         heartbeat_callback: Callable[[str, dict[str, Any]], None] | None = None,
         heartbeat_interval_seconds: int = 60,
         subscribe_quotes: bool = True,
+        websocket_session_id: str | None = None,
     ) -> None:
         self.settings = settings
         self.authenticator = authenticator
@@ -48,6 +50,7 @@ class CapitalOhlcWebSocketClient:
         self.heartbeat_callback = heartbeat_callback
         self.heartbeat_interval_seconds = max(1, heartbeat_interval_seconds)
         self.subscribe_quotes = subscribe_quotes
+        self.websocket_session_id = websocket_session_id or new_correlation_id("ws")
         self.keepalive_seconds = max(60, int(os.getenv("CAPITAL_WS_KEEPALIVE_SECONDS", "300")))
         self._last_heartbeat_at = 0.0
         self.resolution = validate_resolution(resolution)
@@ -61,14 +64,64 @@ class CapitalOhlcWebSocketClient:
         self._csv_write_interval: int = max(1, int(os.getenv("WS_CSV_WRITE_INTERVAL", "5")))
 
     async def stream_forever(self) -> None:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "websocket.connect.start",
+            websocket_session_id=self.websocket_session_id,
+            symbol=self.symbol,
+            epic=self.epic,
+            resolution=self.resolution,
+            price_side=self.price_side,
+            events_path=str(self.events_path),
+            csv_path=str(self.csv_path),
+        )
         tokens = self.authenticator.tokens or self.authenticator.authenticate()
         self.settings.output_dir.mkdir(parents=True, exist_ok=True)
         self._running = True
         async with websockets.connect(WS_URL, ping_interval=None, close_timeout=5) as websocket:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "websocket.connect.success",
+                websocket_session_id=self.websocket_session_id,
+                symbol=self.symbol,
+                epic=self.epic,
+                resolution=self.resolution,
+                price_side=self.price_side,
+            )
             if self.subscribe_quotes:
                 await websocket.send(orjson.dumps(self._quote_subscription_payload(tokens.cst, tokens.security_token)).decode())
+                log_event(
+                    LOGGER,
+                    logging.INFO,
+                    "websocket.subscribe.sent",
+                    websocket_session_id=self.websocket_session_id,
+                    symbol=self.symbol,
+                    epic=self.epic,
+                    resolution=self.resolution,
+                    event_type="quote",
+                )
             await websocket.send(orjson.dumps(self._ohlc_subscription_payload(tokens.cst, tokens.security_token)).decode())
-            LOGGER.info("Subscribed to quote%s stream for %s %s", " and OHLC" if self.subscribe_quotes else "", self.epic, self.resolution)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "websocket.subscribe.sent",
+                websocket_session_id=self.websocket_session_id,
+                symbol=self.symbol,
+                epic=self.epic,
+                resolution=self.resolution,
+                event_type="ohlc",
+            )
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "websocket.subscribe.confirmed",
+                websocket_session_id=self.websocket_session_id,
+                symbol=self.symbol,
+                epic=self.epic,
+                resolution=self.resolution,
+            )
             keepalive_task = asyncio.create_task(self._keepalive(websocket))
             try:
                 async for message in websocket:
@@ -126,7 +179,15 @@ class CapitalOhlcWebSocketClient:
             if self.subscribe_quotes:
                 await websocket.send(orjson.dumps(self._quote_unsubscribe_payload(tokens.cst, tokens.security_token)).decode())
             await websocket.send(orjson.dumps(self._ohlc_unsubscribe_payload(tokens.cst, tokens.security_token)).decode())
-            LOGGER.info("Unsubscribed from OHLC stream for %s %s", self.epic, self.resolution)
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "websocket.unsubscribe.sent",
+                websocket_session_id=self.websocket_session_id,
+                symbol=self.symbol,
+                epic=self.epic,
+                resolution=self.resolution,
+            )
         except Exception as exc:  # noqa: BLE001 - best-effort cleanup on shutdown.
             LOGGER.warning("WebSocket unsubscribe failed during shutdown: %s", exc)
 
@@ -144,12 +205,31 @@ class CapitalOhlcWebSocketClient:
             }
             try:
                 await websocket.send(orjson.dumps(payload).decode())
+                log_event(
+                    LOGGER,
+                    logging.DEBUG,
+                    "websocket.keepalive.sent",
+                    websocket_session_id=self.websocket_session_id,
+                    symbol=self.symbol,
+                    epic=self.epic,
+                    resolution=self.resolution,
+                )
             except Exception as exc:  # noqa: BLE001
                 raise CapitalWebSocketError("WebSocket keepalive failed") from exc
 
     async def _handle_message(self, message: str | bytes) -> None:
         event = orjson.loads(message)
         destination = str(event.get("destination", ""))
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "websocket.message.received",
+            websocket_session_id=self.websocket_session_id,
+            symbol=self.symbol,
+            epic=self.epic,
+            resolution=self.resolution,
+            event_type=destination or "unknown",
+        )
         if event.get("status") == "ERROR":
             raise CapitalWebSocketError(f"Capital.com WebSocket error: {event}")
         payload = event.get("payload", {})
@@ -166,10 +246,41 @@ class CapitalOhlcWebSocketClient:
             )
             return
         if "ohlc" not in destination.lower():
-            LOGGER.debug("Ignoring non-OHLC WebSocket message: %s", destination or event.keys())
+            log_event(
+                LOGGER,
+                logging.DEBUG,
+                "websocket.non_ohlc.ignored",
+                websocket_session_id=self.websocket_session_id,
+                symbol=self.symbol,
+                epic=self.epic,
+                resolution=self.resolution,
+                event_type=destination or "unknown",
+            )
             return
         self._append_jsonl(event, self.events_path)
         raw_timestamp = self._normalized_event_timestamp_utc(payload)
+        persist_started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "websocket.ohlc.received",
+            websocket_session_id=self.websocket_session_id,
+            symbol=self.symbol,
+            epic=self.epic,
+            resolution=self.resolution,
+            event_type=destination or "ohlc",
+            timestamp_utc=raw_timestamp,
+        )
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "websocket.ohlc.persist.start",
+            websocket_session_id=self.websocket_session_id,
+            symbol=self.symbol,
+            epic=self.epic,
+            resolution=self.resolution,
+            timestamp_utc=raw_timestamp,
+        )
         insert_raw_market_event(
             symbol=self.symbol,
             epic=self.epic,
@@ -183,12 +294,17 @@ class CapitalOhlcWebSocketClient:
         except KronosMappingError as exc:
             LOGGER.debug("Skipping OHLC payload that cannot be mapped yet: %s", exc)
             return
-        LOGGER.info(
-            "OHLC %s %s close=%s at %s",
-            payload.get("epic", self.epic),
-            payload.get("resolution", self.resolution),
-            row["close"],
-            row["timestamps"],
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "websocket.ohlc.persist.completed",
+            websocket_session_id=self.websocket_session_id,
+            symbol=self.symbol,
+            epic=self.epic,
+            resolution=self.resolution,
+            close=row.get("close"),
+            timestamp_utc=row.get("timestamps"),
+            duration_ms=int((time.perf_counter() - persist_started) * 1000),
         )
         self._append_row(row)
 
@@ -203,19 +319,25 @@ class CapitalOhlcWebSocketClient:
             event_timestamp_utc=quote_timestamp,
             dsn=self.postgres_dsn,
         )
+        persist_started = time.perf_counter()
         quote = upsert_live_quote(
             symbol=self.symbol,
             epic=self.epic,
             payload=payload,
             dsn=self.postgres_dsn,
         )
-        LOGGER.debug(
-            "QUOTE %s bid=%s ask=%s price=%s at %s",
-            payload.get("epic", self.epic),
-            quote.get("bid"),
-            quote.get("ask"),
-            quote.get("price"),
-            quote.get("timestamp_utc") or quote.get("updated_at"),
+        log_event(
+            LOGGER,
+            logging.DEBUG,
+            "websocket.ohlc.persist.completed",
+            websocket_session_id=self.websocket_session_id,
+            symbol=self.symbol,
+            epic=self.epic,
+            resolution=self.resolution,
+            event_type="quote",
+            close=quote.get("price"),
+            timestamp_utc=quote.get("timestamp_utc") or quote.get("updated_at"),
+            duration_ms=int((time.perf_counter() - persist_started) * 1000),
         )
         self._heartbeat_if_due(
             {

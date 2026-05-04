@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from config import BridgeSettings, RateLimiter
+from logging_utils import log_event
 
 LOGGER = logging.getLogger(__name__)
 
@@ -49,18 +50,52 @@ class CapitalAuthenticator:
             "encryptedPassword": self.settings.use_encrypted_password,
         }
         headers = {"X-CAP-API-KEY": self.settings.api_key}
-        LOGGER.info("Authenticating Capital.com %s session", self.settings.env)
+        started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "capital.auth.start",
+            env=self.settings.env,
+            base_url=self.settings.base_url,
+        )
         response = self.http.post(url, json=body, headers=headers, timeout=20)
         if response.status_code >= 400:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "capital.auth.error",
+                env=self.settings.env,
+                base_url=self.settings.base_url,
+                status_code=response.status_code,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
             raise AuthenticationError(
                 f"Capital.com authentication failed with HTTP {response.status_code}: {response.text}"
             )
         cst = response.headers.get("CST")
         security_token = response.headers.get("X-SECURITY-TOKEN")
         if not cst or not security_token:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "capital.auth.error",
+                env=self.settings.env,
+                base_url=self.settings.base_url,
+                status_code=response.status_code,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                error="missing_session_tokens",
+            )
             raise AuthenticationError("Authentication response did not include CST and X-SECURITY-TOKEN headers")
         self._tokens = CapitalSessionTokens(cst=cst, security_token=security_token, created_at=time.time())
-        LOGGER.info("Authenticated; session tokens stored in memory")
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "capital.auth.success",
+            env=self.settings.env,
+            base_url=self.settings.base_url,
+            status_code=response.status_code,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
         return self._tokens
 
     def auth_headers(self) -> dict[str, str]:
@@ -70,5 +105,21 @@ class CapitalAuthenticator:
         return {"CST": self._tokens.cst, "X-SECURITY-TOKEN": self._tokens.security_token}
 
     def refresh(self) -> CapitalSessionTokens:
-        LOGGER.info("Refreshing Capital.com session")
-        return self.authenticate()
+        started = time.perf_counter()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "capital.auth.refresh.start",
+            env=self.settings.env,
+            base_url=self.settings.base_url,
+        )
+        tokens = self.authenticate()
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "capital.auth.refresh.completed",
+            env=self.settings.env,
+            base_url=self.settings.base_url,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return tokens
