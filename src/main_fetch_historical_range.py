@@ -8,6 +8,7 @@ import pandas as pd
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
 from kronos_mapper import save_kronos_csv
+from prediction_store import upsert_instrument, upsert_ohlcv_df
 from time_utils import format_local_timestamp
 
 
@@ -26,6 +27,7 @@ RESOLUTION_TO_MINUTES = {
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch a longer historical Capital.com range into Kronos CSV format.")
     parser.add_argument("--market", default="ETHUSD")
+    parser.add_argument("--symbol", default=None, help="Stored symbol in PostgreSQL. Defaults to --market or resolved epic.")
     parser.add_argument("--epic", default=None)
     parser.add_argument("--resolution", default="MINUTE_5")
     parser.add_argument("--months", type=int, default=3)
@@ -34,6 +36,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--price-side", default="mid", choices=["bid", "ask", "mid"])
     parser.add_argument("--env", default="demo", choices=["demo", "live"])
     parser.add_argument("--chunk-points", type=int, default=900, help="Candles per request; keep below API max.")
+    parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN. Defaults to POSTGRES_DSN.")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -62,6 +65,7 @@ def main() -> None:
     client.authenticate()
     selected = client.resolve_market(args.market, args.epic, streaming=False)
     epic = selected["epic"]
+    symbol = args.symbol or args.market or epic
     client.save_market_details(epic)
 
     default_start, default_end = _default_window(args.months)
@@ -99,11 +103,29 @@ def main() -> None:
         / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}_{args.months}months.csv"
     )
     save_kronos_csv(combined, output, min_rows=1)
+    upsert_instrument(
+        symbol=symbol,
+        epic=epic,
+        market_name=selected.get("instrumentName", ""),
+        price_side=price_side,
+        metadata=selected,
+        dsn=args.postgres_dsn,
+    )
+    upserted_rows = upsert_ohlcv_df(
+        combined,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        price_side=price_side,
+        source="historical",
+        dsn=args.postgres_dsn,
+    )
     print("\nHistorical range fetch complete")
     print(f"Epic: {epic}")
     print(f"Market: {selected.get('instrumentName', '')}")
     print(f"Resolution: {resolution}")
     print(f"Rows: {len(combined)}")
+    print(f"PostgreSQL candles upserted: {upserted_rows}")
     print(f"Start: {format_local_timestamp(combined['timestamps'].iloc[0])}")
     print(f"End: {format_local_timestamp(combined['timestamps'].iloc[-1])}")
     print(f"CSV: {output}")

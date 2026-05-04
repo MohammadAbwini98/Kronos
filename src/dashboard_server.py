@@ -26,6 +26,7 @@ from walk_forward import create_walk_forward_experiment, get_walk_forward_experi
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "output"
+SUPPORTED_RESOLUTIONS = {"MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4", "DAY", "WEEK"}
 
 
 def _latest_file(pattern: str) -> Path | None:
@@ -66,6 +67,41 @@ def _metadata_stamp(path: Path) -> str:
 
 def _safe_file_fragment(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value)
+
+
+def _coerce_symbol_resolution(
+    symbol: str | None,
+    resolution: str | None,
+    *,
+    default_symbol: str = "ETHUSD",
+    default_resolution: str = "MINUTE_5",
+) -> tuple[str, str]:
+    symbol_value = str(symbol or default_symbol).strip().upper()
+    resolution_value = str(resolution or default_resolution).strip().upper()
+    if not symbol_value or len(symbol_value) > 64:
+        raise ValueError("symbol is required")
+    if resolution_value not in SUPPORTED_RESOLUTIONS:
+        raise ValueError("Unsupported resolution")
+    return symbol_value, resolution_value
+
+
+def _action_context(payload: dict) -> tuple[str, str]:
+    return _coerce_symbol_resolution(
+        payload.get("symbol") or payload.get("market"),
+        payload.get("resolution"),
+        default_symbol="ETHUSD",
+        default_resolution="MINUTE_5",
+    )
+
+
+def _metadata_matches_context(metadata: dict, symbol: str | None, resolution: str | None) -> bool:
+    if not metadata:
+        return False
+    metadata_symbol = str(metadata.get("epic") or metadata.get("symbol") or "").strip().upper()
+    metadata_resolution = str(metadata.get("resolution") or "").strip().upper()
+    symbol_ok = not symbol or not metadata_symbol or metadata_symbol == symbol
+    resolution_ok = not resolution or not metadata_resolution or metadata_resolution == resolution
+    return symbol_ok and resolution_ok
 
 
 def _latest_metadata(symbol: str | None = None, resolution: str | None = None) -> tuple[Path | None, dict]:
@@ -152,6 +188,15 @@ def _content_type(path: Path) -> str:
     return "text/plain; charset=utf-8"
 
 
+def _resolve_path_within_root(path_value: str | Path) -> Path:
+    target = Path(path_value)
+    if not target.is_absolute():
+        target = ROOT / target
+    resolved = target.resolve(strict=True)
+    resolved.relative_to(ROOT.resolve())
+    return resolved
+
+
 def _run(cmd: list[str], timeout: int = 420) -> dict:
     result = subprocess.run(cmd, cwd=ROOT, text=True, capture_output=True, timeout=timeout)
     output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
@@ -197,8 +242,10 @@ def _postgres_snapshot(symbol: str = "ETHUSD", resolution: str = "MINUTE_5") -> 
 
 
 def _metadata_for_run_id(run_id: str | None, symbol: str | None = None, resolution: str | None = None) -> tuple[Path | None, dict]:
+    normalized_symbol = str(symbol).strip().upper() if symbol else None
+    normalized_resolution = str(resolution).strip().upper() if resolution else None
     if not run_id:
-        return _latest_metadata(symbol, resolution)
+        return _latest_metadata(normalized_symbol, normalized_resolution)
     try:
         with connect() as conn:
             row = conn.execute("SELECT metadata_path FROM prediction_runs WHERE run_id = %s", (run_id,)).fetchone()
@@ -206,7 +253,10 @@ def _metadata_for_run_id(run_id: str | None, symbol: str | None = None, resoluti
             path = Path(row["metadata_path"])
             if not path.is_absolute():
                 path = ROOT / path
-            return path, _safe_json(path)
+            metadata = _safe_json(path)
+            if not _metadata_matches_context(metadata, normalized_symbol, normalized_resolution):
+                return None, {}
+            return path, metadata
     except Exception:
         return None, {}
     return None, {}
@@ -341,7 +391,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             selected_symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
             selected_resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
-            if selected_resolution not in {"MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4", "DAY", "WEEK"}:
+            if selected_resolution not in SUPPORTED_RESOLUTIONS:
                 _error_response(self, 400, "VALIDATION_ERROR", "Invalid resolution", {"field": "resolution"})
                 return
             metadata_path, metadata = _latest_metadata(selected_symbol, selected_resolution)
@@ -472,15 +522,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 _error_response(self, 503, "DATABASE_ERROR", "Unable to load walk-forward experiment", {"reason": str(exc)})
             return
         if parsed.path == "/file":
-            target = Path(parse_qs(parsed.query).get("path", [""])[0])
-            if not target.is_absolute():
-                target = ROOT / target
+            target = parse_qs(parsed.query).get("path", [""])[0]
             try:
-                resolved = target.resolve()
-                if not str(resolved).startswith(str(ROOT.resolve())):
+                if not target:
                     raise FileNotFoundError
+                resolved = _resolve_path_within_root(target)
                 body = resolved.read_bytes()
-            except FileNotFoundError:
+            except (FileNotFoundError, ValueError):
                 self.send_error(404)
                 return
             self.send_response(200)
@@ -536,7 +584,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if not market or len(market) > 64 or not symbol or len(symbol) > 64:
             _error_response(self, 400, "VALIDATION_ERROR", "market and symbol are required", {"field": "market"})
             return
-        if resolution not in {"MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4", "DAY", "WEEK"}:
+        if resolution not in SUPPORTED_RESOLUTIONS:
             _error_response(self, 400, "VALIDATION_ERROR", "Unsupported resolution", {"field": "resolution"})
             return
         if not (1 <= pred_len_int <= 96) or not (50 <= lookback_int <= 2048):
@@ -601,10 +649,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
 
     def _fetch_actual(self, payload: dict) -> None:
+        try:
+            symbol, resolution = _action_context(payload)
+        except ValueError as exc:
+            _error_response(self, 400, "VALIDATION_ERROR", str(exc))
+            return
         run_id = (payload.get("run_id") or "").strip() or None
-        metadata_path, _ = _metadata_for_run_id(run_id)
+        metadata_path, _ = _metadata_for_run_id(run_id, symbol=symbol, resolution=resolution)
         if not metadata_path:
-            _error_response(self, 404, "NOT_FOUND", "No forecast metadata found", {"run_id": run_id})
+            _error_response(
+                self,
+                404,
+                "NOT_FOUND",
+                "No forecast metadata found for selected context",
+                {"run_id": run_id, "symbol": symbol, "resolution": resolution},
+            )
             return
         result = _run(
             [
@@ -625,10 +684,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         _json_response(self, 200 if result["returncode"] == 0 else 500, {"status": "completed" if result["returncode"] == 0 else "failed", "run_id": run_id, **result})
 
     def _validate_actual(self, payload: dict) -> None:
+        try:
+            symbol, resolution = _action_context(payload)
+        except ValueError as exc:
+            _error_response(self, 400, "VALIDATION_ERROR", str(exc))
+            return
         run_id = (payload.get("run_id") or "").strip() or None
-        metadata_path, metadata = _metadata_for_run_id(run_id)
+        metadata_path, metadata = _metadata_for_run_id(run_id, symbol=symbol, resolution=resolution)
         if not metadata_path:
-            _error_response(self, 404, "NOT_FOUND", "No forecast metadata found", {"run_id": run_id})
+            _error_response(
+                self,
+                404,
+                "NOT_FOUND",
+                "No forecast metadata found for selected context",
+                {"run_id": run_id, "symbol": symbol, "resolution": resolution},
+            )
             return
         stamp = _metadata_stamp(metadata_path)
         epic = metadata.get("epic", "ETHUSD")
@@ -666,10 +736,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         _json_response(self, 200 if result["returncode"] == 0 else 500, result)
 
     def _baselines(self, payload: dict) -> None:
+        try:
+            symbol, resolution = _action_context(payload)
+        except ValueError as exc:
+            _error_response(self, 400, "VALIDATION_ERROR", str(exc))
+            return
         run_id = (payload.get("run_id") or "").strip() or None
-        metadata_path, metadata = _metadata_for_run_id(run_id)
+        metadata_path, metadata = _metadata_for_run_id(run_id, symbol=symbol, resolution=resolution)
         if not metadata_path:
-            _error_response(self, 404, "NOT_FOUND", "No forecast metadata found", {"run_id": run_id})
+            _error_response(
+                self,
+                404,
+                "NOT_FOUND",
+                "No forecast metadata found for selected context",
+                {"run_id": run_id, "symbol": symbol, "resolution": resolution},
+            )
             return
         stamp = _metadata_stamp(metadata_path)
         epic = metadata.get("epic", "ETHUSD")

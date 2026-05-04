@@ -10,7 +10,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 
-DEFAULT_POSTGRES_DSN = "postgresql://postgres:123@localhost:5432/capital_kronos"
+DEFAULT_POSTGRES_DSN = "postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos"
 
 
 class DatabaseError(RuntimeError):

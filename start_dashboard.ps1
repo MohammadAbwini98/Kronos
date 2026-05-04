@@ -78,6 +78,8 @@ $managedScriptPatterns = @(
     "src\dashboard_server.py"
 )
 $script:processJobHandle = [IntPtr]::Zero
+$defaultPostgresDsn = "postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos"
+$legacyLocalPostgresDsn = "postgresql://postgres:123@localhost:5432/capital_kronos"
 
 function Test-FlagEnabled {
     param(
@@ -285,13 +287,190 @@ function Test-Preflight {
         Write-Host "  PostgreSQL DSN: configured"
     }
     else {
-        Write-Warning "POSTGRES_DSN is not set. PostgreSQL-backed features and heartbeats may be unavailable."
+        Write-Warning "POSTGRES_DSN is not set. Startup will probe local DSN defaults during migration."
     }
 
     & $python -c "import sys; print(sys.version)"
     if ($LASTEXITCODE -ne 0) {
         throw "Python preflight execution failed with exit code $LASTEXITCODE"
     }
+}
+
+function Invoke-DatabaseMigrations {
+    $candidateDsns = @()
+    $configuredDsn = [Environment]::GetEnvironmentVariable("POSTGRES_DSN", "Process")
+
+    if (-not [string]::IsNullOrWhiteSpace($configuredDsn)) {
+        $candidateDsns = @($configuredDsn)
+    }
+    else {
+        $candidateDsns = @($defaultPostgresDsn, $legacyLocalPostgresDsn)
+    }
+
+    $lastMigrationExitCode = 0
+
+    for ($index = 0; $index -lt $candidateDsns.Count; $index++) {
+        $dsnCandidate = $candidateDsns[$index]
+        $migrateArgs = @("src\main_db_migrate.py", "--dsn", $dsnCandidate)
+
+        & $python @migrateArgs
+        $exitCode = $LASTEXITCODE
+
+        if ($exitCode -eq 0) {
+            if ($env:POSTGRES_DSN -ne $dsnCandidate) {
+                $env:POSTGRES_DSN = $dsnCandidate
+            }
+            if ([string]::IsNullOrWhiteSpace($configuredDsn) -and $index -gt 0) {
+                Write-Warning "Using fallback local PostgreSQL DSN for startup. Set POSTGRES_DSN in your environment to avoid probing on future runs."
+            }
+            return
+        }
+
+        $lastMigrationExitCode = $exitCode
+        if ([string]::IsNullOrWhiteSpace($configuredDsn) -and $index -lt ($candidateDsns.Count - 1)) {
+            Write-Warning "Migration failed with detected default DSN. Retrying with fallback local DSN."
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($configuredDsn)) {
+        throw "Database migration failed with exit code $lastMigrationExitCode using configured POSTGRES_DSN."
+    }
+    throw "Database migration failed with exit code $lastMigrationExitCode after trying default local DSNs. Set POSTGRES_DSN explicitly for your environment."
+}
+
+function Get-CommandOutputText {
+    param(
+        $Output
+    )
+    if ($null -eq $Output) {
+        return ""
+    }
+    return ([string]::Join("`n", @($Output))).Trim()
+}
+
+function Get-LocalHostNames {
+    $hosts = @()
+    if (-not [string]::IsNullOrWhiteSpace($env:COMPUTERNAME)) {
+        $hosts += $env:COMPUTERNAME
+    }
+    try {
+        $dnsHost = [System.Net.Dns]::GetHostName()
+        if (-not [string]::IsNullOrWhiteSpace($dnsHost)) {
+            $hosts += $dnsHost
+        }
+    }
+    catch {
+        # Ignore DNS hostname lookup failures in local-only fallback logic.
+    }
+    return @($hosts | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
+}
+
+function Invoke-SupervisorLeaseAcquire {
+    param(
+        [string]$InstanceId,
+        [int]$ProcessId,
+        [int]$TtlSeconds,
+        [bool]$AllowDuplicate
+    )
+
+    $leaseArgs = @(
+        "src\main_supervisor_lease.py",
+        "acquire",
+        "--instance-id", $InstanceId,
+        "--process-id", "$ProcessId",
+        "--command-line", "start_dashboard.ps1",
+        "--ttl-seconds", "$TtlSeconds"
+    )
+    if ($AllowDuplicate) {
+        $leaseArgs += "--allow-duplicate"
+    }
+    if ($env:POSTGRES_DSN) {
+        $leaseArgs += @("--dsn", $env:POSTGRES_DSN)
+    }
+
+    $leaseOutput = & $python @leaseArgs
+    $leaseExitCode = $LASTEXITCODE
+    $leaseText = Get-CommandOutputText -Output $leaseOutput
+    if (-not [string]::IsNullOrWhiteSpace($leaseText)) {
+        Write-Host $leaseText
+    }
+    if ($leaseExitCode -eq 0) {
+        return
+    }
+
+    $leasePayload = $null
+    if (-not [string]::IsNullOrWhiteSpace($leaseText)) {
+        try {
+            $leasePayload = $leaseText | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            $leasePayload = $null
+        }
+    }
+
+    if ($null -ne $leasePayload -and $null -ne $leasePayload.existing -and -not $AllowDuplicate) {
+        $existing = $leasePayload.existing
+        $existingHost = [string]$existing.host_name
+        $existingInstanceId = [string]$existing.supervisor_instance_id
+        $existingProcessId = 0
+        [void][int]::TryParse([string]$existing.process_id, [ref]$existingProcessId)
+        $localHosts = Get-LocalHostNames
+        $isLocalLease = $false
+        if (-not [string]::IsNullOrWhiteSpace($existingHost)) {
+            $isLocalLease = ($localHosts -contains $existingHost.ToLowerInvariant())
+        }
+        $existingProcess = $null
+        if ($existingProcessId -gt 0) {
+            $existingProcess = Get-Process -Id $existingProcessId -ErrorAction SilentlyContinue
+        }
+
+        if ($isLocalLease -and $null -eq $existingProcess -and -not [string]::IsNullOrWhiteSpace($existingInstanceId)) {
+            Write-Warning "Detected stale local supervisor lease for non-running process $existingProcessId. Releasing and retrying acquire."
+            $releaseArgs = @(
+                "src\main_supervisor_lease.py",
+                "release",
+                "--instance-id", $existingInstanceId
+            )
+            if ($env:POSTGRES_DSN) {
+                $releaseArgs += @("--dsn", $env:POSTGRES_DSN)
+            }
+
+            $releaseOutput = & $python @releaseArgs
+            $releaseExitCode = $LASTEXITCODE
+            $releaseText = Get-CommandOutputText -Output $releaseOutput
+            if (-not [string]::IsNullOrWhiteSpace($releaseText)) {
+                Write-Host $releaseText
+            }
+
+            if ($releaseExitCode -eq 0) {
+                $retryOutput = & $python @leaseArgs
+                $retryExitCode = $LASTEXITCODE
+                $retryText = Get-CommandOutputText -Output $retryOutput
+                if (-not [string]::IsNullOrWhiteSpace($retryText)) {
+                    Write-Host $retryText
+                }
+                if ($retryExitCode -eq 0) {
+                    return
+                }
+            }
+            throw "Failed to reacquire supervisor lease after releasing stale local lease."
+        }
+
+        $details = @()
+        if (-not [string]::IsNullOrWhiteSpace($existingHost)) {
+            $details += "host=$existingHost"
+        }
+        if ($existingProcessId -gt 0) {
+            $details += "pid=$existingProcessId"
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$existing.expires_at)) {
+            $details += "expires_at=$($existing.expires_at)"
+        }
+        $detailText = if ($details.Count -gt 0) { " ($($details -join ', '))" } else { "" }
+        throw "Another active dashboard supervisor lease exists$detailText. Set ALLOW_DUPLICATE_WORKERS=true to override intentionally."
+    }
+
+    throw "Another active dashboard supervisor lease exists. Set ALLOW_DUPLICATE_WORKERS=true to override intentionally."
 }
 
 function New-Worker {
@@ -477,34 +656,10 @@ try {
     }
 
     Write-Host "Applying database migrations"
-    $migrateArgs = @("src\main_db_migrate.py")
-    if ($env:POSTGRES_DSN) {
-        $migrateArgs += @("--dsn", $env:POSTGRES_DSN)
-    }
-    & $python @migrateArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Database migration failed with exit code $LASTEXITCODE"
-    }
+    Invoke-DatabaseMigrations
 
     Write-Host "Acquiring supervisor lease"
-    $leaseArgs = @(
-        "src\main_supervisor_lease.py",
-        "acquire",
-        "--instance-id", $supervisorInstanceId,
-        "--process-id", "$PID",
-        "--command-line", "start_dashboard.ps1",
-        "--ttl-seconds", "$supervisorLeaseTtlSeconds"
-    )
-    if (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false) {
-        $leaseArgs += "--allow-duplicate"
-    }
-    if ($env:POSTGRES_DSN) {
-        $leaseArgs += @("--dsn", $env:POSTGRES_DSN)
-    }
-    & $python @leaseArgs
-    if ($LASTEXITCODE -ne 0) {
-        throw "Another active dashboard supervisor lease exists. Set ALLOW_DUPLICATE_WORKERS=true to override intentionally."
-    }
+    Invoke-SupervisorLeaseAcquire -InstanceId $supervisorInstanceId -ProcessId $PID -TtlSeconds $supervisorLeaseTtlSeconds -AllowDuplicate (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)
 
     if (Test-FlagEnabled -Value $historicalBackfillEnabled -Default $true) {
         Write-Host "Backfilling and gap-filling $historicalBackfillDays day(s) of 5-minute Capital.com candles"

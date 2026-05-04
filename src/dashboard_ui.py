@@ -884,7 +884,7 @@ def dashboard_html() -> str:
       <button id="refresh" class="btn-alt">Refresh Snapshot</button>
       <button id="fetchActual" class="btn-warn">Fetch Actuals</button>
       <button id="validateActual" class="btn-warn">Validate Actuals</button>
-      <button id="baselines" class="btn-alt">Run Baselines</button>
+      <button id="runBaselines" class="btn-alt">Run Baselines</button>
     </div>
   </section>
 
@@ -1487,6 +1487,15 @@ function currentStatusQuery() {
   params.set('symbol', $('market').value || 'ETHUSD');
   params.set('resolution', $('resolution').value || 'MINUTE');
   return params.toString();
+}
+
+function actionContextPayload(extra = {}) {
+  return {
+    run_id: selectedRunId || '',
+    symbol: $('market').value || 'ETHUSD',
+    resolution: $('resolution').value || 'MINUTE_5',
+    ...extra,
+  };
 }
 
 function getSignalQuery(page = 1) {
@@ -2317,9 +2326,9 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
 
 $('predict').addEventListener('click', () => runPrediction());
 $('refresh').addEventListener('click', () => refreshStatus({ showSpinner: true }));
-$('fetchActual').addEventListener('click', () => postJson('/api/fetch-actual', { run_id: selectedRunId }, { loaderText: 'Fetching actual candles...' }).then(() => showToast('Actual fetch finished')));
-$('validateActual').addEventListener('click', () => postJson('/api/validate-actual', { run_id: selectedRunId, scoring_version: 'v1' }, { loaderText: 'Validating actuals...' }).then(() => showToast('Validation finished')));
-$('baselines').addEventListener('click', () => postJson('/api/baselines', { run_id: selectedRunId }, { loaderText: 'Running baselines...' }).then(() => showToast('Baselines complete')));
+$('fetchActual').addEventListener('click', () => postJson('/api/fetch-actual', actionContextPayload(), { loaderText: 'Fetching actual candles...' }).then(() => showToast('Actual fetch finished')));
+$('validateActual').addEventListener('click', () => postJson('/api/validate-actual', actionContextPayload({ scoring_version: 'v1' }), { loaderText: 'Validating actuals...' }).then(() => showToast('Validation finished')));
+$('runBaselines').addEventListener('click', () => postJson('/api/baselines', actionContextPayload(), { loaderText: 'Running baselines...' }).then(() => showToast('Baselines complete')));
 
 $('autoRefresh').addEventListener('change', setupAutoRefresh);
 $('autoPredict').addEventListener('change', () => { lastAutoPredictClosedBucket = null; });

@@ -314,10 +314,10 @@ The status is directional and data-only:
 - `LOSS` means the direction did not match.
 - No BUY/SELL execution logic is created or called.
 
-Create/use a local PostgreSQL database. If you installed PostgreSQL locally with the default `postgres` user, the app default DSN is:
+Create/use a local PostgreSQL database. The default DSN (matching the provided docker-compose credentials) is:
 
 ```text
-postgresql://postgres:123@localhost:5432/capital_kronos
+postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos
 ```
 
 Apply migrations:

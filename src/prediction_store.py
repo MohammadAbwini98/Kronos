@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -61,6 +62,26 @@ def _safe_float(value: Any) -> float:
     if pd.isna(value):
         return 0.0
     return float(value)
+
+
+def _coerce_finite_float(
+    value: Any,
+    *,
+    field: str,
+    timestamp_utc: str,
+    allow_null: bool = False,
+) -> float:
+    if pd.isna(value):
+        if allow_null:
+            return 0.0
+        raise PredictionStoreError(f"Candle field {field!r} is null at {timestamp_utc}")
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise PredictionStoreError(f"Candle field {field!r} is non-numeric at {timestamp_utc}: {value!r}") from exc
+    if not math.isfinite(result):
+        raise PredictionStoreError(f"Candle field {field!r} is non-finite at {timestamp_utc}: {value!r}")
+    return result
 
 
 def preferred_candle_source(existing: str | None, incoming: str | None) -> str:
@@ -134,9 +155,32 @@ def upsert_ohlcv_df(
     if df.empty:
         return 0
     clean = df.copy()
+    required_columns = ["timestamps", "open", "high", "low", "close"]
+    missing_required = [column for column in required_columns if column not in clean.columns]
+    if missing_required:
+        missing_list = ", ".join(missing_required)
+        raise PredictionStoreError(f"OHLC DataFrame missing required columns: {missing_list}")
+    if "volume" not in clean.columns:
+        clean["volume"] = 0.0
+    if "amount" not in clean.columns:
+        clean["amount"] = 0.0
     clean["timestamps"] = pd.to_datetime(clean["timestamps"], utc=True)
     rows = []
     for _, row in clean.iterrows():
+        timestamp_utc = _to_utc_iso(row["timestamps"])
+        open_price = _coerce_finite_float(row["open"], field="open", timestamp_utc=timestamp_utc)
+        high_price = _coerce_finite_float(row["high"], field="high", timestamp_utc=timestamp_utc)
+        low_price = _coerce_finite_float(row["low"], field="low", timestamp_utc=timestamp_utc)
+        close_price = _coerce_finite_float(row["close"], field="close", timestamp_utc=timestamp_utc)
+        volume_value = _coerce_finite_float(row["volume"], field="volume", timestamp_utc=timestamp_utc, allow_null=True)
+        amount_value = _coerce_finite_float(row["amount"], field="amount", timestamp_utc=timestamp_utc, allow_null=True)
+
+        if high_price < max(open_price, close_price, low_price) or low_price > min(open_price, close_price, high_price):
+            raise PredictionStoreError(
+                "Invalid OHLC ordering at "
+                f"{timestamp_utc}: open={open_price}, high={high_price}, low={low_price}, close={close_price}"
+            )
+
         rows.append(
             (
                 provider,
@@ -144,13 +188,13 @@ def upsert_ohlcv_df(
                 epic,
                 resolution,
                 price_side,
-                _to_utc_iso(row["timestamps"]),
-                _safe_float(row["open"]),
-                _safe_float(row["high"]),
-                _safe_float(row["low"]),
-                _safe_float(row["close"]),
-                _safe_float(row["volume"]),
-                _safe_float(row["amount"]),
+                timestamp_utc,
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+                volume_value,
+                amount_value,
                 source,
                 Jsonb({}),
             )
