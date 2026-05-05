@@ -1740,11 +1740,16 @@ function renderOverview(options = {}) {
 function renderValidation(data) {
   const v = data.validation || {};
   const source = data.validation_source || 'none';
+  const sv = data.signal_validation || {};
+  const tf = data.timeframe_validations || [];
+  const componentScores = sv.component_scores || {};
+  const reasonCodes = sv.reason_codes || [];
+  const reasonDetails = sv.reason_details || [];
   const matchedCandles = Number(v.matched_candles || 0);
   const accuracyHint = matchedCandles < 20
     ? `Low sample size (${matchedCandles}) - direction accuracy is noisy.`
     : `Sample size ${matchedCandles} - direction accuracy is more reliable.`;
-  const rows = [
+  const qualityRows = [
     ['Source', source],
     ['Quality', v.quality_status],
     ['Direction', v.forecast_direction],
@@ -1757,22 +1762,98 @@ function renderValidation(data) {
     ['Expected move', v.max_abs_close_move_pct === undefined || v.max_abs_close_move_pct === null ? 'n/a' : `${fmtNumber(v.max_abs_close_move_pct, 3)}%`],
   ];
 
+  const scoreRows = [
+    ['Candidate signal', sv.candidate_signal || 'n/a'],
+    ['Final signal', sv.final_signal || 'n/a'],
+    ['Confidence level', sv.confidence_level || 'n/a'],
+    ['Total score', sv.total_score === undefined || sv.total_score === null ? 'n/a' : fmtNumber(sv.total_score, 2)],
+    ['Blocked', sv.blocked ? 'Yes' : 'No'],
+    ['Block reason', sv.block_reason || 'n/a'],
+    ['Net edge %', sv.net_edge_pct === undefined || sv.net_edge_pct === null ? 'n/a' : `${fmtNumber(sv.net_edge_pct, 4)}%`],
+    ['Estimated cost %', sv.estimated_cost_pct === undefined || sv.estimated_cost_pct === null ? 'n/a' : `${fmtNumber(sv.estimated_cost_pct, 4)}%`],
+  ];
+
+  const componentRows = [
+    ['Kronos forecast quality', fmtNumber(componentScores.kronos_forecast, 2)],
+    ['Higher-timeframe alignment', fmtNumber(componentScores.higher_timeframe_alignment, 2)],
+    ['Momentum confirmation', fmtNumber(componentScores.momentum, 2)],
+    ['Volume confirmation', fmtNumber(componentScores.volume, 2)],
+    ['Cost/liquidity quality', fmtNumber(componentScores.cost_liquidity, 2)],
+    ['Volatility regime', fmtNumber(componentScores.volatility, 2)],
+    ['Support/resistance location', fmtNumber(componentScores.support_resistance, 2)],
+  ];
+
+  const timeframeRows = tf.length
+    ? tf.map(row => {
+      const snap = row.indicator_snapshot || {};
+      return `<tr>
+        <td>${escapeHtml(row.timeframe || '')}</td>
+        <td>${chip(row.trend || 'NEUTRAL')}</td>
+        <td>${row.confirms_candidate ? 'Yes' : 'No'}</td>
+        <td>${fmtNumber(row.total_timeframe_score, 2)}</td>
+        <td>${fmtNumber(snap.rsi14, 2)}</td>
+        <td>${fmtNumber(snap.macd_hist, 4)}</td>
+        <td>${fmtNumber(snap.ema20, 2)}</td>
+        <td>${fmtNumber(snap.ema50, 2)}</td>
+        <td>${fmtNumber(snap.atr14, 4)}</td>
+        <td>${fmtNumber(snap.volume_zscore, 2)}</td>
+        <td>${snap.distance_to_support_pct === undefined || snap.distance_to_support_pct === null ? 'n/a' : `${fmtNumber(snap.distance_to_support_pct, 2)}%`}</td>
+        <td>${snap.distance_to_resistance_pct === undefined || snap.distance_to_resistance_pct === null ? 'n/a' : `${fmtNumber(snap.distance_to_resistance_pct, 2)}%`}</td>
+      </tr>`;
+    }).join('')
+    : '<tr><td colspan="12">No higher-timeframe validation rows available.</td></tr>';
+
+  const reasonHtml = (reasonDetails.length || reasonCodes.length)
+    ? `<div class="warning-stack">
+        ${reasonCodes.map(code => `<div class="warning-item">Reason code: ${escapeHtml(code)}</div>`).join('')}
+        ${reasonDetails.map(item => `<div class="warning-item">${escapeHtml(item)}</div>`).join('')}
+      </div>`
+    : '<div class="tiny-help">No validation reasons attached for this run.</div>';
+
   $('validation').innerHTML = `
     <div class="panel-head">
       <div>
         <h2>Validation Summary</h2>
-        <p>Readable quality metrics for the latest run without parsing raw JSON manually.</p>
+        <p>Forecast quality plus external higher-timeframe validation and signal scoring.</p>
       </div>
-      ${chip(v.quality_status || 'PENDING')}
+      ${chip(sv.final_signal || v.quality_status || 'PENDING')}
     </div>
 
     <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
-      ${rows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
+      ${qualityRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
     </tbody></table></div>
+
+    <h3 style="margin-top: 12px;">External Signal Validation</h3>
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+      ${scoreRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
+    </tbody></table></div>
+
+    <h3 style="margin-top: 12px;">Score Breakdown</h3>
+    <div class="table-wrap"><table><thead><tr><th>Component</th><th>Score</th></tr></thead><tbody>
+      ${componentRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
+    </tbody></table></div>
+
+    <h3 style="margin-top: 12px;">Higher-Timeframe Context</h3>
+    <div class="table-wrap"><table><thead>
+      <tr>
+        <th>Timeframe</th><th>Trend</th><th>Confirms</th><th>Score</th>
+        <th>RSI</th><th>MACD Hist</th><th>EMA20</th><th>EMA50</th>
+        <th>ATR</th><th>Volume Z</th><th>Dist Support</th><th>Dist Resistance</th>
+      </tr>
+    </thead><tbody>
+      ${timeframeRows}
+    </tbody></table></div>
+
+    <h3 style="margin-top: 12px;">Decision Reasons</h3>
+    ${reasonHtml}
 
     <details style="margin-top: 10px;">
       <summary class="muted">Show raw validation payload</summary>
-      <pre>${escapeHtml(JSON.stringify(v, null, 2))}</pre>
+      <pre>${escapeHtml(JSON.stringify({
+        forecast_quality: v,
+        signal_validation: sv,
+        timeframe_validations: tf,
+      }, null, 2))}</pre>
     </details>`;
 }
 

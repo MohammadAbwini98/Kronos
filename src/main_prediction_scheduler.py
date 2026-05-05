@@ -4,6 +4,7 @@ import argparse
 from dataclasses import dataclass
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -36,6 +37,13 @@ WEBSOCKET_STREAM_PAUSE_STATUSES = {"RECONNECTING", "COOLDOWN", "ERROR", "MISSING
 _LAST_PROCESSED_WEBSOCKET_CANDLE: dict[tuple[str, str], pd.Timestamp] = {}
 
 
+RUN_ID_RE = re.compile(r"run_id=(?P<run_id>[A-Za-z0-9_\-:TZ]+)")
+VALIDATION_RE = re.compile(
+    r"SIGNAL_VALIDATION:run_id=(?P<run_id>[^,]+),final_signal=(?P<final_signal>[^,]+),"
+    r"total_score=(?P<total_score>[^,]+),blocked=(?P<blocked>[^\s,]+)"
+)
+
+
 @dataclass
 class WebSocketPredictionGate:
     allow: bool
@@ -55,6 +63,34 @@ def _combined_output(result: subprocess.CompletedProcess[str]) -> str:
 def _looks_like_rate_limit(output: str) -> bool:
     text = (output or "").lower()
     return "error.too-many.requests" in text or "http 429" in text or "too many requests" in text
+
+
+def _extract_latest_run_id(output: str) -> str | None:
+    if not output:
+        return None
+    matches = RUN_ID_RE.findall(output)
+    if not matches:
+        return None
+    return str(matches[-1])
+
+
+def _extract_validation_summary(output: str) -> dict[str, Any]:
+    if not output:
+        return {}
+    match = VALIDATION_RE.search(output)
+    if not match:
+        return {}
+    blocked_text = str(match.group("blocked")).strip().lower()
+    try:
+        total_score = float(str(match.group("total_score")).strip())
+    except Exception:  # noqa: BLE001
+        total_score = 0.0
+    return {
+        "validation_run_id": str(match.group("run_id")).strip(),
+        "validation_final_signal": str(match.group("final_signal")).strip(),
+        "validation_total_score": total_score,
+        "validation_blocked": blocked_text in {"1", "true", "yes", "on"},
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -406,6 +442,7 @@ def _run_cycle(args: argparse.Namespace) -> int:
         max_attempts = 2
         result: subprocess.CompletedProcess[str] | None = None
         output_tail_text = ""
+        final_output = ""
         while attempt < max_attempts:
             attempt += 1
             log_event(
@@ -420,6 +457,7 @@ def _run_cycle(args: argparse.Namespace) -> int:
             )
             result = _run_forecast_command(cmd, args)
             output = _combined_output(result)
+            final_output = output
             output_tail_text = sanitize_output_tail(output)
             log_event(
                 LOGGER,
@@ -462,6 +500,9 @@ def _run_cycle(args: argparse.Namespace) -> int:
         if result.returncode != 0 and output_tail_text:
             LOGGER.warning("Scheduler cycle failed output tail: %s", output_tail_text)
 
+        latest_run_id = _extract_latest_run_id(final_output)
+        validation_summary = _extract_validation_summary(final_output)
+
         details = {
             "returncode": int(result.returncode),
             "attempts": attempt,
@@ -470,6 +511,10 @@ def _run_cycle(args: argparse.Namespace) -> int:
             "interval_minutes": int(args.interval_minutes),
             "scheduler_cycle_id": scheduler_cycle_id,
             "current_operation": "cycle",
+            "latest_run_id": latest_run_id,
+            "validation_status": validation_summary.get("validation_final_signal"),
+            "validation_blocked": validation_summary.get("validation_blocked"),
+            "validation_total_score": validation_summary.get("validation_total_score"),
             "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
             **gate.details,
         }

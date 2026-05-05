@@ -411,6 +411,28 @@ def _status_warnings(postgres_snapshot: dict) -> list[str]:
             warnings.append(f"Worker {service_name} heartbeat appears stale ({stale_seconds}s).")
         if service_name == "maintenance_worker" and status == "ERROR":
             warnings.append(f"Worker {service_name} status is {status}.")
+
+    signal_validation = postgres_snapshot.get("signal_validation") or {}
+    if signal_validation.get("error") == "validation_tables_missing":
+        warnings.append("Signal validation tables are missing. Run migrations to enable validation scoring.")
+
+    final_signal = str(signal_validation.get("final_signal") or "").upper()
+    blocked = bool(signal_validation.get("blocked"))
+    block_reason = signal_validation.get("block_reason")
+    if blocked:
+        warnings.append(f"Signal is blocked by validation rules ({block_reason or 'UNKNOWN'}).")
+    if final_signal == "VALIDATION_UNAVAILABLE":
+        warnings.append("Signal validation is unavailable; actionable signal output is suppressed.")
+
+    reason_codes = signal_validation.get("reason_codes") or []
+    if "MISSING_HIGHER_TIMEFRAME_CONTEXT" in reason_codes:
+        warnings.append("Higher-timeframe context is missing for signal validation.")
+    if "WIDE_SPREAD_OR_COST_UNKNOWN" in reason_codes:
+        warnings.append("Signal blocked due to wide spread or unknown trading cost context.")
+    if "EXTREME_VOLATILITY" in reason_codes:
+        warnings.append("Signal blocked due to extreme volatility regime.")
+    if "VERY_LOW_VOLUME" in reason_codes:
+        warnings.append("Signal blocked due to very low volume context.")
     return warnings
 
 
@@ -486,6 +508,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 postgres_snapshot = _postgres_snapshot(selected_symbol, selected_resolution)
                 auto_finetune = _auto_finetune_status()
                 validation_from_db = postgres_snapshot.get("latest_validation") or {}
+                signal_validation = postgres_snapshot.get("signal_validation") or {}
+                timeframe_validations = postgres_snapshot.get("timeframe_validations") or []
                 if quality_report:
                     validation_body = quality_report.get("forecast_quality_validation", quality_report)
                 else:
@@ -500,6 +524,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     {
                         "metadata": metadata,
                         "validation": validation_body,
+                        "signal_validation": signal_validation,
+                        "timeframe_validations": timeframe_validations,
                         "forecast": forecast,
                         "input_tail": input_tail,
                         "actual_tail": actual_tail,

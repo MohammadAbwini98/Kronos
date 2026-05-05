@@ -14,6 +14,7 @@ from config import configure_logging
 from logging_utils import log_event, new_correlation_id
 from prediction_store import save_prediction_run
 from time_utils import display_timezone_name, format_local_timestamp
+from signal_config import load_signal_config
 
 
 LOGGER = logging.getLogger(__name__)
@@ -94,6 +95,8 @@ def parse_args() -> argparse.Namespace:
         help="Movement below this threshold is likely not useful after spread, fees, and slippage.",
     )
     parser.add_argument("--signal-min-confidence", type=float, default=float(os.getenv("SIGNAL_MIN_CONFIDENCE", "0.55")))
+    parser.add_argument("--signal-validation-enabled", default=None, help="Override SIGNAL_VALIDATION_ENABLED with true/false.")
+    parser.add_argument("--signal-validation-strict", default=None, help="Override SIGNAL_VALIDATION_STRICT with true/false.")
     parser.add_argument("--repo-dir", default=None, help="Local Kronos repository path.")
     parser.add_argument("--model-dir", default=None, help="Local Kronos model directory.")
     parser.add_argument("--tokenizer-dir", default=None, help="Local Kronos tokenizer directory.")
@@ -366,6 +369,92 @@ def _future_timestamps(last_timestamp: pd.Timestamp, resolution: str, pred_len: 
     return pd.Series(pd.date_range(start=start, periods=pred_len, freq=freq, tz="UTC"))
 
 
+def _run_external_signal_validation(
+    *,
+    run_id: str,
+    dsn: str | None,
+    env_name: str,
+    prediction_request_id: str,
+    signal_validation_enabled_override: str | None,
+    signal_validation_strict_override: str | None,
+) -> dict[str, object]:
+    overrides: dict[str, object] = {}
+    if signal_validation_enabled_override is not None:
+        overrides["SIGNAL_VALIDATION_ENABLED"] = signal_validation_enabled_override
+    if signal_validation_strict_override is not None:
+        overrides["SIGNAL_VALIDATION_STRICT"] = signal_validation_strict_override
+
+    cfg = load_signal_config(overrides=overrides)
+    if not cfg.signal_validation_enabled:
+        return {
+            "ok": True,
+            "skipped": True,
+            "final_signal": "VALIDATION_DISABLED",
+            "blocked": True,
+            "total_score": 0.0,
+            "reason": "SIGNAL_VALIDATION_ENABLED is false.",
+        }
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "kronos.signal_validation.start",
+        prediction_request_id=prediction_request_id,
+        run_id=run_id,
+        validation_strict=cfg.signal_validation_strict,
+        dsn=dsn,
+    )
+
+    from main_validate_signal_context import run_validation_for_run
+
+    result = run_validation_for_run(
+        run_id,
+        dsn=dsn,
+        env_name=env_name,
+        config_overrides=overrides,
+    )
+    if not result.get("ok", False):
+        error_message = str(result.get("error") or result.get("details") or "signal validation failed")
+        log_event(
+            LOGGER,
+            logging.ERROR,
+            "kronos.signal_validation.error",
+            prediction_request_id=prediction_request_id,
+            run_id=run_id,
+            validation_strict=cfg.signal_validation_strict,
+            error=error_message,
+        )
+        if cfg.signal_validation_strict:
+            raise RuntimeError(f"Signal validation strict-mode failure: {error_message}")
+        return {
+            "ok": False,
+            "skipped": False,
+            "final_signal": "VALIDATION_UNAVAILABLE",
+            "blocked": True,
+            "total_score": 0.0,
+            "reason": error_message,
+        }
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "kronos.signal_validation.completed",
+        prediction_request_id=prediction_request_id,
+        run_id=run_id,
+        final_signal=result.get("final_signal"),
+        total_score=result.get("total_score"),
+        blocked=result.get("blocked"),
+    )
+    return {
+        "ok": True,
+        "skipped": False,
+        "final_signal": result.get("final_signal"),
+        "blocked": bool(result.get("blocked", False)),
+        "total_score": float(result.get("total_score") or 0.0),
+        "reason": None,
+    }
+
+
 def run_prediction(
     input_csv: Path,
     output_csv: Path,
@@ -398,6 +487,8 @@ def run_prediction(
     prediction_db: Path | None = None,
     save_prediction_db: bool = True,
     prediction_request_id: str | None = None,
+    signal_validation_enabled_override: str | None = None,
+    signal_validation_strict_override: str | None = None,
 ) -> pd.DataFrame:
     request_id = prediction_request_id or new_correlation_id("pred")
     started = time.perf_counter()
@@ -690,6 +781,21 @@ def run_prediction(
                     "Prediction DB saved: "
                     f"{db_summary['saved_records']} rows, run_id={db_summary['run_id']}, dsn={db_summary['dsn']}"
                 )
+                validation_summary = _run_external_signal_validation(
+                    run_id=str(db_summary["run_id"]),
+                    dsn=str(prediction_db) if prediction_db is not None else None,
+                    env_name=os.getenv("CAPITAL_ENV", "demo"),
+                    prediction_request_id=request_id,
+                    signal_validation_enabled_override=signal_validation_enabled_override,
+                    signal_validation_strict_override=signal_validation_strict_override,
+                )
+                print(
+                    "SIGNAL_VALIDATION:"
+                    f"run_id={db_summary['run_id']},"
+                    f"final_signal={validation_summary.get('final_signal')},"
+                    f"total_score={validation_summary.get('total_score')},"
+                    f"blocked={validation_summary.get('blocked')}"
+                )
 
         print("Validation report:")
         print(json.dumps(report, indent=2))
@@ -816,6 +922,8 @@ def main() -> None:
         prediction_db=Path(args.postgres_dsn or args.prediction_db) if (args.postgres_dsn or args.prediction_db) else None,
         save_prediction_db=not args.no_save_prediction_db,
         prediction_request_id=prediction_request_id,
+        signal_validation_enabled_override=args.signal_validation_enabled,
+        signal_validation_strict_override=args.signal_validation_strict,
     )
     print(f"METADATA_PATH:{metadata_output}")
     print("\nKronos forecast complete")

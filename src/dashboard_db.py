@@ -647,6 +647,68 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                 "SELECT service_name, status, details, updated_at FROM service_heartbeats ORDER BY service_name"
             ).fetchall()
 
+            latest_signal_validation_row = None
+            timeframe_validations_rows: list[dict[str, Any]] = []
+            validation_query_error = None
+            try:
+                latest_signal_validation_row = conn.execute(
+                    """
+                    SELECT
+                        run_id,
+                        symbol,
+                        epic,
+                        base_resolution,
+                        candidate_signal,
+                        final_signal,
+                        forecast_direction,
+                        last_input_close,
+                        forecast_close,
+                        forecast_return_pct,
+                        estimated_cost_pct,
+                        net_edge_pct,
+                        blocked,
+                        block_reason,
+                        confidence_level,
+                        total_score,
+                        component_scores,
+                        reason_codes,
+                        reason_details,
+                        created_at,
+                        updated_at
+                    FROM signal_validation_runs
+                    WHERE symbol = %s
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (symbol,),
+                ).fetchone()
+                if latest_signal_validation_row and latest_signal_validation_row.get("run_id"):
+                    timeframe_validations_rows = conn.execute(
+                        """
+                        SELECT
+                            run_id,
+                            timeframe,
+                            timestamp_utc,
+                            trend,
+                            confirms_candidate,
+                            trend_score,
+                            momentum_score,
+                            volume_score,
+                            volatility_score,
+                            support_resistance_score,
+                            total_timeframe_score,
+                            indicator_snapshot,
+                            reason_details,
+                            created_at
+                        FROM signal_timeframe_validations
+                        WHERE run_id = %s
+                        ORDER BY timeframe ASC
+                        """,
+                        (latest_signal_validation_row["run_id"],),
+                    ).fetchall()
+            except Exception as exc:  # noqa: BLE001
+                validation_query_error = str(exc)
+
         live_quote = websocket_live_quote or fallback_live_quote
         websocket_row = dict(websocket_live_quote or websocket_candle_quote) if (websocket_live_quote or websocket_candle_quote) else None
         websocket_ref = None
@@ -680,6 +742,24 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
             latest_validation = latest_validation_metrics(symbol=symbol, resolution=resolution, dsn=dsn)
         except Exception:  # noqa: BLE001
             latest_validation = None
+        if latest_signal_validation_row is None:
+            if validation_query_error and "does not exist" in validation_query_error.lower():
+                latest_signal_validation: dict[str, Any] = {
+                    "ok": False,
+                    "error": "validation_tables_missing",
+                    "reason": validation_query_error,
+                }
+            elif validation_query_error:
+                latest_signal_validation = {
+                    "ok": False,
+                    "error": "query_failed",
+                    "reason": validation_query_error,
+                }
+            else:
+                latest_signal_validation = {}
+        else:
+            latest_signal_validation = dict(latest_signal_validation_row)
+        timeframe_validations = [dict(row) for row in timeframe_validations_rows]
         try:
             supervisor = current_supervisor_lease(dsn=dsn)
         except Exception:  # noqa: BLE001
@@ -697,6 +777,8 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                 "alert_threshold_seconds": WEBSOCKET_STALE_THRESHOLD_SECONDS,
             },
             "latest_validation": latest_validation,
+            "signal_validation": latest_signal_validation,
+            "timeframe_validations": timeframe_validations,
             "horizon_metrics": horizon_metric_summary(symbol=symbol, resolution=resolution, dsn=dsn),
             "outcomes": [dict(row) for row in outcomes],
             "heartbeats": [dict(row) for row in heartbeats],

@@ -414,6 +414,46 @@ Prepare collected candles for future Kronos fine-tuning experiments:
 
 Signals are analytical labels only: `LONG`, `SHORT`, or `HOLD`. They are not orders and this project does not execute trades.
 
+## External Higher-Timeframe Signal Validation
+
+The forecast engine remains Kronos on `MINUTE_5`. Higher timeframes are used externally to validate and score signals.
+
+Enable or disable:
+
+```text
+SIGNAL_VALIDATION_ENABLED=true
+SIGNAL_VALIDATION_STRICT=false
+SIGNAL_VALIDATION_TIMEFRAMES=MINUTE_15,MINUTE_30,HOUR,HOUR_4
+```
+
+- Set `SIGNAL_VALIDATION_ENABLED=false` to disable the feature cleanly.
+- Keep `SIGNAL_VALIDATION_STRICT=false` to preserve forecast artifacts when validation context is temporarily unavailable.
+
+Run manually for a run id:
+
+```powershell
+.\.venv\Scripts\python.exe .\src\main_validate_signal_context.py --run-id RUN_ID
+```
+
+Run manually for the latest run:
+
+```powershell
+.\.venv\Scripts\python.exe .\src\main_validate_signal_context.py --latest --symbol ETHUSD --resolution MINUTE_5
+```
+
+Generate calibration report:
+
+```powershell
+.\.venv\Scripts\python.exe .\src\main_signal_validation_report.py --output .\output\signal_validation_report.json
+```
+
+View results in dashboard:
+
+- Open `http://127.0.0.1:8765`
+- Check the Validation tab for final signal, confidence, total score, component breakdown, and per-timeframe validation details.
+
+Reminder: validation outputs are analytical only. No trading endpoint or order flow is introduced.
+
 This loads local model files by default:
 
 ```text

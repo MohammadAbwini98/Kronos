@@ -4,6 +4,7 @@ import argparse
 import json
 import logging
 import os
+import re
 from pathlib import Path
 import time
 
@@ -19,6 +20,12 @@ from time_utils import format_local_timestamp
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+SIGNAL_VALIDATION_LINE_RE = re.compile(
+    r"SIGNAL_VALIDATION:run_id=(?P<run_id>[^,]+),final_signal=(?P<final_signal>[^,]+),"
+    r"total_score=(?P<total_score>[^,]+),blocked=(?P<blocked>[^\s,]+)"
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -174,6 +181,30 @@ def _run_shadow_prediction(
         active_run_id=active_run_id,
     )
     return True
+
+
+def _extract_signal_validation_summary(output_text: str) -> dict[str, object] | None:
+    if not output_text:
+        return None
+    match = SIGNAL_VALIDATION_LINE_RE.search(output_text)
+    if not match:
+        return None
+
+    total_score_raw = str(match.group("total_score")).strip()
+    try:
+        total_score = float(total_score_raw)
+    except Exception:  # noqa: BLE001
+        total_score = 0.0
+
+    blocked_raw = str(match.group("blocked")).strip().lower()
+    blocked = blocked_raw in {"1", "true", "yes", "on"}
+
+    return {
+        "run_id": str(match.group("run_id")).strip(),
+        "final_signal": str(match.group("final_signal")).strip(),
+        "total_score": total_score,
+        "blocked": blocked,
+    }
 
 
 def main() -> None:
@@ -464,6 +495,30 @@ def main() -> None:
         if result.returncode != 0:
             raise SystemExit(result.returncode)
 
+        kronos_output = (result.stdout or "") + ("\n" + result.stderr if result.stderr else "")
+        signal_validation_summary = _extract_signal_validation_summary(kronos_output)
+        if signal_validation_summary:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.signal_validation.parsed",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                validation_run_id=signal_validation_summary.get("run_id"),
+                validation_final_signal=signal_validation_summary.get("final_signal"),
+                validation_total_score=signal_validation_summary.get("total_score"),
+                validation_blocked=signal_validation_summary.get("blocked"),
+            )
+            print(
+                "Signal validation summary: "
+                f"run_id={signal_validation_summary.get('run_id')} "
+                f"final_signal={signal_validation_summary.get('final_signal')} "
+                f"score={signal_validation_summary.get('total_score')} "
+                f"blocked={signal_validation_summary.get('blocked')}"
+            )
+
         latest_metadata = settings.output_dir / f"forecast_metadata_{safe_epic_for_filename(epic)}_{resolution}_{run_stamp}.json"
         metadata = json.loads(latest_metadata.read_text(encoding="utf-8"))
         log_event(
@@ -570,6 +625,9 @@ def main() -> None:
             metadata_path=str(latest_metadata),
             stored_rows=stored_rows,
             quality_grade=data_quality.quality_grade,
+            validation_final_signal=(signal_validation_summary or {}).get("final_signal"),
+            validation_total_score=(signal_validation_summary or {}).get("total_score"),
+            validation_blocked=(signal_validation_summary or {}).get("blocked"),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
 
