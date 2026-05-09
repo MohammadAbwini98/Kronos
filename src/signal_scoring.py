@@ -100,6 +100,34 @@ def _aggregate_timeframe_scores(timeframe_validations: list[dict[str, Any]]) -> 
     }
 
 
+def _higher_timeframe_conflict_penalty(
+    candidate_signal: str,
+    timeframe_validations: list[dict[str, Any]],
+) -> tuple[float, list[str]]:
+    candidate = str(candidate_signal).upper()
+    if candidate not in {"LONG", "SHORT"}:
+        return 0.0, []
+
+    penalty_by_timeframe = {
+        "MINUTE_15": 2.0,
+        "MINUTE_30": 4.0,
+        "HOUR": 9.0,
+        "HOUR_4": 7.0,
+    }
+    opposing_trend = "BEARISH" if candidate == "LONG" else "BULLISH"
+    penalty = 0.0
+    reasons: list[str] = []
+    for row in timeframe_validations:
+        timeframe = str(row.get("timeframe") or "").upper()
+        trend = str(row.get("trend") or "NEUTRAL").upper()
+        if trend != opposing_trend:
+            continue
+        value = penalty_by_timeframe.get(timeframe, 0.0)
+        penalty += value
+        reasons.append(f"{timeframe} trend is {trend} against {candidate} candidate (-{value:.0f}).")
+    return _clamp(penalty, 0.0, 20.0), reasons
+
+
 def score_signal(
     *,
     normalized_forecast: dict[str, Any],
@@ -146,6 +174,7 @@ def score_signal(
     tf_scores = _aggregate_timeframe_scores(timeframe_validations)
 
     cost_liquidity_score = 10.0
+    low_volume_reason: str | None = None
     spread_pct = market.get("spread_pct")
     if spread_pct is not None:
         spread_value = float(spread_pct)
@@ -156,6 +185,15 @@ def score_signal(
 
     if net_edge_pct < (config.signal_min_net_edge_pct * 2.0):
         cost_liquidity_score -= 2.0
+
+    volume_z = market.get("volume_zscore")
+    if volume_z is not None and float(volume_z) <= float(config.signal_low_volume_zscore):
+        penalty = min(float(config.signal_low_volume_penalty_points), 10.0)
+        cost_liquidity_score -= penalty
+        low_volume_reason = (
+            f"Very low volume context reduced cost/liquidity score by {penalty:.1f} "
+            f"(volume z-score {float(volume_z):.3f})."
+        )
     cost_liquidity_score = _clamp(cost_liquidity_score, 0.0, 10.0)
 
     components = {
@@ -168,13 +206,16 @@ def score_signal(
         "support_resistance": round(tf_scores["support_resistance"], 4),
     }
 
-    penalty_score = 0.0
+    penalty_score, penalty_reasons = _higher_timeframe_conflict_penalty(candidate_signal, timeframe_validations)
     total = _clamp(sum(components.values()) - penalty_score, 0.0, 100.0)
 
     final_signal = _final_signal(candidate_signal, total, config)
     confidence = _bucket_confidence(total)
 
     reasons: list[str] = []
+    reasons.extend(penalty_reasons)
+    if low_volume_reason:
+        reasons.append(low_volume_reason)
     if final_signal in {"WATCH", "HOLD"} and candidate_signal in {"LONG", "SHORT"}:
         reasons.append("Candidate signal did not clear final scoring thresholds.")
 

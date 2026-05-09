@@ -25,6 +25,13 @@ class ActualWindowCoverageTests(unittest.TestCase):
         self.assertTrue(main_fetch_actual_for_forecast._covers_required_window(complete, start, end, "MINUTE_5"))
         self.assertFalse(main_fetch_actual_for_forecast._covers_required_window(missing_middle, start, end, "MINUTE_5"))
 
+    def test_latest_closed_timestamp_excludes_current_open_candle(self):
+        now = pd.Timestamp("2026-05-01T10:07:30Z")
+
+        closed = main_fetch_actual_for_forecast._latest_closed_timestamp(now, "MINUTE_5")
+
+        self.assertEqual(pd.Timestamp("2026-05-01T10:00:00Z"), closed)
+
 
 if __name__ == "__main__":
     unittest.main()

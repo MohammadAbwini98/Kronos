@@ -94,10 +94,28 @@ def _confirms_candidate(candidate_signal: str, trend: str) -> bool:
     signal = str(candidate_signal).upper()
     trend_value = str(trend).upper()
     if signal == "LONG":
-        return trend_value != "BEARISH"
+        return trend_value == "BULLISH"
     if signal == "SHORT":
-        return trend_value != "BULLISH"
+        return trend_value == "BEARISH"
     return trend_value == "NEUTRAL"
+
+
+def _alignment_state(candidate_signal: str, trend: str) -> str:
+    signal = str(candidate_signal).upper()
+    trend_value = str(trend).upper()
+    if signal == "LONG":
+        if trend_value == "BULLISH":
+            return "CONFIRMS"
+        if trend_value == "BEARISH":
+            return "CONFLICTS"
+    if signal == "SHORT":
+        if trend_value == "BEARISH":
+            return "CONFIRMS"
+        if trend_value == "BULLISH":
+            return "CONFLICTS"
+    if trend_value == "NEUTRAL":
+        return "NEUTRAL"
+    return "UNALIGNED"
 
 
 def _score_components(
@@ -181,6 +199,7 @@ def validate_single_timeframe(
         "timestamp_utc": None,
         "trend": "NEUTRAL",
         "confirms_candidate": False,
+        "alignment_state": "UNKNOWN",
         "trend_score": 0.0,
         "momentum_score": 0.0,
         "volume_score": 0.0,
@@ -202,6 +221,7 @@ def validate_single_timeframe(
     if len(frame.index) < 60:
         result["reason_details"].append("Insufficient candle warmup for stable indicators.")
         result["confirms_candidate"] = _confirms_candidate(candidate_signal, "NEUTRAL")
+        result["alignment_state"] = _alignment_state(candidate_signal, "NEUTRAL")
         return result
 
     close = frame["close"]
@@ -269,6 +289,7 @@ def validate_single_timeframe(
     result.update(scores)
     result["trend"] = trend
     result["confirms_candidate"] = _confirms_candidate(candidate_signal, trend)
+    result["alignment_state"] = _alignment_state(candidate_signal, trend)
     result["timestamp_utc"] = str(frame["timestamps"].iloc[-1].isoformat())
     result["indicator_snapshot"] = {
         "close": float(last_close),
@@ -291,7 +312,7 @@ def validate_single_timeframe(
 
     if trend == "NEUTRAL":
         result["reason_details"].append("Mixed trend signals or weak trend strength across EMA/MACD/RSI.")
-    if not result["confirms_candidate"]:
+    if result["alignment_state"] == "CONFLICTS":
         result["reason_details"].append("Timeframe trend opposes the candidate signal.")
 
     return result

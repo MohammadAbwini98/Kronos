@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import contextlib
 import sys
 import unittest
 from unittest.mock import patch
@@ -99,17 +100,16 @@ class WorkerStaleDerivationTests(unittest.TestCase):
             heartbeats,
         ]
 
-        with (
-            patch("dashboard_db.healthcheck", return_value={"ok": True}),
-            patch(
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("dashboard_db.healthcheck", return_value={"ok": True}))
+            _stack.enter_context(patch(
                 "dashboard_db.connect",
                 side_effect=[
                     _FakeConnection(query_results),
                     _FakeConnection([[]]),
                 ],
-            ),
-            patch("dashboard_db.prediction_summary", return_value={"recent_runs": []}),
-        ):
+            ))
+            _stack.enter_context(patch("dashboard_db.prediction_summary", return_value={"recent_runs": []}))
             snapshot = dashboard_db.postgres_dashboard_snapshot(symbol="ETHUSD", resolution="MINUTE")
 
         workers = snapshot["worker_statuses"]
@@ -175,17 +175,16 @@ class WorkerStaleDerivationTests(unittest.TestCase):
             [],  # heartbeats
         ]
 
-        with (
-            patch("dashboard_db.healthcheck", return_value={"ok": True}),
-            patch(
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("dashboard_db.healthcheck", return_value={"ok": True}))
+            _stack.enter_context(patch(
                 "dashboard_db.connect",
                 side_effect=[
                     _FakeConnection(query_results),
                     _FakeConnection([[]]),
                 ],
-            ),
-            patch("dashboard_db.prediction_summary", return_value={"recent_runs": []}),
-        ):
+            ))
+            _stack.enter_context(patch("dashboard_db.prediction_summary", return_value={"recent_runs": []}))
             snapshot = dashboard_db.postgres_dashboard_snapshot(symbol="ETHUSD", resolution="MINUTE_5")
 
         self.assertEqual("websocket_quote", snapshot["live_quote"]["source"])

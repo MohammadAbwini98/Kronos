@@ -15,6 +15,7 @@ from logging_utils import log_event, new_correlation_id
 from prediction_store import save_prediction_run
 from time_utils import display_timezone_name, format_local_timestamp
 from signal_config import load_signal_config
+from trade_execution import enqueue_signal_for_execution
 
 
 LOGGER = logging.getLogger(__name__)
@@ -54,6 +55,32 @@ RESOLUTION_TO_MINUTES = {
 }
 
 
+def _env_float(names: tuple[str, ...], default: float) -> float:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        try:
+            return float(str(raw).strip())
+        except ValueError:
+            continue
+    return default
+
+
+def _env_int(names: tuple[str, ...], default: int, *, minimum: int = 1) -> int:
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        try:
+            parsed = int(str(raw).strip())
+        except ValueError:
+            continue
+        if parsed >= minimum:
+            return parsed
+    return default
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run local Kronos forecast on a Kronos-ready CSV.")
     parser.add_argument("--input", required=True, help="Kronos-ready CSV with timestamps, OHLC, volume, amount.")
@@ -71,9 +98,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="output", help="Directory for timestamped forecast artifacts.")
     parser.add_argument("--metadata-output", default=None, help="Metadata JSON output path. Defaults to timestamped output file.")
     parser.add_argument("--input-copy-output", default=None, help="Input copy path. Defaults to timestamped output file.")
-    parser.add_argument("--temperature", type=float, default=1.0, help="Kronos sampling temperature.")
-    parser.add_argument("--top-p", type=float, default=0.9, help="Kronos nucleus sampling probability.")
-    parser.add_argument("--sample-count", type=int, default=1, help="Number of sampled forecast paths to average.")
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=_env_float(("KRONOS_INFERENCE_TEMPERATURE", "SIGNAL_INFERENCE_TEMPERATURE"), 0.65),
+        help="Kronos sampling temperature.",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=_env_float(("KRONOS_INFERENCE_TOP_P", "SIGNAL_INFERENCE_TOP_P"), 0.75),
+        help="Kronos nucleus sampling probability.",
+    )
+    parser.add_argument(
+        "--sample-count",
+        type=int,
+        default=_env_int(("KRONOS_INFERENCE_SAMPLE_COUNT", "SIGNAL_INFERENCE_SAMPLE_COUNT"), 3, minimum=1),
+        help="Number of sampled forecast paths to average.",
+    )
     parser.add_argument(
         "--feature-set",
         default="auto",
@@ -484,7 +526,7 @@ def run_prediction(
     flat_threshold_pct: float,
     movement_cost_threshold_pct: float,
     signal_min_confidence: float,
-    prediction_db: Path | None = None,
+    prediction_db: str | Path | None = None,
     save_prediction_db: bool = True,
     prediction_request_id: str | None = None,
     signal_validation_enabled_override: str | None = None,
@@ -796,6 +838,47 @@ def run_prediction(
                     f"total_score={validation_summary.get('total_score')},"
                     f"blocked={validation_summary.get('blocked')}"
                 )
+                auto_execute_enabled = str(os.getenv("AUTO_EXECUTE_SIGNALS", "")).strip().lower() in {"1", "true", "yes", "on"}
+                if not auto_execute_enabled:
+                    log_event(
+                        LOGGER,
+                        logging.INFO,
+                        "kronos.trade_execution.enqueue.skipped",
+                        prediction_request_id=request_id,
+                        run_id=str(db_summary["run_id"]),
+                        reason="AUTO_EXECUTE_SIGNALS is not enabled.",
+                    )
+                    print("TRADE_EXECUTION_QUEUE:{\"accepted\": false, \"status\": \"DISABLED\"}")
+                else:
+                    try:
+                        execution_queue_result = enqueue_signal_for_execution(
+                            str(db_summary["run_id"]),
+                            dsn=str(prediction_db) if prediction_db is not None else None,
+                            requested_by="auto",
+                            require_auto_enabled=True,
+                        )
+                        log_event(
+                            LOGGER,
+                            logging.INFO,
+                            "kronos.trade_execution.enqueue.completed",
+                            prediction_request_id=request_id,
+                            run_id=str(db_summary["run_id"]),
+                            accepted=execution_queue_result.get("accepted"),
+                            status=execution_queue_result.get("status"),
+                            failure_reason=execution_queue_result.get("failure_reason"),
+                        )
+                        print(f"TRADE_EXECUTION_QUEUE:{json.dumps(execution_queue_result, default=str)}")
+                    except Exception as exc:  # noqa: BLE001
+                        log_event(
+                            LOGGER,
+                            logging.ERROR,
+                            "kronos.trade_execution.enqueue.error",
+                            prediction_request_id=request_id,
+                            run_id=str(db_summary["run_id"]),
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                        )
+                        print(f"TRADE_EXECUTION_QUEUE_ERROR:{exc}")
 
         print("Validation report:")
         print(json.dumps(report, indent=2))
@@ -890,6 +973,7 @@ def main() -> None:
         else output_dir / f"kronos_forecast_validation_{safe_epic}_{args.resolution}_{run_timestamp}.json"
     )
 
+    prediction_dsn = args.postgres_dsn or args.prediction_db
     pred_df = run_prediction(
         input_csv=Path(args.input),
         output_csv=output_csv,
@@ -919,7 +1003,7 @@ def main() -> None:
         flat_threshold_pct=args.flat_threshold_pct,
         movement_cost_threshold_pct=args.movement_cost_threshold_pct,
         signal_min_confidence=args.signal_min_confidence,
-        prediction_db=Path(args.postgres_dsn or args.prediction_db) if (args.postgres_dsn or args.prediction_db) else None,
+        prediction_db=prediction_dsn,
         save_prediction_db=not args.no_save_prediction_db,
         prediction_request_id=prediction_request_id,
         signal_validation_enabled_override=args.signal_validation_enabled,

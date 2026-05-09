@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 import webbrowser
+from decimal import Decimal, InvalidOperation
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -25,6 +26,14 @@ from logging_utils import log_event, new_correlation_id, output_tail, safe_comma
 from model_registry import evaluate_promotion, list_model_versions, model_performance
 from prediction_store import prediction_summary
 from prediction_log_report import generate_prediction_log_report
+from time_utils import display_timezone_name
+from trade_execution import (
+    CapitalTradingClient,
+    TradeExecutionQueueService,
+    TradeExecutionRepository,
+    TradeExecutionService,
+    enqueue_signal_for_execution,
+)
 from walk_forward import create_walk_forward_experiment, get_walk_forward_experiment, run_walk_forward_experiment
 
 
@@ -32,6 +41,12 @@ ROOT = Path(__file__).resolve().parents[1]
 OUTPUT_DIR = ROOT / "output"
 SUPPORTED_RESOLUTIONS = {"MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4", "DAY", "WEEK"}
 LOGGER = logging.getLogger(__name__)
+_TRANSACTION_HISTORY_CACHE = {"expires_at": 0.0, "transactions": [], "error": None}
+_TRANSACTION_HISTORY_CACHE_LOCK = threading.Lock()
+_TRADE_ACTIVITY_CACHE = {"expires_at": 0.0, "activities": [], "error": None}
+_TRADE_ACTIVITY_CACHE_LOCK = threading.Lock()
+_TRADE_ENRICHMENT_SERVICE: TradeExecutionService | None = None
+_TRADE_ENRICHMENT_SERVICE_LOCK = threading.Lock()
 
 
 def _latest_file(pattern: str) -> Path | None:
@@ -60,7 +75,7 @@ def _safe_csv(path: str | Path | None, limit: int | None = None) -> list[dict]:
         return []
     df = pd.read_csv(source)
     if "timestamps" in df.columns:
-        df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True).dt.tz_convert("Asia/Amman").astype(str)
+        df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True).dt.tz_convert(display_timezone_name()).astype(str)
     if limit is not None:
         df = df.tail(limit)
     return df.to_dict(orient="records")
@@ -147,6 +162,9 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) 
     setattr(handler, "_response_status", status)
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
     handler.send_header("Content-Length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
@@ -282,6 +300,133 @@ def _prediction_db_summary() -> dict:
         return {"error": str(exc)}
 
 
+def _trade_enrichment_service() -> TradeExecutionService:
+    global _TRADE_ENRICHMENT_SERVICE
+    with _TRADE_ENRICHMENT_SERVICE_LOCK:
+        if _TRADE_ENRICHMENT_SERVICE is None:
+            _TRADE_ENRICHMENT_SERVICE = TradeExecutionService()
+        return _TRADE_ENRICHMENT_SERVICE
+
+
+def _cached_trade_transactions(service: TradeExecutionService, ttl_seconds: int = 30) -> tuple[list[dict], str | None]:
+    now = time.monotonic()
+    with _TRANSACTION_HISTORY_CACHE_LOCK:
+        if float(_TRANSACTION_HISTORY_CACHE.get("expires_at") or 0) > now:
+            return list(_TRANSACTION_HISTORY_CACHE.get("transactions") or []), _TRANSACTION_HISTORY_CACHE.get("error")
+
+    try:
+        transactions = service.client.get_transaction_history(last_period_seconds=86400, transaction_type="TRADE")
+        error = None
+    except Exception as exc:  # noqa: BLE001
+        with _TRANSACTION_HISTORY_CACHE_LOCK:
+            transactions = list(_TRANSACTION_HISTORY_CACHE.get("transactions") or [])
+        if transactions:
+            return transactions, None
+        transactions = []
+        error = str(exc)
+
+    with _TRANSACTION_HISTORY_CACHE_LOCK:
+        _TRANSACTION_HISTORY_CACHE.update(
+            {
+                "expires_at": time.monotonic() + (ttl_seconds if not error else 60),
+                "transactions": transactions,
+                "error": error,
+            }
+        )
+    return list(transactions), error
+
+
+def _cached_trade_activities(service: TradeExecutionService, ttl_seconds: int = 30) -> tuple[list[dict], str | None]:
+    now = time.monotonic()
+    with _TRADE_ACTIVITY_CACHE_LOCK:
+        if float(_TRADE_ACTIVITY_CACHE.get("expires_at") or 0) > now:
+            return list(_TRADE_ACTIVITY_CACHE.get("activities") or []), _TRADE_ACTIVITY_CACHE.get("error")
+
+    try:
+        activities = service.client.get_activity_history(last_period_seconds=86400)
+        error = None
+    except Exception as exc:  # noqa: BLE001
+        with _TRADE_ACTIVITY_CACHE_LOCK:
+            activities = list(_TRADE_ACTIVITY_CACHE.get("activities") or [])
+        if activities:
+            return activities, None
+        activities = []
+        error = str(exc)
+
+    with _TRADE_ACTIVITY_CACHE_LOCK:
+        _TRADE_ACTIVITY_CACHE.update(
+            {
+                "expires_at": time.monotonic() + (ttl_seconds if not error else 60),
+                "activities": activities,
+                "error": error,
+            }
+        )
+    return list(activities), error
+
+
+def _trade_execution_status() -> dict:
+    try:
+        queue = TradeExecutionQueueService()
+        trades = queue.repository.executed_trades(limit=100)
+        transaction_lookup_error = None
+        outcome_lookup_error = None
+        if any(str(row.get("deal_id") or "").strip() for row in trades):
+            transaction_service = _trade_enrichment_service()
+            transactions, transaction_lookup_error = _cached_trade_transactions(transaction_service)
+            trades = transaction_service.enrich_transaction_references(trades, transactions=transactions)
+            activities, outcome_lookup_error = _cached_trade_activities(transaction_service)
+            trades = transaction_service.enrich_trade_outcomes(trades, activities=activities)
+            if transaction_lookup_error:
+                for row in trades:
+                    if str(row.get("deal_id") or "").strip():
+                        row["transaction_lookup_error"] = transaction_lookup_error
+            if outcome_lookup_error:
+                for row in trades:
+                    if str(row.get("deal_id") or "").strip():
+                        row["trade_outcome_lookup_error"] = outcome_lookup_error
+        active_statuses = {"OPEN", "CLOSE_REQUESTED"}
+        pending_statuses = {"PENDING", "SUBMITTED"}
+        return {
+            "ok": True,
+            "queue": queue.snapshot(),
+            "trades": trades,
+            "transaction_lookup_error": transaction_lookup_error,
+            "trade_outcome_lookup_error": outcome_lookup_error,
+            "active_trades": [row for row in trades if str(row.get("status") or "").upper() in active_statuses],
+            "pending_trades": [row for row in trades if str(row.get("status") or "").upper() in pending_statuses],
+            "historical_trades": [
+                row
+                for row in trades
+                if str(row.get("status") or "").upper() not in active_statuses | pending_statuses
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
+def _broker_account_snapshot() -> dict:
+    try:
+        client = CapitalTradingClient()
+        account = client.get_account_snapshot()
+        positions = client.get_open_positions()
+        return {
+            "ok": True,
+            "account": {
+                "account_id": account.account_id,
+                "account_name": account.account_name,
+                "currency": account.currency,
+                "balance": account.balance,
+                "available": account.available,
+                "profit_loss": account.profit_loss,
+                "equity": account.equity,
+                "is_demo": account.is_demo,
+            },
+            "open_positions": positions,
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)}
+
+
 def _postgres_snapshot(symbol: str = "ETHUSD", resolution: str = "MINUTE_5") -> dict:
     try:
         return postgres_dashboard_snapshot(symbol=symbol, resolution=resolution)
@@ -326,6 +471,7 @@ def _auto_finetune_status() -> dict:
     payload = _safe_json(OUTPUT_DIR / "auto_finetune_status.json")
     if not payload:
         return {}
+    enabled = str(os.getenv("ENABLE_AUTO_FINETUNE", "true")).strip().lower() in {"1", "true", "yes", "on"}
     rows = int(payload.get("dataset_rows") or 0)
     required = int(payload.get("required_dataset_rows") or payload.get("min_rows") or 0)
     progress = payload.get("promotion_progress_pct")
@@ -333,13 +479,14 @@ def _auto_finetune_status() -> dict:
         progress = 100.0 if required <= 0 else min(100.0, (rows / required) * 100.0)
     promotion_status = str(payload.get("promotion_status") or "").strip().lower()
     active_ready = bool(payload.get("active_model_ready"))
-    auto_model_running = active_ready and promotion_status in {"approved", "promoted"}
+    auto_model_running = enabled and active_ready and promotion_status in {"approved", "promoted"}
     model_path = payload.get("active_model_path")
     model_version = Path(str(model_path)).name if model_path else None
     enriched = dict(payload)
     enriched.update(
         {
             "dataset_rows": rows,
+            "enabled": enabled,
             "required_dataset_rows": required,
             "promotion_progress_pct": round(float(progress), 2),
             "current_model_label": "Kronos-auto-finetuned" if auto_model_running else "Kronos-base",
@@ -388,7 +535,14 @@ def _human_summary(metadata: dict, validation_body: dict, postgres_snapshot: dic
 
 def _status_warnings(postgres_snapshot: dict) -> list[str]:
     warnings: list[str] = []
-    required_workers = {"prediction_scheduler", "validation_worker", "websocket_stream", "auto_finetune_worker"}
+    required_workers = {"prediction_scheduler", "validation_worker", "websocket_stream"}
+    if str(os.getenv("ENABLE_AUTO_FINETUNE", "true")).strip().lower() in {"1", "true", "yes", "on"}:
+        required_workers.add("auto_finetune_worker")
+    trade_worker_enabled = str(
+        os.getenv("ENABLE_TRADE_EXECUTION_WORKER", os.getenv("AUTO_EXECUTE_SIGNALS", "false"))
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if trade_worker_enabled:
+        required_workers.add("trade_execution_worker")
     live_quote = postgres_snapshot.get("live_quote") or {}
     if live_quote.get("source") == "latest_fetch":
         warnings.append("Live price fallback active: source is latest_fetch (websocket stream unavailable or stale).")
@@ -427,12 +581,52 @@ def _status_warnings(postgres_snapshot: dict) -> list[str]:
     reason_codes = signal_validation.get("reason_codes") or []
     if "MISSING_HIGHER_TIMEFRAME_CONTEXT" in reason_codes:
         warnings.append("Higher-timeframe context is missing for signal validation.")
+    if "HIGHER_TIMEFRAME_CONFLICT" in reason_codes:
+        warnings.append("Signal blocked because required higher-timeframe confirmation conflicts with the candidate direction.")
     if "WIDE_SPREAD_OR_COST_UNKNOWN" in reason_codes:
         warnings.append("Signal blocked due to wide spread or unknown trading cost context.")
     if "EXTREME_VOLATILITY" in reason_codes:
         warnings.append("Signal blocked due to extreme volatility regime.")
     if "VERY_LOW_VOLUME" in reason_codes:
         warnings.append("Signal blocked due to very low volume context.")
+
+    validation_summary = postgres_snapshot.get("signal_validation_summary") or {}
+    total_runs = int(validation_summary.get("total_runs") or 0)
+
+    def _ratio(name: str) -> float:
+        try:
+            return float(validation_summary.get(name) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    if total_runs >= 20:
+        blocked_ratio = _ratio("blocked_ratio_pct")
+        actionable_ratio = _ratio("actionable_ratio_pct")
+        invalid_ratio = _ratio("invalid_5m_input_ratio_pct")
+        edge_ratio = _ratio("edge_below_cost_ratio_pct")
+        low_volume_ratio = _ratio("very_low_volume_ratio_pct")
+        window_hours = int(validation_summary.get("window_hours") or 24)
+
+        if blocked_ratio >= 70.0:
+            warnings.append(
+                f"Validation blocker alert: {blocked_ratio:.1f}% of runs were blocked in the last {window_hours}h ({total_runs} runs)."
+            )
+        if actionable_ratio <= 15.0:
+            warnings.append(
+                f"Validation throughput alert: only {actionable_ratio:.1f}% actionable runs in the last {window_hours}h."
+            )
+        if invalid_ratio >= 35.0:
+            warnings.append(
+                f"Input integrity alert: INVALID_5M_INPUT accounts for {invalid_ratio:.1f}% of validation runs in the last {window_hours}h."
+            )
+        if edge_ratio >= 20.0:
+            warnings.append(
+                f"Edge filter alert: FORECAST_EDGE_BELOW_COST accounts for {edge_ratio:.1f}% of validation runs in the last {window_hours}h."
+            )
+        if low_volume_ratio >= 20.0:
+            warnings.append(
+                f"Liquidity alert: VERY_LOW_VOLUME accounts for {low_volume_ratio:.1f}% of validation runs in the last {window_hours}h."
+            )
     return warnings
 
 
@@ -485,6 +679,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._response_status = 200
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
                 self.wfile.write(body)
@@ -516,7 +713,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     validation_body = {}
                 validation_body = _merge_validation(validation_body, validation_from_db)
                 postgres_candles = postgres_snapshot.get("candles") or []
-                market_tail = postgres_candles[-100:]
+                market_tail = [
+                    {("timestamps" if k == "timestamp_utc" else k): v for k, v in row.items()}
+                    for row in postgres_candles[-100:]
+                ]
                 validation_source = "quality_report" if quality_path else ("prediction_outcomes" if validation_from_db else "none")
                 _json_response(
                     self,
@@ -542,6 +742,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "supervisor_lease": postgres_snapshot.get("supervisor_lease"),
                         "horizon_metrics": postgres_snapshot.get("horizon_metrics"),
                         "auto_finetune": auto_finetune,
+                        "trade_execution": _trade_execution_status(),
                         "human_summary": _human_summary(metadata, validation_body, postgres_snapshot),
                         "baseline_summary": baseline_summary,
                         "validation_source": validation_source,
@@ -614,6 +815,37 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     _json_response(self, 200, list_model_versions())
                 except Exception as exc:  # noqa: BLE001
                     _error_response(self, 503, "DATABASE_ERROR", "Unable to load model versions", {"reason": str(exc)})
+                return
+            if parsed.path == "/api/trade-execution/status":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _trade_execution_status())
+                return
+            if parsed.path == "/api/trades":
+                if not _require_auth(self):
+                    return
+                try:
+                    limit = int(query.get("limit", ["50"])[0] or 50)
+                except ValueError:
+                    limit = 50
+                try:
+                    _json_response(self, 200, {"rows": TradeExecutionRepository().executed_trades(limit=max(1, min(limit, 200)))})
+                except Exception as exc:  # noqa: BLE001
+                    _error_response(self, 503, "DATABASE_ERROR", "Unable to load executed trades", {"reason": str(exc)})
+                return
+            if parsed.path == "/api/broker/account":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _broker_account_snapshot())
+                return
+            if parsed.path == "/api/broker/positions":
+                if not _require_auth(self):
+                    return
+                try:
+                    client = CapitalTradingClient()
+                    _json_response(self, 200, {"ok": True, "open_positions": client.get_open_positions()})
+                except Exception as exc:  # noqa: BLE001
+                    _json_response(self, 200, {"ok": False, "error": str(exc), "open_positions": []})
                 return
             if parsed.path.startswith("/api/walk-forward-experiments/"):
                 if not _require_auth(self):
@@ -693,6 +925,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path.startswith("/api/model-versions/") and parsed.path.endswith("/evaluate-promotion"):
                 model_version_id = parsed.path.split("/")[-2]
                 self._evaluate_promotion(model_version_id, payload)
+                return
+            if parsed.path == "/api/trade-execution/execute-signal":
+                self._execute_signal(payload)
+                return
+            if parsed.path == "/api/trade-execution/drain":
+                self._drain_trade_execution_queue()
+                return
+            if parsed.path == "/api/trade-execution/force-close":
+                self._force_close_trade(payload)
+                return
+            if parsed.path == "/api/trade-execution/transaction-history":
+                self._fetch_trade_transaction(payload)
                 return
             self._response_status = 404
             self.send_error(404)
@@ -1105,6 +1349,70 @@ class DashboardHandler(BaseHTTPRequestHandler):
             _error_response(self, 404, "NOT_FOUND", str(exc), {"model_version_id": model_version_id})
         except Exception as exc:  # noqa: BLE001
             _error_response(self, 503, "DATABASE_ERROR", "Promotion evaluation failed", {"reason": str(exc)})
+
+    def _execute_signal(self, payload: dict) -> None:
+        signal_id = str(payload.get("signal_id") or payload.get("run_id") or "").strip()
+        if not signal_id:
+            _error_response(self, 400, "VALIDATION_ERROR", "signal_id or run_id is required")
+            return
+        requested_size = None
+        if payload.get("requested_size") not in (None, ""):
+            try:
+                requested_size = Decimal(str(payload.get("requested_size")))
+            except (InvalidOperation, ValueError):
+                _error_response(self, 400, "VALIDATION_ERROR", "requested_size must be numeric")
+                return
+        try:
+            result = enqueue_signal_for_execution(
+                signal_id,
+                requested_by="manual",
+                require_auto_enabled=False,
+                requested_size=requested_size,
+                force_market_execution=bool(payload.get("force_market_execution")),
+            )
+            _json_response(self, 202 if result.get("accepted") else 200, result)
+        except Exception as exc:  # noqa: BLE001
+            _error_response(self, 503, "TRADE_EXECUTION_ERROR", "Unable to queue signal execution", {"reason": str(exc)})
+
+    def _drain_trade_execution_queue(self) -> None:
+        try:
+            queue = TradeExecutionQueueService()
+            drained = queue.drain_once()
+            _json_response(self, 200, {"ok": True, "drained": drained, "queue": queue.snapshot()})
+        except Exception as exc:  # noqa: BLE001
+            _error_response(self, 503, "TRADE_EXECUTION_ERROR", "Unable to drain trade execution queue", {"reason": str(exc)})
+
+    def _force_close_trade(self, payload: dict) -> None:
+        try:
+            executed_trade_id = int(payload.get("executed_trade_id") or payload.get("trade_id"))
+        except (TypeError, ValueError):
+            _error_response(self, 400, "VALIDATION_ERROR", "executed_trade_id is required")
+            return
+        try:
+            service = TradeExecutionService()
+            result = service.force_close(executed_trade_id)
+            _json_response(self, 200 if result.get("success") else 409, result)
+        except Exception as exc:  # noqa: BLE001
+            _error_response(self, 503, "TRADE_EXECUTION_ERROR", "Unable to force close demo trade", {"reason": str(exc)})
+
+    def _fetch_trade_transaction(self, payload: dict) -> None:
+        executed_trade_id = None
+        if payload.get("executed_trade_id") not in (None, ""):
+            try:
+                executed_trade_id = int(payload.get("executed_trade_id"))
+            except (TypeError, ValueError):
+                _error_response(self, 400, "VALIDATION_ERROR", "executed_trade_id must be an integer")
+                return
+        deal_id = str(payload.get("deal_id") or "").strip() or None
+        if executed_trade_id is None and not deal_id:
+            _error_response(self, 400, "VALIDATION_ERROR", "executed_trade_id or deal_id is required")
+            return
+        try:
+            service = TradeExecutionService()
+            result = service.fetch_transaction_reference(executed_trade_id=executed_trade_id, deal_id=deal_id)
+            _json_response(self, 200 if result.get("success") else 404, result)
+        except Exception as exc:  # noqa: BLE001
+            _error_response(self, 503, "TRADE_EXECUTION_ERROR", "Unable to fetch Capital.com transaction history", {"reason": str(exc)})
 
     def log_message(self, format: str, *args) -> None:
         return

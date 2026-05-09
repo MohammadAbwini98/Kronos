@@ -37,6 +37,7 @@ class SignalConfig:
 
     signal_block_on_extreme_volatility: bool = True
     signal_block_on_wide_spread: bool = True
+    signal_block_on_low_volume: bool = False
     signal_max_spread_pct: float = 0.08
     signal_min_net_edge_pct: float = 0.05
 
@@ -47,6 +48,7 @@ class SignalConfig:
 
     signal_atr_extreme_percentile: float = 95.0
     signal_low_volume_zscore: float = -1.0
+    signal_low_volume_penalty_points: float = 3.0
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -63,6 +65,7 @@ class SignalConfig:
             "SIGNAL_REQUIRE_HOUR_CONFIRMATION": self.signal_require_hour_confirmation,
             "SIGNAL_BLOCK_ON_EXTREME_VOLATILITY": self.signal_block_on_extreme_volatility,
             "SIGNAL_BLOCK_ON_WIDE_SPREAD": self.signal_block_on_wide_spread,
+            "SIGNAL_BLOCK_ON_LOW_VOLUME": self.signal_block_on_low_volume,
             "SIGNAL_MAX_SPREAD_PCT": self.signal_max_spread_pct,
             "SIGNAL_MIN_NET_EDGE_PCT": self.signal_min_net_edge_pct,
             "SIGNAL_SCORE_STRONG_THRESHOLD": self.signal_score_strong_threshold,
@@ -71,6 +74,7 @@ class SignalConfig:
             "SIGNAL_SCORE_WATCH_THRESHOLD": self.signal_score_watch_threshold,
             "SIGNAL_ATR_EXTREME_PERCENTILE": self.signal_atr_extreme_percentile,
             "SIGNAL_LOW_VOLUME_ZSCORE": self.signal_low_volume_zscore,
+            "SIGNAL_LOW_VOLUME_PENALTY_POINTS": self.signal_low_volume_penalty_points,
         }
         return payload
 
@@ -194,6 +198,7 @@ def load_signal_config(
         signal_require_hour_confirmation=_parse_bool(source.get("SIGNAL_REQUIRE_HOUR_CONFIRMATION"), False),
         signal_block_on_extreme_volatility=_parse_bool(source.get("SIGNAL_BLOCK_ON_EXTREME_VOLATILITY"), True),
         signal_block_on_wide_spread=_parse_bool(source.get("SIGNAL_BLOCK_ON_WIDE_SPREAD"), True),
+        signal_block_on_low_volume=_parse_bool(source.get("SIGNAL_BLOCK_ON_LOW_VOLUME"), False),
         signal_max_spread_pct=_parse_float(
             source.get("SIGNAL_MAX_SPREAD_PCT"),
             0.08,
@@ -242,6 +247,12 @@ def load_signal_config(
             minimum=-10.0,
             maximum=10.0,
         ),
+        signal_low_volume_penalty_points=_parse_float(
+            source.get("SIGNAL_LOW_VOLUME_PENALTY_POINTS"),
+            3.0,
+            minimum=0.0,
+            maximum=20.0,
+        ),
     )
 
     # Keep threshold ordering valid even when env input is inconsistent.
@@ -269,6 +280,8 @@ def add_signal_cli_overrides(parser: argparse.ArgumentParser) -> argparse.Argume
     parser.add_argument("--signal-min-confidence", type=float, default=None)
     parser.add_argument("--signal-min-net-edge-pct", type=float, default=None)
     parser.add_argument("--signal-max-spread-pct", type=float, default=None)
+    parser.add_argument("--signal-block-on-low-volume", default=None, help="Override SIGNAL_BLOCK_ON_LOW_VOLUME with true/false.")
+    parser.add_argument("--signal-low-volume-penalty-points", type=float, default=None)
     parser.add_argument("--signal-require-hour-confirmation", default=None, help="Override SIGNAL_REQUIRE_HOUR_CONFIRMATION with true/false.")
     return parser
 
@@ -284,6 +297,8 @@ def signal_overrides_from_args(args: argparse.Namespace | None) -> dict[str, Any
         "SIGNAL_MIN_CONFIDENCE": getattr(args, "signal_min_confidence", None),
         "SIGNAL_MIN_NET_EDGE_PCT": getattr(args, "signal_min_net_edge_pct", None),
         "SIGNAL_MAX_SPREAD_PCT": getattr(args, "signal_max_spread_pct", None),
+        "SIGNAL_BLOCK_ON_LOW_VOLUME": getattr(args, "signal_block_on_low_volume", None),
+        "SIGNAL_LOW_VOLUME_PENALTY_POINTS": getattr(args, "signal_low_volume_penalty_points", None),
         "SIGNAL_REQUIRE_HOUR_CONFIRMATION": getattr(args, "signal_require_hour_confirmation", None),
     }
     return {key: value for key, value in raw.items() if value is not None}

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import io
+import contextlib
 import json
 import logging
 from argparse import Namespace
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -21,7 +23,7 @@ import logging_utils
 import main_prediction_scheduler
 import main_validation_worker
 import subprocess_utils
-from config import configure_logging
+from config import _DailyLogFileHandler, configure_logging
 
 
 def _json_messages(stream: io.StringIO) -> list[dict]:
@@ -73,6 +75,54 @@ class ConfigureLoggingDedupeTests(unittest.TestCase):
 
         self.assertEqual(1, first_count)
         self.assertEqual(1, second_count)
+
+    def test_daily_file_handler_rotates_when_size_limit_reached(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            handler = _DailyLogFileHandler(log_dir, max_bytes=60, backup_count=2)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            try:
+                record = logging.LogRecord("unit", logging.INFO, __file__, 1, "x" * 80, (), None)
+                handler.emit(record)
+                handler.emit(record)
+            finally:
+                handler.close()
+
+            current = next(log_dir.glob("log_*.log"))
+            rotated = log_dir / f"{current.name}.1"
+            self.assertTrue(rotated.exists())
+            self.assertGreater(rotated.stat().st_size, 0)
+
+    def test_configure_logging_uses_service_specific_file(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.dict(
+                "os.environ",
+                {
+                    "CAPITAL_LOG_DIR": temp_dir,
+                    "LOG_TO_CONSOLE": "0",
+                    "LOG_TO_FILE": "1",
+                },
+                clear=False,
+            ):
+                configure_logging(service_name="db_migrate")
+                logging.getLogger("unit.service_file").info("hello")
+                self.tearDown()
+
+            files = list(Path(temp_dir).glob("log_*_db_migrate.log"))
+            self.assertEqual(1, len(files))
+
+    def test_daily_file_handler_does_not_raise_when_rotation_file_is_locked(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            handler = _DailyLogFileHandler(log_dir, max_bytes=10, backup_count=2)
+            handler.setFormatter(logging.Formatter("%(message)s"))
+            try:
+                record = logging.LogRecord("unit", logging.INFO, __file__, 1, "x" * 20, (), None)
+                handler.emit(record)
+                with patch("config.os.replace", side_effect=PermissionError("locked")):
+                    handler.emit(record)
+            finally:
+                handler.close()
 
 
 class TimedStepTests(unittest.TestCase):
@@ -142,10 +192,9 @@ class DashboardRunLoggingTests(unittest.TestCase):
     def test_dashboard_run_logs_request_id(self):
         cmd = ["python", "-V"]
         fake_result = subprocess.CompletedProcess(cmd, 0, "ok", "")
-        with (
-            patch.object(dashboard_server.subprocess, "run", return_value=fake_result),
-            patch.object(dashboard_server, "log_event") as mocked_log_event,
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(dashboard_server.subprocess, "run", return_value=fake_result))
+            mocked_log_event = _stack.enter_context(patch.object(dashboard_server, "log_event"))
             dashboard_server._run(cmd, request_id="req_test", endpoint="/api/test")
 
         events = [call.args[2] for call in mocked_log_event.call_args_list]
@@ -177,12 +226,11 @@ class CycleCorrelationIdTests(unittest.TestCase):
             details={"state": "paused_websocket_gate", "gate_reason": "websocket_stale"},
             latest_candle_timestamp_utc=None,
         )
-        with (
-            patch.object(main_prediction_scheduler, "new_correlation_id", return_value="sched_test_id"),
-            patch.object(main_prediction_scheduler, "_websocket_prediction_gate", return_value=gate),
-            patch.object(main_prediction_scheduler, "_heartbeat"),
-            patch.object(main_prediction_scheduler, "log_event") as mocked_log_event,
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(main_prediction_scheduler, "new_correlation_id", return_value="sched_test_id"))
+            _stack.enter_context(patch.object(main_prediction_scheduler, "_websocket_prediction_gate", return_value=gate))
+            _stack.enter_context(patch.object(main_prediction_scheduler, "_heartbeat"))
+            mocked_log_event = _stack.enter_context(patch.object(main_prediction_scheduler, "log_event"))
             main_prediction_scheduler._run_cycle(self._scheduler_args())
 
         cycle_start = next(call for call in mocked_log_event.call_args_list if call.args[2] == "scheduler.cycle.start")
@@ -192,11 +240,10 @@ class CycleCorrelationIdTests(unittest.TestCase):
 
     def test_validation_cycle_logs_validation_cycle_id(self):
         args = Namespace(batch_size=5, postgres_dsn=None, env="demo")
-        with (
-            patch.object(main_validation_worker, "_due_runs", return_value=[]),
-            patch.object(main_validation_worker, "refresh_shadow_prediction_statuses", return_value={"checked": 0, "updated": 0, "pending": 0, "errors": 0}),
-            patch.object(main_validation_worker, "log_event") as mocked_log_event,
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(main_validation_worker, "_due_runs", return_value=[]))
+            _stack.enter_context(patch.object(main_validation_worker, "refresh_shadow_prediction_statuses", return_value={"checked": 0, "updated": 0, "pending": 0, "errors": 0}))
+            mocked_log_event = _stack.enter_context(patch.object(main_validation_worker, "log_event"))
             payload = main_validation_worker._run_validation_cycle(args, "val_test_id")
 
         cycle_start = next(call for call in mocked_log_event.call_args_list if call.args[2] == "validation.cycle.start")

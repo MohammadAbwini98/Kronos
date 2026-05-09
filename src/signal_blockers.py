@@ -12,6 +12,7 @@ BLOCK_REASONS = {
     "MISSING_5M_INPUT",
     "INVALID_5M_INPUT",
     "MISSING_HIGHER_TIMEFRAME_CONTEXT",
+    "HIGHER_TIMEFRAME_CONFLICT",
     "PROVISIONAL_HIGHER_TIMEFRAME_CONTEXT",
     "WIDE_SPREAD_OR_COST_UNKNOWN",
     "VERY_LOW_VOLUME",
@@ -38,9 +39,9 @@ def _hour_confirmation_conflict(candidate_signal: str, timeframe_results: list[d
     if not hour_row:
         return False
     trend = str(hour_row.get("trend") or "NEUTRAL").upper()
-    if candidate_signal == "LONG" and trend == "BEARISH":
+    if candidate_signal == "LONG" and trend != "BULLISH":
         return True
-    if candidate_signal == "SHORT" and trend == "BULLISH":
+    if candidate_signal == "SHORT" and trend != "BEARISH":
         return True
     return False
 
@@ -116,8 +117,8 @@ def evaluate_hard_blockers(
             reason_details.append("Higher-timeframe context is provisional and cannot be trusted for scoring.")
 
     if config.signal_require_hour_confirmation and _hour_confirmation_conflict(candidate_signal, timeframe_results):
-        reason_codes.append("MISSING_HIGHER_TIMEFRAME_CONTEXT")
-        reason_details.append("HOUR trend confirmation is required and currently opposes the candidate signal.")
+        reason_codes.append("HIGHER_TIMEFRAME_CONFLICT")
+        reason_details.append("HOUR trend confirmation is required and does not confirm the candidate signal.")
 
     spread_pct = market.get("spread_pct")
     if config.signal_block_on_wide_spread:
@@ -131,7 +132,11 @@ def evaluate_hard_blockers(
             )
 
     volume_z = market.get("volume_zscore")
-    if volume_z is not None and float(volume_z) <= float(config.signal_low_volume_zscore):
+    if (
+        config.signal_block_on_low_volume
+        and volume_z is not None
+        and float(volume_z) <= float(config.signal_low_volume_zscore)
+    ):
         reason_codes.append("VERY_LOW_VOLUME")
         reason_details.append(
             f"Volume z-score {float(volume_z):.3f} is below threshold {config.signal_low_volume_zscore:.3f}."
@@ -154,9 +159,5 @@ def evaluate_hard_blockers(
     for code in reason_codes:
         if code in BLOCK_REASONS and code not in filtered_codes:
             filtered_codes.append(code)
-
-    if candidate_signal == "HOLD" and "FORECAST_DIRECTION_FLAT" not in filtered_codes:
-        filtered_codes.insert(0, "KRONOS_FORECAST_INVALID")
-        reason_details.insert(0, "Candidate signal is HOLD before external scoring.")
 
     return _blocked(filtered_codes, reason_details)

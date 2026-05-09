@@ -12,12 +12,12 @@ from logging_utils import log_event, new_correlation_id
 from rate_limit_state import list_rate_limit_states
 from supervisor_lease import current_supervisor_lease
 from prediction_store import prediction_summary
+from time_utils import display_timezone_name
 
 
-ALLOWED_SIGNAL_STATUSES = {"PENDING", "WIN", "LOSS"}
+ALLOWED_SIGNAL_STATUSES = {"PENDING", "WIN", "LOSS", "EXPIRED", "GOOD_HOLD", "MISSED_MOVE", "AMBIGUOUS"}
 ALLOWED_RUN_STATUSES = {"PENDING", "PARTIAL", "VALIDATED", "ERROR"}
 ALLOWED_SIGNALS = {"LONG", "SHORT", "HOLD"}
-DISPLAY_TIMEZONE = "Asia/Amman"
 _DATE_ONLY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 WEBSOCKET_STALE_THRESHOLD_SECONDS = max(30, int(os.getenv("SIGNAL_WEBSOCKET_STALE_SECONDS", "90")))
 LOGGER = logging.getLogger(__name__)
@@ -153,14 +153,14 @@ def query_signals(
             params.append(normalized_resolution)
         if date_from:
             if _looks_like_date_only(date_from):
-                where.append(f"(s.timestamp_utc AT TIME ZONE '{DISPLAY_TIMEZONE}')::date >= %s::date")
+                where.append(f"(s.timestamp_utc AT TIME ZONE '{display_timezone_name()}')::date >= %s::date")
                 params.append(date_from)
             else:
                 where.append("s.timestamp_utc >= %s")
                 params.append(date_from)
         if date_to:
             if _looks_like_date_only(date_to):
-                where.append(f"(s.timestamp_utc AT TIME ZONE '{DISPLAY_TIMEZONE}')::date <= %s::date")
+                where.append(f"(s.timestamp_utc AT TIME ZONE '{display_timezone_name()}')::date <= %s::date")
                 params.append(date_to)
             else:
                 where.append("s.timestamp_utc <= %s")
@@ -245,6 +245,9 @@ def query_signals(
                     s.cost_threshold_pct,
                     s.scoring_version,
                     s.actionable,
+                    s.validation_status,
+                    s.validation_score,
+                    s.validation_summary,
                     s.quality_grade,
                     s.movement_after_cost_pct,
                     s.entry_price,
@@ -332,24 +335,50 @@ def latest_validation_metrics(*, symbol: str, resolution: str, dsn: str | None =
     with connect(dsn) as conn:
         row = conn.execute(
             """
+            WITH latest_run AS (
+                SELECT *
+                FROM prediction_runs
+                WHERE symbol = %s AND resolution = %s
+                ORDER BY generated_at_utc DESC
+                LIMIT 1
+            ),
+            outcome_rollup AS (
+                SELECT
+                    run_id,
+                    COALESCE(SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
+                    COALESCE(SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
+                    COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0)::int AS pending,
+                    AVG(ABS(close_error)) FILTER (WHERE status IN ('WIN', 'LOSS'))::double precision AS mae,
+                    SQRT(AVG(close_error * close_error) FILTER (WHERE status IN ('WIN', 'LOSS')))::double precision AS rmse,
+                    AVG(ABS(close_error_pct)) FILTER (WHERE status IN ('WIN', 'LOSS'))::double precision AS mape_pct
+                FROM prediction_outcomes
+                WHERE run_id = (SELECT run_id FROM latest_run)
+                GROUP BY run_id
+            ),
+            horizon_rollup AS (
+                SELECT
+                    fc.run_id,
+                    MAX(ABS(((fc.close / NULLIF(r.last_input_close, 0)) - 1.0) * 100.0))::double precision AS max_abs_close_move_pct
+                FROM forecast_candles fc
+                JOIN latest_run r ON r.run_id = fc.run_id
+                GROUP BY fc.run_id
+            )
             SELECT
                 r.run_id,
                 r.generated_at_utc,
                 r.forecast_start_timestamp_utc,
                 r.forecast_end_timestamp_utc,
-                COALESCE(SUM(CASE WHEN o.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
-                COALESCE(SUM(CASE WHEN o.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
-                COALESCE(SUM(CASE WHEN o.status = 'PENDING' THEN 1 ELSE 0 END), 0)::int AS pending,
-                AVG(ABS(o.close_error)) FILTER (WHERE o.status IN ('WIN', 'LOSS'))::double precision AS mae,
-                SQRT(AVG((o.close_error * o.close_error)) FILTER (WHERE o.status IN ('WIN', 'LOSS')) )::double precision AS rmse,
-                AVG(ABS(o.close_error_pct)) FILTER (WHERE o.status IN ('WIN', 'LOSS'))::double precision AS mape_pct,
-                AVG(ABS(o.forecast_close - o.actual_close)) FILTER (WHERE o.status IN ('WIN', 'LOSS'))::double precision AS max_abs_close_move_pct
-            FROM prediction_runs r
-            LEFT JOIN prediction_outcomes o ON o.run_id = r.run_id
-            WHERE r.symbol = %s AND r.resolution = %s
-            GROUP BY r.run_id, r.generated_at_utc, r.forecast_start_timestamp_utc, r.forecast_end_timestamp_utc
-            ORDER BY r.generated_at_utc DESC
-            LIMIT 1
+                COALESCE(o.wins, 0)::int AS wins,
+                COALESCE(o.losses, 0)::int AS losses,
+                COALESCE(o.pending, 0)::int AS pending,
+                o.mae,
+                o.rmse,
+                o.mape_pct,
+                COALESCE(h.max_abs_close_move_pct, ABS(s.expected_move_pct)::double precision) AS max_abs_close_move_pct
+            FROM latest_run r
+            LEFT JOIN outcome_rollup o ON o.run_id = r.run_id
+            LEFT JOIN horizon_rollup h ON h.run_id = r.run_id
+            LEFT JOIN signals s ON s.run_id = r.run_id
             """,
             (symbol, resolution),
         ).fetchone()
@@ -530,6 +559,9 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                     s.cost_threshold_pct,
                     s.scoring_version,
                     s.actionable,
+                    s.validation_status,
+                    s.validation_score,
+                    s.validation_summary,
                     s.quality_grade,
                     s.movement_after_cost_pct,
                     s.entry_price,
@@ -649,6 +681,7 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
 
             latest_signal_validation_row = None
             timeframe_validations_rows: list[dict[str, Any]] = []
+            signal_validation_summary_row = None
             validation_query_error = None
             try:
                 latest_signal_validation_row = conn.execute(
@@ -677,10 +710,11 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                         updated_at
                     FROM signal_validation_runs
                     WHERE symbol = %s
-                    ORDER BY created_at DESC
+                      AND base_resolution = %s
+                    ORDER BY updated_at DESC, created_at DESC
                     LIMIT 1
                     """,
-                    (symbol,),
+                    (symbol, resolution),
                 ).fetchone()
                 if latest_signal_validation_row and latest_signal_validation_row.get("run_id"):
                     timeframe_validations_rows = conn.execute(
@@ -702,10 +736,33 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
                             created_at
                         FROM signal_timeframe_validations
                         WHERE run_id = %s
-                        ORDER BY timeframe ASC
+                        ORDER BY CASE timeframe
+                            WHEN 'MINUTE_15' THEN 1
+                            WHEN 'MINUTE_30' THEN 2
+                            WHEN 'HOUR' THEN 3
+                            WHEN 'HOUR_4' THEN 4
+                            ELSE 99
+                        END
                         """,
                         (latest_signal_validation_row["run_id"],),
                     ).fetchall()
+                signal_validation_summary_row = conn.execute(
+                    """
+                    SELECT
+                        COUNT(*)::int AS total_runs,
+                        COALESCE(SUM(CASE WHEN blocked THEN 1 ELSE 0 END), 0)::int AS blocked_runs,
+                        COALESCE(SUM(CASE WHEN block_reason = 'INVALID_5M_INPUT' THEN 1 ELSE 0 END), 0)::int AS invalid_5m_input_runs,
+                        COALESCE(SUM(CASE WHEN block_reason = 'FORECAST_EDGE_BELOW_COST' THEN 1 ELSE 0 END), 0)::int AS edge_below_cost_runs,
+                        COALESCE(SUM(CASE WHEN block_reason = 'VERY_LOW_VOLUME' THEN 1 ELSE 0 END), 0)::int AS very_low_volume_runs,
+                        COALESCE(SUM(CASE WHEN final_signal IN ('LONG', 'SHORT', 'STRONG_LONG', 'STRONG_SHORT', 'WEAK_LONG', 'WEAK_SHORT') THEN 1 ELSE 0 END), 0)::int AS actionable_runs,
+                        AVG(total_score)::double precision AS average_score
+                    FROM signal_validation_runs
+                    WHERE symbol = %s
+                      AND base_resolution = %s
+                      AND created_at >= now() - interval '24 hours'
+                    """,
+                    (symbol, resolution),
+                ).fetchone()
             except Exception as exc:  # noqa: BLE001
                 validation_query_error = str(exc)
 
@@ -721,6 +778,7 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
             "websocket_stream": {"status": "MISSING", "details": {}, "updated_at": None},
             "auto_finetune_worker": {"status": "MISSING", "details": {}, "updated_at": None},
             "maintenance_worker": {"status": "MISSING", "details": {}, "updated_at": None},
+            "trade_execution_worker": {"status": "MISSING", "details": {}, "updated_at": None},
         }
         for row in heartbeats:
             worker_statuses[row["service_name"]] = {
@@ -760,6 +818,25 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
         else:
             latest_signal_validation = dict(latest_signal_validation_row)
         timeframe_validations = [dict(row) for row in timeframe_validations_rows]
+        if signal_validation_summary_row:
+            raw_summary = dict(signal_validation_summary_row)
+            total_runs = _to_int(raw_summary.get("total_runs"))
+            blocked_runs = _to_int(raw_summary.get("blocked_runs"))
+            actionable_runs = _to_int(raw_summary.get("actionable_runs"))
+            invalid_runs = _to_int(raw_summary.get("invalid_5m_input_runs"))
+            edge_runs = _to_int(raw_summary.get("edge_below_cost_runs"))
+            low_volume_runs = _to_int(raw_summary.get("very_low_volume_runs"))
+            signal_validation_summary = {
+                **raw_summary,
+                "window_hours": 24,
+                "blocked_ratio_pct": None if total_runs == 0 else round((blocked_runs / total_runs) * 100.0, 2),
+                "actionable_ratio_pct": None if total_runs == 0 else round((actionable_runs / total_runs) * 100.0, 2),
+                "invalid_5m_input_ratio_pct": None if total_runs == 0 else round((invalid_runs / total_runs) * 100.0, 2),
+                "edge_below_cost_ratio_pct": None if total_runs == 0 else round((edge_runs / total_runs) * 100.0, 2),
+                "very_low_volume_ratio_pct": None if total_runs == 0 else round((low_volume_runs / total_runs) * 100.0, 2),
+            }
+        else:
+            signal_validation_summary = {}
         try:
             supervisor = current_supervisor_lease(dsn=dsn)
         except Exception:  # noqa: BLE001
@@ -778,6 +855,7 @@ def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MI
             },
             "latest_validation": latest_validation,
             "signal_validation": latest_signal_validation,
+            "signal_validation_summary": signal_validation_summary,
             "timeframe_validations": timeframe_validations,
             "horizon_metrics": horizon_metric_summary(symbol=symbol, resolution=resolution, dsn=dsn),
             "outcomes": [dict(row) for row in outcomes],

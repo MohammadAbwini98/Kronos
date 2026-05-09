@@ -27,34 +27,44 @@ def _timeframe_snapshot(
     dsn: str | None,
     now_utc: pd.Timestamp,
 ) -> dict[str, Any]:
+    delta = resolution_to_timedelta(resolution)
+    cutoff = now_utc - delta
+    expected_latest_closed = now_utc.floor(delta) - delta
+
     with connect(dsn) as conn:
         row = conn.execute(
             """
             SELECT
                 COUNT(*)::int AS total_rows,
-                MAX(timestamp_utc) AS latest_timestamp_utc
+                COUNT(*) FILTER (WHERE timestamp_utc <= %s)::int AS closed_rows,
+                MAX(timestamp_utc) AS latest_timestamp_utc,
+                MAX(timestamp_utc) FILTER (WHERE timestamp_utc <= %s) AS latest_closed_timestamp_utc
             FROM ohlcv_candles
             WHERE symbol = %s
               AND resolution = %s
               AND price_side = %s
             """,
-            (symbol, resolution, price_side),
+            (cutoff, cutoff, symbol, resolution, price_side),
         ).fetchone()
 
     total_rows = int((row or {}).get("total_rows") or 0)
+    closed_rows = int((row or {}).get("closed_rows") or 0)
     latest_ts = (row or {}).get("latest_timestamp_utc")
     latest_ts = pd.to_datetime(latest_ts, utc=True, errors="coerce") if latest_ts is not None else None
+    latest_closed_ts = (row or {}).get("latest_closed_timestamp_utc")
+    latest_closed_ts = pd.to_datetime(latest_closed_ts, utc=True, errors="coerce") if latest_closed_ts is not None else None
 
-    delta = resolution_to_timedelta(resolution)
-    cutoff = now_utc - delta
-    has_closed_latest = bool(latest_ts is not None and latest_ts <= cutoff)
+    has_closed_latest = bool(latest_closed_ts is not None and latest_closed_ts >= expected_latest_closed)
     stale_seconds = None
-    if latest_ts is not None:
-        stale_seconds = max(0, int((now_utc - latest_ts).total_seconds()))
+    if latest_closed_ts is not None:
+        stale_seconds = max(0, int((now_utc - latest_closed_ts).total_seconds()))
 
     return {
         "total_rows": total_rows,
+        "closed_rows": closed_rows,
         "latest_timestamp_utc": None if latest_ts is None else latest_ts.isoformat(),
+        "latest_closed_timestamp_utc": None if latest_closed_ts is None else latest_closed_ts.isoformat(),
+        "expected_latest_closed_timestamp_utc": expected_latest_closed.isoformat(),
         "has_closed_latest": has_closed_latest,
         "stale_seconds": stale_seconds,
         "resolution_delta_minutes": int(delta.total_seconds() / 60),
@@ -122,6 +132,7 @@ def ensure_higher_timeframe_candles(
         "fetched_rows": {},
         "credentials_available": False,
     }
+    required_closed_rows = max(1, int(min_rows_per_timeframe) - 1)
 
     try:
         for timeframe in timeframes:
@@ -132,10 +143,11 @@ def ensure_higher_timeframe_candles(
                 dsn=dsn,
                 now_utc=current_time,
             )
-            enough_rows = snapshot["total_rows"] >= int(min_rows_per_timeframe)
+            enough_rows = snapshot["closed_rows"] >= required_closed_rows
             fresh_closed = bool(snapshot["has_closed_latest"])
             snapshot["enough_rows"] = enough_rows
             snapshot["fresh_closed"] = fresh_closed
+            snapshot["required_closed_rows"] = required_closed_rows
             snapshot["needs_fetch"] = not (enough_rows and fresh_closed)
             result["timeframes"][timeframe] = snapshot
     except Exception as exc:  # noqa: BLE001
@@ -177,7 +189,7 @@ def ensure_higher_timeframe_candles(
 
     for timeframe in needs_fetch:
         try:
-            fetch_limit = max(int(min_rows_per_timeframe), 180)
+            fetch_limit = max(int(min_rows_per_timeframe) + 2, 180)
             df = client.get_historical_prices(
                 epic=resolved_epic,
                 resolution=timeframe,
@@ -203,8 +215,9 @@ def ensure_higher_timeframe_candles(
                 dsn=dsn,
                 now_utc=current_time,
             )
-            snapshot["enough_rows"] = snapshot["total_rows"] >= int(min_rows_per_timeframe)
+            snapshot["enough_rows"] = snapshot["closed_rows"] >= required_closed_rows
             snapshot["fresh_closed"] = bool(snapshot["has_closed_latest"])
+            snapshot["required_closed_rows"] = required_closed_rows
             snapshot["needs_fetch"] = not (snapshot["enough_rows"] and snapshot["fresh_closed"])
             result["timeframes"][timeframe] = snapshot
             if snapshot["needs_fetch"]:

@@ -273,7 +273,7 @@ class CapitalRestClient:
         if not candidates:
             raise CapitalApiError(f"No Capital.com markets found for {requested!r}")
 
-        selected = self._select_best_market(candidates, streaming=streaming)
+        selected = self._select_best_market(candidates, streaming=streaming, requested=requested)
         epic = selected.get("epic")
         if not epic:
             raise CapitalApiError("Selected market did not include an epic")
@@ -282,19 +282,43 @@ class CapitalRestClient:
         return {"epic": epic, "instrumentName": name, "searchResult": selected}
 
     @staticmethod
-    def _select_best_market(candidates: list[dict[str, Any]], streaming: bool) -> dict[str, Any]:
-        keywords = ("eth/usd", "ethusd", "ethereum", "ether", "eth")
+    def _normalize_market_token(value: Any) -> str:
+        text = str(value or "").lower()
+        return "".join(ch for ch in text if ch.isalnum())
 
-        def score(market: dict[str, Any]) -> tuple[int, int, int, str]:
-            epic = str(market.get("epic", "")).lower()
-            name = str(market.get("instrumentName") or market.get("name") or "").lower()
+    @staticmethod
+    def _select_best_market(candidates: list[dict[str, Any]], streaming: bool, requested: str | None = None) -> dict[str, Any]:
+        keywords = ("eth/usd", "ethusd", "ethereum", "ether", "eth")
+        requested_norm = CapitalRestClient._normalize_market_token(requested)
+
+        def score(market: dict[str, Any]) -> tuple[int, int, int, int, int, str]:
+            epic_raw = str(market.get("epic", ""))
+            name_raw = str(market.get("instrumentName") or market.get("name") or "")
+            epic = epic_raw.lower()
+            name = name_raw.lower()
             status = str(market.get("marketStatus", "")).upper()
             stream_ok = bool(market.get("streamingPricesAvailable"))
             text = f"{epic} {name}"
             match_score = max((20 if kw in text else 0 for kw in keywords), default=0)
+            requested_score = 0
+            if requested_norm:
+                epic_norm = CapitalRestClient._normalize_market_token(epic_raw)
+                name_norm = CapitalRestClient._normalize_market_token(name_raw)
+                if epic_norm == requested_norm:
+                    requested_score += 300
+                elif requested_norm in epic_norm:
+                    requested_score += 100
+                if name_norm == requested_norm:
+                    requested_score += 220
+                elif requested_norm in name_norm:
+                    requested_score += 80
             stream_score = 10 if (not streaming or stream_ok) else 0
             status_score = 5 if status == "TRADEABLE" else (2 if status != "CLOSED" else 0)
-            return (match_score, stream_score, status_score, epic)
+            length_score = 0
+            if requested_norm:
+                epic_norm = CapitalRestClient._normalize_market_token(epic_raw)
+                length_score = -abs(len(epic_norm) - len(requested_norm))
+            return (requested_score, match_score, stream_score, status_score, length_score, epic)
 
         sorted_candidates = sorted(candidates, key=score, reverse=True)
         selected = sorted_candidates[0]

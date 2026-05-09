@@ -1,0 +1,124 @@
+
+Read content.txt
+
+I’ve confirmed one INVALID_5M_INPUT case is caused by cadence gaps, not broken OHLC values. I’m now sampling many invalid runs to verify whether this is systematic and quantify how often cadence is the real trigger.
+
+A high-impact inconsistency may exist: blocked validation results might not be propagated back into trade outcome scoring, so weak LONG/SHORT candidates could still be counted as active trade signals. I’m verifying this path now.
+
+I confirmed a critical pipeline mismatch: outcome scoring uses the original signals table direction, not validation final_signal. I’m quantifying how often actionable LONG/SHORT signals are later downgraded to BLOCKED/HOLD to measure this impact.
+
+I’ve completed the core diagnosis and identified two systemic issues beyond model quality: strict cadence-based invalidation and non-propagated validation gating. I’m storing these findings in repo memory, then I’ll give you a prioritized action plan to increase signal quality and win rate.
+
+Created memory file kronos-signal-weakness-20260507.md
+
+Review completed without interrupting the running services. The instance is up and healthy, but signal quality is weak for structural reasons, not just model weights.
+
+Findings
+
+Critical: validation gating is not driving trade outcome scoring.
+Evidence: the same run is stored as actionable LONG at log_07052026_kronos_predict.log:21819, then validated as BLOCKED at log_07052026_kronos_predict.log:21853. Outcome scoring still uses the original signals.signal in prediction_store.py:1445 and updates final status from that path in prediction_store.py:1511. Validation only writes validation_status and validation_summary in signal_validation_store.py:382. In today’s logs, 192 original LONG/SHORT runs were found and 189 were downgraded by validation to non-actionable states (98.44%).
+
+High: INVALID_5M_INPUT is mostly cadence-gap driven, not bad candle values.
+Evidence: cadence tolerance is strict in candle_context.py:165 and candle_context.py:166, and this triggers INVALID_5M_INPUT in signal_blockers.py:99. I sampled 30 recent INVALID_5M_INPUT runs; all had exactly 2 cadence mismatches and zero OHLC violations, duplicates, or parse errors. This is a false-negative pattern from data continuity checks.
+
+High: hard blockers dominate final signals and force score to zero.
+Evidence: blocker short-circuit forces BLOCKED and total_score 0 in signal_scoring.py:142. Today’s canonical validation set had 309 runs: 275 BLOCKED, 27 HOLD, 4 WEAK_SHORT, 1 SHORT, 2 VALIDATION_UNAVAILABLE. Main blocker mix: INVALID_5M_INPUT (181), FORECAST_EDGE_BELOW_COST (65), FORECAST_DIRECTION_FLAT (20), VERY_LOW_VOLUME (11). The live run is also blocked by VERY_LOW_VOLUME at log_07052026_kronos_predict.log:21853, from rule logic in signal_blockers.py:135.
+
+High: current predictive edge is weak on both active and candidate models.
+Evidence: live metrics show direction_accuracy_pct about 36.76% with 5606 matched candles in auto_finetune_status.json:36 and auto_finetune_status.json:37. Training settings are small and conservative: dataset limit 3000 in .env:53, 1 epoch in .env:61, learning rate 1e-6 in .env:63. This matches your training summary in traning_status.md:10, traning_status.md:13, traning_status.md:15. Runtime model-performance snapshot also showed active around 36.8% and shadow around 28.6% on comparable samples.
+
+Medium: inference defaults are stochastic with minimal averaging.
+Evidence: default inference settings are temperature 1.0, top-p 0.9, sample-count 1 in main_run_kronos_predict.py:74. The forecast launcher does not override them in main_forecast_latest.py:426. This can increase run-to-run variance and unstable edge estimates.
+
+Open Questions / Assumptions
+
+Should validation final_signal be an execution gate, or only an advisory/dashboard signal?
+Should model-performance and win/loss metrics include only validation-actionable signals?
+Are 2 cadence gaps in a 512-bar window acceptable in your market microstructure policy?
+Recommendations
+
+Propagate validation into outcome scoring (highest priority).
+Use validation_status or validation_summary.final_signal before scoring trade outcomes. If final signal is BLOCKED/HOLD/WATCH/VALIDATION_UNAVAILABLE, score as non-actionable (HOLD path) instead of LONG/SHORT. This will immediately reduce false losses and align metrics with your validation engine.
+
+Relax or redesign cadence hard-fail logic.
+Given observed pattern (all sampled invalid runs had only mismatch=2), move from hard-fail to warning for low mismatch counts, or increase tolerated mismatches for long windows. Keep hard-fail for true integrity defects (OHLC, nulls, duplicates).
+
+Convert VERY_LOW_VOLUME from hard blocker to conditional penalty.
+When net edge is strong, penalize score instead of force BLOCKED. Keep hard block only for extreme low liquidity conditions.
+
+Re-tune training for signal quality.
+Increase AUTO_FINETUNE_DATASET_LIMIT significantly, run more epochs than 1, and raise learning rate from 1e-6 to a practical finetuning range. Current setup is likely underfitting and not adapting enough.
+
+Reduce inference randomness.
+Lower temperature, lower top-p, and/or increase sample-count with aggregation to reduce noisy directional flips.
+
+Align observability with decision logic.
+Expose validation_status in signals API rows and dashboard tables, and add alerts on blocker ratios (especially INVALID_5M_INPUT spikes and sustained BLOCKED share).
+
+No code was changed in this review pass.
+
+If you want, I can implement this in a safe sequence:
+
+Patch validation-to-outcome propagation.
+Patch cadence tolerance logic with tests.
+Add a conservative config profile for training and inference and stage it behind env flags.
+
+
+----------------------------------------------implementiaon 
+
+Core patches are in place across prediction, validation/scoring, dashboard API/UI, and config defaults. I’m moving to verification now by running focused tests and static error checks, then I’ll fix anything that breaks.
+
+Checked prediction_store.py, signal_config.py, signal_blockers.py, signal_scoring.py, candle_context.py, dashboard_db.py, dashboard_server.py, dashboard_ui.py, main_run_kronos_predict.py, test_signal_validation_pipeline.py, no problems found
+
+Syntax and diagnostics are clean for all touched files; I’m running targeted tests next to confirm behavior changes for cadence, blockers, scoring, and status warnings.
+
+Implementation is complete and tests are green; I’m now collecting exact file/line references so you get a precise changelog and rollout checklist.
+
+Implemented the full six-point plan and started execution immediately. All scoped code changes are in place and verified by tests, without restarting running services.
+
+Plan Applied
+
+Propagate validation final signal into trade outcome scoring.
+Relax cadence hard-fail behavior for long windows.
+Convert low-volume from hard block to score penalty by default.
+Retune training defaults.
+Reduce inference randomness through env-backed defaults.
+Improve observability with validation fields and blocker-ratio alerts.
+Implemented
+
+Validation gating now controls effective trade signal and actionability during outcome updates in prediction_store.py:121, prediction_store.py:1450, prediction_store.py:1488, prediction_store.py:1561.
+Cadence tolerance for long windows increased to 2 mismatches before failing in candle_context.py:165.
+Low-volume hard block is now configurable and default-off, with explicit penalty controls in signal_config.py:40, signal_config.py:201, signal_blockers.py:136, signal_scoring.py:191.
+Dashboard/API now exposes validation status/summary per signal and computes 24h blocker ratios in dashboard_db.py:248, dashboard_db.py:749, dashboard_db.py:857.
+Status warnings now include blocker-ratio alerts in dashboard_server.py:440, dashboard_server.py:459.
+Signals table now shows validation outcome and parses validation summary robustly in dashboard_ui.py:1606, dashboard_ui.py:1760.
+Inference defaults are now env-backed and less random in main_run_kronos_predict.py:57, main_run_kronos_predict.py:103.
+Runtime config tuned for training/inference and low-volume policy in .env:27, .env:37, .env:58, .env.example:27, .env.example:37, .env.example:58.
+Tests
+
+Focused regression suite passed: 27 passed.
+Additional signal improvement suite passed: 41 passed.
+Added/updated validation pipeline tests for new behavior in test_signal_validation_pipeline.py:126, test_signal_validation_pipeline.py:198, test_signal_validation_pipeline.py:358.
+Operational Note
+
+No service interruption was performed. Running processes were not restarted.
+Code and env changes will fully take effect on the next worker/service restart cycle.
+Natural next steps:
+
+Let the system run for at least 50 to 100 new validation runs, then compare blocked ratio and actionable ratio from the new dashboard warnings.
+If blocker ratio remains high, I can implement a second pass to separate cadence warning classes by source quality (websocket vs fetch) and auto-suppress known harmless gaps.
+If training jobs become too slow with the new dataset size, I can tune batch size and timeout with a bounded training-time target.
+
+
+Dashboard and workers stopped.
+Another active dashboard supervisor lease exists (host=MohammadAbwini, pid=9992, 
+expires_at=2026-05-08 16:49:35.968261+00:00). Set ALLOW_DUPLICATE_WORKERS=true to 
+override intentionally.
+At C:\Users\moham\Desktop\Kronos\start_dashboard.ps1:494 char:9
++         throw "Another active dashboard supervisor lease exists$detai ...
++         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : OperationStopped: (Another active ... intentionally 
+   .:String) [], RuntimeException
+    + FullyQualifiedErrorId : Another active dashboard supervisor lease exists (h 
+   ost=MohammadAbwini, pid=9992, expires_at=2026-05-08 16:49:35.968261+00:00). S  
+  et ALLOW_DUPLICATE_WORKERS=true to override intentionally.

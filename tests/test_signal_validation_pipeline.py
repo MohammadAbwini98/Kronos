@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import http.client
+import contextlib
 import json
 from pathlib import Path
 import sys
@@ -105,6 +106,40 @@ class HardBlockerTests(unittest.TestCase):
         self.assertTrue(blockers["blocked"])
         self.assertIn("FORECAST_EDGE_BELOW_COST", blockers["reason_codes"])
 
+    def test_hold_candidate_is_not_forced_invalid(self):
+        blockers = evaluate_hard_blockers(
+            normalized_forecast={
+                "candidate_signal": "HOLD",
+                "forecast_direction": "UP",
+                "net_edge_pct": 0.2,
+            },
+            primary_input_validation={"ok": True, "cadence_ok": True},
+            context_fetch_status={"ok": True, "missing_timeframes": []},
+            timeframe_validations=[],
+            config=self._cfg(),
+            market_context={"spread_pct": 0.01, "volume_zscore": 0.0, "atr_percentile": 50.0},
+            database_available=True,
+        )
+        self.assertFalse(blockers["blocked"])
+        self.assertNotIn("KRONOS_FORECAST_INVALID", blockers["reason_codes"])
+
+    def test_low_volume_does_not_hard_block_by_default(self):
+        blockers = evaluate_hard_blockers(
+            normalized_forecast={
+                "candidate_signal": "LONG",
+                "forecast_direction": "UP",
+                "net_edge_pct": 0.2,
+            },
+            primary_input_validation={"ok": True, "cadence_ok": True},
+            context_fetch_status={"ok": True, "missing_timeframes": []},
+            timeframe_validations=[],
+            config=self._cfg(),
+            market_context={"spread_pct": 0.01, "volume_zscore": -3.0, "atr_percentile": 50.0},
+            database_available=True,
+        )
+        self.assertFalse(blockers["blocked"])
+        self.assertNotIn("VERY_LOW_VOLUME", blockers["reason_codes"])
+
 
 class CandleValidatorTests(unittest.TestCase):
     def test_rejects_duplicate_timestamps(self):
@@ -139,6 +174,65 @@ class CandleValidatorTests(unittest.TestCase):
         out = validate_candle_frame(frame, "MINUTE_5")
         self.assertFalse(out["ok"])
         self.assertTrue(any("OHLC invariant" in message for message in out["errors"]))
+
+    def test_allows_single_cadence_gap_for_long_window(self):
+        timestamps = pd.date_range("2026-05-01", periods=130, freq="5min", tz="UTC").tolist()
+        del timestamps[60]
+        frame = pd.DataFrame(
+            {
+                "timestamps": timestamps,
+                "open": [1.0] * len(timestamps),
+                "high": [1.2] * len(timestamps),
+                "low": [0.8] * len(timestamps),
+                "close": [1.1] * len(timestamps),
+                "volume": [10.0] * len(timestamps),
+                "amount": [0.0] * len(timestamps),
+            }
+        )
+        out = validate_candle_frame(frame, "MINUTE_5")
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["cadence_ok"])
+        self.assertEqual(1, out.get("cadence_mismatch_count"))
+        self.assertTrue(any("tolerated" in message for message in out["warnings"]))
+
+    def test_allows_two_cadence_gaps_for_long_window(self):
+        timestamps = pd.date_range("2026-05-01", periods=140, freq="5min", tz="UTC").tolist()
+        for idx in sorted([80, 40], reverse=True):
+            del timestamps[idx]
+        frame = pd.DataFrame(
+            {
+                "timestamps": timestamps,
+                "open": [1.0] * len(timestamps),
+                "high": [1.2] * len(timestamps),
+                "low": [0.8] * len(timestamps),
+                "close": [1.1] * len(timestamps),
+                "volume": [10.0] * len(timestamps),
+                "amount": [0.0] * len(timestamps),
+            }
+        )
+        out = validate_candle_frame(frame, "MINUTE_5")
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["cadence_ok"])
+        self.assertEqual(2, out.get("cadence_mismatch_count"))
+        self.assertTrue(any("tolerated" in message for message in out["warnings"]))
+
+    def test_rejects_cadence_gap_for_short_window(self):
+        timestamps = pd.date_range("2026-05-01", periods=12, freq="5min", tz="UTC").tolist()
+        del timestamps[5]
+        frame = pd.DataFrame(
+            {
+                "timestamps": timestamps,
+                "open": [1.0] * len(timestamps),
+                "high": [1.2] * len(timestamps),
+                "low": [0.8] * len(timestamps),
+                "close": [1.1] * len(timestamps),
+                "volume": [10.0] * len(timestamps),
+                "amount": [0.0] * len(timestamps),
+            }
+        )
+        out = validate_candle_frame(frame, "MINUTE_5")
+        self.assertFalse(out["ok"])
+        self.assertFalse(out["cadence_ok"])
 
 
 class HigherTimeframeTrendTests(unittest.TestCase):
@@ -261,6 +355,25 @@ class SignalScoringTests(unittest.TestCase):
         )
         self.assertEqual("BLOCKED", blocked["final_signal"])
 
+    def test_low_volume_applies_score_penalty(self):
+        cfg = self._cfg()
+        result = score_signal(
+            normalized_forecast={
+                "candidate_signal": "LONG",
+                "net_edge_pct": 0.25,
+                "forecast_path_consistency_score": 70.0,
+                "forecast_quality_score": 70.0,
+            },
+            timeframe_validations=[
+                {"timeframe": "HOUR", "trend_score": 8, "momentum_score": 1, "volume_score": 1, "volatility_score": 1, "support_resistance_score": 1},
+            ],
+            blockers={"blocked": False},
+            config=cfg,
+            market_context={"spread_pct": 0.02, "volume_zscore": -2.5},
+        )
+        self.assertLess(result["component_scores"]["cost_liquidity"], 10.0)
+        self.assertTrue(any("Very low volume context reduced" in item for item in result["reason_details"]))
+
 
 class MigrationIdempotenceTests(unittest.TestCase):
     def test_migration_contains_idempotent_statements(self):
@@ -380,16 +493,22 @@ class SignalValidationStoreTests(unittest.TestCase):
 
 class DashboardStatusApiTests(unittest.TestCase):
     def _request_status(self, snapshot: dict) -> tuple[int, dict]:
-        with (
-            patch.object(dashboard_server, "_latest_metadata", return_value=(None, {})),
-            patch.object(dashboard_server, "_quality_report_for_metadata", return_value=(None, {})),
-            patch.object(dashboard_server, "_safe_csv", return_value=[]),
-            patch.object(dashboard_server, "_latest_file", return_value=None),
-            patch.object(dashboard_server, "_history", return_value=[]),
-            patch.object(dashboard_server, "_prediction_db_summary", return_value={"recent_runs": []}),
-            patch.object(dashboard_server, "_postgres_snapshot", return_value=snapshot),
-            patch.object(dashboard_server, "_auto_finetune_status", return_value={}),
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(dashboard_server, "_latest_metadata", return_value=(None, {})))
+            _stack.enter_context(patch.object(dashboard_server, "_quality_report_for_metadata", return_value=(None, {})))
+            _stack.enter_context(patch.object(dashboard_server, "_safe_csv", return_value=[]))
+            _stack.enter_context(patch.object(dashboard_server, "_latest_file", return_value=None))
+            _stack.enter_context(patch.object(dashboard_server, "_history", return_value=[]))
+            _stack.enter_context(patch.object(dashboard_server, "_prediction_db_summary", return_value={"recent_runs": []}))
+            _stack.enter_context(patch.object(dashboard_server, "_postgres_snapshot", return_value=snapshot))
+            _stack.enter_context(patch.object(dashboard_server, "_auto_finetune_status", return_value={}))
+            _stack.enter_context(
+                patch.object(
+                    dashboard_server,
+                    "_trade_execution_status",
+                    return_value={"ok": True, "queue": {}, "trades": [], "active_trades": [], "pending_trades": [], "historical_trades": []},
+                )
+            )
             server = dashboard_server.ThreadingHTTPServer(("127.0.0.1", 0), dashboard_server.DashboardHandler)
             try:
                 port = server.server_address[1]

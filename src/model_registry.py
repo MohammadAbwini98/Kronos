@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import date, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -117,6 +119,24 @@ def artifact_manifest(model_path: str | None, tokenizer_path: str | None = None)
     return manifest
 
 
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, Path):
+        return str(value)
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
 def register_model_version(
     *,
     model_version_id: str | None = None,
@@ -138,6 +158,8 @@ def register_model_version(
 ) -> dict[str, Any]:
     version_id = model_version_id or model_version_id_for_path(model_name, model_path)
     manifest = artifact_manifest(model_path, tokenizer_path)
+    safe_approval_metrics = _json_safe(approval_metrics or {})
+    safe_manifest = _json_safe(manifest)
     with connect(dsn) as conn:
         conn.execute(
             """
@@ -182,11 +204,11 @@ def register_model_version(
                 int(pred_len),
                 promotion_status,
                 promotion_reason,
-                Jsonb(approval_metrics or {}),
-                Jsonb(manifest),
+                Jsonb(safe_approval_metrics),
+                Jsonb(safe_manifest),
             ),
         )
-    return {"model_version_id": version_id, "artifact_manifest": manifest}
+    return {"model_version_id": version_id, "artifact_manifest": safe_manifest}
 
 
 def associate_run_model_version(
@@ -265,6 +287,34 @@ def _rate_from_wins_losses(wins: int, losses: int) -> float | None:
     if samples <= 0:
         return None
     return (int(wins) / samples) * 100.0
+
+
+def _aggregate_shadow_horizon_accuracy(rows: list[dict[str, Any]]) -> dict[int, float]:
+    wins_by_horizon: dict[int, int] = {}
+    samples_by_horizon: dict[int, int] = {}
+    for row in rows:
+        horizon_metrics = row.get("horizon_metrics") or []
+        metric_rows = list(horizon_metrics.values()) if isinstance(horizon_metrics, dict) else horizon_metrics
+        if not isinstance(metric_rows, list):
+            continue
+        for metric in metric_rows:
+            if not isinstance(metric, dict):
+                continue
+            try:
+                horizon_index = int(metric.get("horizon_index"))
+            except (TypeError, ValueError):
+                continue
+            status = str(metric.get("status") or "PENDING").upper()
+            if status not in {"WIN", "LOSS"}:
+                continue
+            samples_by_horizon[horizon_index] = samples_by_horizon.get(horizon_index, 0) + 1
+            if status == "WIN":
+                wins_by_horizon[horizon_index] = wins_by_horizon.get(horizon_index, 0) + 1
+    return {
+        horizon_index: (wins_by_horizon.get(horizon_index, 0) / sample_count) * 100.0
+        for horizon_index, sample_count in samples_by_horizon.items()
+        if sample_count > 0
+    }
 
 
 def model_performance(
@@ -389,6 +439,16 @@ def model_performance(
             """,
             (symbol, resolution),
         ).fetchall()
+        shadow_horizon_rows = conn.execute(
+            """
+            SELECT horizon_metrics
+            FROM shadow_evaluations
+            WHERE symbol = %s
+              AND resolution = %s
+              AND (%s::text IS NULL OR shadow_model_version_id = %s::text)
+            """,
+            (symbol, resolution, selected_shadow_model_version_id, selected_shadow_model_version_id),
+        ).fetchall()
         gate_rows = conn.execute(
             """
             SELECT pgr.gate_name, pgr.status, pgr.metric_value, pgr.threshold_value, pgr.details, pgr.evaluated_at
@@ -420,15 +480,17 @@ def model_performance(
             "shadow_wins_when_disagree": int(shadow_row.get("shadow_wins_when_disagree") or 0),
             "active_wins_when_disagree": int(shadow_row.get("active_wins_when_disagree") or 0),
         }
+    shadow_horizon_accuracy = _aggregate_shadow_horizon_accuracy([dict(row) for row in shadow_horizon_rows])
     horizon_payload = []
     for row in horizons:
+        horizon_index = int(row["horizon_index"])
         samples = int(row.get("samples") or 0)
         wins = int(row.get("wins") or 0)
         horizon_payload.append(
             {
-                "horizon_index": int(row["horizon_index"]),
+                "horizon_index": horizon_index,
                 "active_accuracy_pct": None if samples == 0 else (wins / samples) * 100.0,
-                "shadow_accuracy_pct": None,
+                "shadow_accuracy_pct": shadow_horizon_accuracy.get(horizon_index),
                 "baseline_accuracy_pct": None,
                 "samples": samples,
                 "mape_pct": row.get("mape_pct"),

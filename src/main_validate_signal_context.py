@@ -9,7 +9,7 @@ from typing import Any
 
 import pandas as pd
 
-from candle_context import load_recent_candles, validate_candle_frame
+from candle_context import load_recent_candles, resolution_to_timedelta, validate_candle_frame
 from config import configure_logging
 from db import connect
 from forecast_normalizer import normalize_forecast
@@ -147,6 +147,28 @@ def _load_input_frame(run: dict[str, Any], dsn: str | None, lookback: int) -> pd
         limit=max(1, int(lookback)),
         dsn=dsn,
     )
+
+
+def _closed_candles_only(
+    frame: pd.DataFrame,
+    *,
+    resolution: str,
+    now_utc: pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    current = now_utc or pd.Timestamp.now(tz="UTC")
+    try:
+        delta = resolution_to_timedelta(resolution)
+    except Exception:  # noqa: BLE001
+        return frame
+    cutoff = current - delta
+    closed = frame.copy()
+    closed["timestamps"] = pd.to_datetime(closed["timestamps"], utc=True, errors="coerce")
+    closed = closed[closed["timestamps"] <= cutoff]
+    if closed.empty:
+        return frame
+    return closed.reset_index(drop=True)
 
 
 def _spread_pct(symbol: str, dsn: str | None) -> float | None:
@@ -315,6 +337,11 @@ def validate_signal_context_for_run(
             "error": "Input candles are missing for this run.",
             "run_id": run_id_value,
         }
+
+    input_frame = _closed_candles_only(
+        input_frame,
+        resolution=str(run.get("resolution") or resolution),
+    )
 
     try:
         normalized = normalize_forecast(

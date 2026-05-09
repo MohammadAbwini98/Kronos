@@ -69,6 +69,13 @@ def _expected_timestamps(start_ts: pd.Timestamp, end_ts: pd.Timestamp, resolutio
     return set(pd.date_range(start_ts, end_ts, freq=f"{RESOLUTION_TO_MINUTES[resolution]}min", tz="UTC"))
 
 
+def _latest_closed_timestamp(now_utc: pd.Timestamp, resolution: str) -> pd.Timestamp:
+    resolution_minutes = RESOLUTION_TO_MINUTES[resolution]
+    timestamp = pd.to_datetime(now_utc, utc=True)
+    floored = timestamp.floor(f"{resolution_minutes}min")
+    return floored - pd.Timedelta(minutes=resolution_minutes)
+
+
 def _covers_required_window(df: pd.DataFrame, start_ts: pd.Timestamp, end_ts: pd.Timestamp, resolution: str) -> bool:
     if df.empty:
         return False
@@ -143,7 +150,8 @@ def main() -> None:
                 f"Forecast window has not completed yet. forecast_end={forecast_end_ts}, now_utc={now_utc}. "
                 "Run this script after the forecast period has passed."
             )
-        effective_end_ts = min(forecast_end_ts, now_utc) if args.allow_partial else forecast_end_ts
+        closed_end_ts = _latest_closed_timestamp(now_utc, resolution)
+        effective_end_ts = min(forecast_end_ts, closed_end_ts) if args.allow_partial else forecast_end_ts
         timestamp = _metadata_timestamp(metadata_path)
 
         settings = load_settings(args.env)

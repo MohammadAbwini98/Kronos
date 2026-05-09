@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from decimal import Decimal
+import contextlib
 import sys
 import tempfile
 import unittest
@@ -75,9 +76,9 @@ class WebsocketHeartbeatTests(unittest.TestCase):
                     "timestamp": 1777638000000,
                 },
             }
-            with (
-                patch("capital_ws_ohlc_client.insert_raw_market_event"),
-                patch(
+            with contextlib.ExitStack() as _stack:
+                _stack.enter_context(patch("capital_ws_ohlc_client.insert_raw_market_event"))
+                upsert_quote = _stack.enter_context(patch(
                     "capital_ws_ohlc_client.upsert_live_quote",
                     return_value={
                         "price": Decimal("2300.5"),
@@ -85,8 +86,7 @@ class WebsocketHeartbeatTests(unittest.TestCase):
                         "ask": 2301.0,
                         "timestamp_utc": "2026-05-01T12:20:00+00:00",
                     },
-                ) as upsert_quote,
-            ):
+                ))
                 import asyncio
 
                 asyncio.run(client._handle_message(orjson.dumps(event)))

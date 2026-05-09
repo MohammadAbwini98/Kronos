@@ -16,7 +16,7 @@ function Import-DotEnv {
         $parts = $line.Split("=", 2)
         $key = $parts[0].Trim()
         $value = $parts[1].Trim().Trim('"').Trim("'")
-        if ($key -and -not [Environment]::GetEnvironmentVariable($key, "Process")) {
+        if ($key) {
             [Environment]::SetEnvironmentVariable($key, $value, "Process")
         }
     }
@@ -55,6 +55,7 @@ $historicalBackfillDays = if ($env:HISTORICAL_BACKFILL_DAYS) { $env:HISTORICAL_B
 $historicalBackfillIntervalMinutes = if ($env:HISTORICAL_BACKFILL_INTERVAL_MINUTES) { $env:HISTORICAL_BACKFILL_INTERVAL_MINUTES } else { "5" }
 $autoFinetuneEnabled = if ($env:ENABLE_AUTO_FINETUNE) { $env:ENABLE_AUTO_FINETUNE } else { "true" }
 $maintenanceEnabled = if ($env:ENABLE_MAINTENANCE_WORKER) { $env:ENABLE_MAINTENANCE_WORKER } else { "true" }
+$tradeExecutionEnabled = if ($env:ENABLE_TRADE_EXECUTION_WORKER) { $env:ENABLE_TRADE_EXECUTION_WORKER } elseif ($env:AUTO_EXECUTE_SIGNALS) { $env:AUTO_EXECUTE_SIGNALS } else { "false" }
 $envName = if ($env:CAPITAL_ENV) { $env:CAPITAL_ENV } else { "demo" }
 [int]$restartMaxAttempts = if ($env:WORKER_RESTART_MAX_ATTEMPTS) { $env:WORKER_RESTART_MAX_ATTEMPTS } else { 20 }
 [int]$monitorIntervalSeconds = if ($env:WORKER_MONITOR_INTERVAL_SECONDS) { $env:WORKER_MONITOR_INTERVAL_SECONDS } else { 5 }
@@ -70,12 +71,13 @@ $logsDir = Join-Path $outputDir "logs"
 $dashboardStdOutLog = Join-Path $logsDir "dashboard_stdout.log"
 $dashboardStdErrLog = Join-Path $logsDir "dashboard_stderr.log"
 $managedScriptPatterns = @(
-    "src\main_prediction_scheduler.py",
-    "src\main_validation_worker.py",
-    "src\main_stream_ohlc.py",
-    "src\main_auto_finetune_worker.py",
-    "src\main_maintenance_worker.py",
-    "src\dashboard_server.py"
+    "src/main_prediction_scheduler.py",
+    "src/main_validation_worker.py",
+    "src/main_stream_ohlc.py",
+    "src/main_auto_finetune_worker.py",
+    "src/main_maintenance_worker.py",
+    "src/main_trade_execution_worker.py",
+    "src/dashboard_server.py"
 )
 $script:processJobHandle = [IntPtr]::Zero
 $defaultPostgresDsn = "postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos"
@@ -224,20 +226,26 @@ function Add-ProcessToJob {
 }
 
 function Get-ManagedPythonProcesses {
-    return Get-CimInstance Win32_Process -Filter "name='python.exe'" |
-        Where-Object {
-            $cmd = [string]($_.CommandLine)
-            if ([string]::IsNullOrWhiteSpace($cmd)) {
+    try {
+        return Get-CimInstance Win32_Process -Filter "name='python.exe'" -ErrorAction Stop |
+            Where-Object {
+                $cmd = [string]($_.CommandLine)
+                if ([string]::IsNullOrWhiteSpace($cmd)) {
+                    return $false
+                }
+                $cmdLower = $cmd.ToLower().Replace("\", "/")
+                foreach ($pattern in $managedScriptPatterns) {
+                    if ($cmdLower.Contains($pattern.ToLower().Replace("\", "/"))) {
+                        return $true
+                    }
+                }
                 return $false
             }
-            $cmdLower = $cmd.ToLower()
-            foreach ($pattern in $managedScriptPatterns) {
-                if ($cmdLower.Contains($pattern.ToLower())) {
-                    return $true
-                }
-            }
-            return $false
-        }
+    }
+    catch {
+        Write-Warning "Unable to inspect existing Python command lines for stale managed workers: $($_.Exception.Message). Continuing without startup cleanup."
+        return @()
+    }
 }
 
 function Stop-StaleManagedProcesses {
@@ -265,6 +273,18 @@ function Test-Preflight {
 
     New-Item -ItemType Directory -Path $outputDir -Force | Out-Null
     New-Item -ItemType Directory -Path $logsDir -Force | Out-Null
+    if ($env:SSLKEYLOGFILE) {
+        $workspaceSslKeyLog = Join-Path $logsDir "ssl-keys.log"
+        try {
+            $stream = [System.IO.File]::Open($workspaceSslKeyLog, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+            $stream.Close()
+            $env:SSLKEYLOGFILE = $workspaceSslKeyLog
+        }
+        catch {
+            Write-Warning "Unable to prepare workspace SSLKEYLOGFILE at ${workspaceSslKeyLog}: $($_.Exception.Message). Clearing SSLKEYLOGFILE for worker startup."
+            Remove-Item Env:SSLKEYLOGFILE -ErrorAction SilentlyContinue
+        }
+    }
 
     Write-Host "Preflight check"
     Write-Host "  Python: $python"
@@ -277,12 +297,16 @@ function Test-Preflight {
     Write-Host "  Environment: $envName"
     Write-Host "  Auto finetune: $autoFinetuneEnabled"
     Write-Host "  Maintenance worker: $maintenanceEnabled"
+    Write-Host "  Trade execution worker: $tradeExecutionEnabled"
     Write-Host "  Restart max attempts: $restartMaxAttempts"
     Write-Host "  Dashboard restart max attempts: $dashboardRestartMaxAttempts"
     Write-Host "  Monitor interval (seconds): $monitorIntervalSeconds"
     Write-Host "  Cleanup stale processes on start: $(Test-FlagEnabled -Value $cleanupStaleProcessesOnStart -Default $true)"
     Write-Host "  Supervisor instance: $supervisorInstanceId"
     Write-Host "  Allow duplicate workers: $(Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)"
+    if ($env:SSLKEYLOGFILE) {
+        Write-Host "  SSL key log file: $env:SSLKEYLOGFILE"
+    }
     if ($env:POSTGRES_DSN) {
         Write-Host "  PostgreSQL DSN: configured"
     }
@@ -622,6 +646,10 @@ $maintenanceArgs = @(
     "--env", $envName
 )
 
+$tradeExecutionArgs = @(
+    "src\main_trade_execution_worker.py"
+)
+
 if (-not (Test-FlagEnabled -Value $historicalBackfillEnabled -Default $true)) {
     $maintenanceArgs += @("--disable-historical-backfill")
 }
@@ -642,7 +670,8 @@ $workers = @(
     (New-Worker -Name "validation_worker" -LaunchParams $validationArgs -Enabled $true),
     (New-Worker -Name "websocket_stream" -LaunchParams $streamArgs -Enabled $true),
     (New-Worker -Name "auto_finetune_worker" -LaunchParams $autoFinetuneArgs -Enabled ($autoFinetuneEnabled.ToLower() -in @("1", "true", "yes"))),
-    (New-Worker -Name "maintenance_worker" -LaunchParams $maintenanceArgs -Enabled ($maintenanceEnabled.ToLower() -in @("1", "true", "yes")))
+    (New-Worker -Name "maintenance_worker" -LaunchParams $maintenanceArgs -Enabled ($maintenanceEnabled.ToLower() -in @("1", "true", "yes"))),
+    (New-Worker -Name "trade_execution_worker" -LaunchParams $tradeExecutionArgs -Enabled ($tradeExecutionEnabled.ToLower() -in @("1", "true", "yes")))
 )
 
 $dashboard = $null

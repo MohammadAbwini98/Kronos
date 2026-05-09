@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -214,6 +216,11 @@ class FinetuneDatasetTests(unittest.TestCase):
 
 
 class FinetuneCommandTemplateSafetyTests(unittest.TestCase):
+    def test_no_command_configured_reports_paused_heartbeat_status(self):
+        latest = {"action": "skip", "reason": "no_finetune_command_configured"}
+
+        self.assertEqual("PAUSED", main_auto_finetune_worker._heartbeat_status_for_cycle(latest))
+
     def test_invalid_command_template_skips_without_subprocess(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -233,19 +240,20 @@ class FinetuneCommandTemplateSafetyTests(unittest.TestCase):
                 poll_minutes=15,
                 command="python train.py --dataset {dataset}",
                 model_dir=str(model_dir),
+                failure_cooldown_minutes=360,
+                training_heartbeat_seconds=60,
                 promotion_min_direction_accuracy=55.0,
                 promotion_min_matched_candles=20,
             )
 
-            with (
-                patch("main_auto_finetune_worker._load_finetune_dataset", return_value=_dataset(3)),
-                patch(
+            with contextlib.ExitStack() as _stack:
+                _stack.enter_context(patch("main_auto_finetune_worker._load_finetune_dataset", return_value=_dataset(3)))
+                _stack.enter_context(patch(
                     "main_auto_finetune_worker._latest_live_metrics",
                     return_value={"matched_candles": 30, "direction_accuracy_pct": 62.0},
-                ),
-                patch("main_auto_finetune_worker._model_ready", return_value=False),
-                patch("main_auto_finetune_worker.subprocess.run") as run_mock,
-            ):
+                ))
+                _stack.enter_context(patch("main_auto_finetune_worker._model_ready", return_value=False))
+                run_mock = _stack.enter_context(patch("main_auto_finetune_worker.subprocess.run"))
                 main_auto_finetune_worker._run_cycle(args, output_dir, status_path)
 
             run_mock.assert_not_called()
@@ -254,6 +262,131 @@ class FinetuneCommandTemplateSafetyTests(unittest.TestCase):
             self.assertEqual("invalid_finetune_command_template", payload.get("reason"))
             self.assertIn("{dataset}", payload.get("hint", ""))
             self.assertIn("{model_dir}", payload.get("hint", ""))
+
+    def test_recent_finetune_failure_enters_cooldown_without_subprocess(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            status_path = root / "auto_finetune_status.json"
+            model_dir = root / "model"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            recent_failure = {
+                "action": "train",
+                "reason": "finetune_command_failed",
+                "exit_code": 1,
+                "finished_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+                "last_trained_rows": 0,
+            }
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(json.dumps(recent_failure), encoding="utf-8")
+            args = argparse.Namespace(
+                symbol="ETHUSD",
+                resolution="MINUTE",
+                price_side="mid",
+                postgres_dsn=None,
+                limit=100,
+                min_rows=3,
+                min_new_rows=1,
+                poll_minutes=15,
+                command="python train.py --dataset {dataset} --model-dir {model_dir}",
+                model_dir=str(model_dir),
+                failure_cooldown_minutes=360,
+                training_heartbeat_seconds=60,
+                promotion_min_direction_accuracy=55.0,
+                promotion_min_matched_candles=20,
+            )
+
+            with contextlib.ExitStack() as _stack:
+                _stack.enter_context(patch("main_auto_finetune_worker._load_finetune_dataset", return_value=_dataset(5)))
+                _stack.enter_context(patch(
+                    "main_auto_finetune_worker._latest_live_metrics",
+                    return_value={"matched_candles": 30, "direction_accuracy_pct": 62.0},
+                ))
+                _stack.enter_context(patch("main_auto_finetune_worker._model_ready", return_value=False))
+                run_mock = _stack.enter_context(patch("main_auto_finetune_worker._run_command_with_training_heartbeat"))
+                main_auto_finetune_worker._run_cycle(args, output_dir, status_path)
+
+            run_mock.assert_not_called()
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual("skip", payload.get("action"))
+            self.assertEqual("finetune_failure_cooldown", payload.get("reason"))
+            self.assertIn("cooldown_until_utc", payload)
+
+    def test_command_runner_refreshes_training_heartbeat_while_waiting(self):
+        class FakeProcess:
+            returncode = 0
+
+            def __init__(self):
+                self.calls = 0
+
+            def communicate(self, timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired("train", timeout)
+                return "ok", ""
+
+        fake_process = FakeProcess()
+        with contextlib.ExitStack() as _stack:
+            popen_mock = _stack.enter_context(patch("main_auto_finetune_worker.subprocess.Popen", return_value=fake_process))
+            heartbeat = _stack.enter_context(patch("main_auto_finetune_worker._heartbeat"))
+            result = main_auto_finetune_worker._run_command_with_training_heartbeat(
+                command="python train.py",
+                heartbeat_details={"symbol": "ETHUSD", "resolution": "MINUTE_5"},
+                dsn=None,
+                heartbeat_interval_seconds=1,
+            )
+
+        popen_mock.assert_called_once()
+        heartbeat.assert_called_once()
+        self.assertEqual("TRAINING", heartbeat.call_args.args[0])
+        self.assertEqual(0, result.returncode)
+        self.assertEqual("ok", result.stdout)
+
+    def test_ready_model_registers_with_model_directory_name(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            output_dir = root / "output"
+            status_path = root / "auto_finetune_status.json"
+            model_dir = root / "Kronos-auto-finetuned"
+            model_dir.mkdir(parents=True, exist_ok=True)
+            previous = {
+                "last_trained_rows": 5,
+                "promoted_direction_accuracy_pct": None,
+            }
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            status_path.write_text(json.dumps(previous), encoding="utf-8")
+            args = argparse.Namespace(
+                symbol="ETHUSD",
+                resolution="MINUTE",
+                price_side="mid",
+                postgres_dsn=None,
+                limit=100,
+                min_rows=3,
+                min_new_rows=1000,
+                poll_minutes=15,
+                command="python train.py --dataset {dataset} --model-dir {model_dir}",
+                model_dir=str(model_dir),
+                failure_cooldown_minutes=360,
+                training_heartbeat_seconds=60,
+                promotion_min_direction_accuracy=55.0,
+                promotion_min_matched_candles=20,
+            )
+
+            with contextlib.ExitStack() as _stack:
+                _stack.enter_context(patch("main_auto_finetune_worker._load_finetune_dataset", return_value=_dataset(5)))
+                _stack.enter_context(patch(
+                    "main_auto_finetune_worker._latest_live_metrics",
+                    return_value={"matched_candles": 30, "direction_accuracy_pct": 62.0},
+                ))
+                _stack.enter_context(patch("main_auto_finetune_worker._model_ready", return_value=True))
+                register = _stack.enter_context(
+                    patch("main_auto_finetune_worker.register_model_version", return_value={"model_version_id": "Kronos-auto-finetuned"})
+                )
+                main_auto_finetune_worker._run_cycle(args, output_dir, status_path)
+
+            self.assertEqual("Kronos-auto-finetuned", register.call_args.kwargs["model_version_id"])
+            payload = json.loads(status_path.read_text(encoding="utf-8"))
+            self.assertEqual("Kronos-auto-finetuned", payload.get("candidate_model_version_id"))
 
 
 if __name__ == "__main__":

@@ -85,6 +85,7 @@ def validate_candle_frame(df: pd.DataFrame, resolution: str) -> dict[str, Any]:
         "errors": [],
         "warnings": [],
         "cadence_ok": True,
+        "cadence_mismatch_count": 0,
     }
 
     if not isinstance(df, pd.DataFrame):
@@ -157,11 +158,21 @@ def validate_candle_frame(df: pd.DataFrame, resolution: str) -> dict[str, Any]:
     try:
         cadence = resolution_to_timedelta(str(resolution).upper())
         deltas = check["timestamps"].diff().dropna()
-        if not deltas.empty and not (deltas == cadence).all():
-            result["ok"] = False
-            result["cadence_ok"] = False
+        if not deltas.empty:
             mismatch = int((deltas != cadence).sum())
-            result["errors"].append(f"Cadence mismatch for {mismatch} interval(s), expected {cadence}.")
+            result["cadence_mismatch_count"] = mismatch
+            # Large lookback windows can contain a couple of upstream gaps without invalidating the run.
+            allowed_mismatch = 2 if len(deltas.index) >= 120 else 0
+            if mismatch > allowed_mismatch:
+                result["ok"] = False
+                result["cadence_ok"] = False
+                result["errors"].append(
+                    f"Cadence mismatch for {mismatch} interval(s), expected {cadence}."
+                )
+            elif mismatch > 0:
+                result["warnings"].append(
+                    f"Cadence mismatch for {mismatch} interval(s), tolerated for long-window context."
+                )
     except ValueError:
         result["ok"] = False
         result["cadence_ok"] = False

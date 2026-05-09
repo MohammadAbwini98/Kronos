@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import contextlib
 import sys
 import unittest
 from unittest.mock import patch
@@ -59,25 +60,24 @@ class HistoricalBackfillTests(unittest.TestCase):
         end = pd.Timestamp("2026-05-01T00:20:00Z")
         selected_market = {"epic": "ETHUSD", "instrumentName": "Ethereum/USD"}
 
-        with (
-            patch("historical_backfill.history_window", return_value=(start, end)),
-            patch(
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("historical_backfill.history_window", return_value=(start, end)))
+            _stack.enter_context(patch(
                 "historical_backfill._load_existing_timestamps",
                 return_value=[
                     pd.Timestamp("2026-05-01T00:00:00Z"),
                     pd.Timestamp("2026-05-01T00:10:00Z"),
                 ],
-            ),
-            patch("historical_backfill.upsert_instrument") as upsert_instrument,
-            patch(
+            ))
+            upsert_instrument = _stack.enter_context(patch("historical_backfill.upsert_instrument"))
+            fetch_range = _stack.enter_context(patch(
                 "historical_backfill._fetch_range",
                 side_effect=[
                     _df("2026-05-01T00:05:00Z"),
                     _df("2026-05-01T00:15:00Z", "2026-05-01T00:20:00Z"),
                 ],
-            ) as fetch_range,
-            patch("historical_backfill.upsert_ohlcv_df", side_effect=lambda df, **_: len(df)) as upsert_ohlcv,
-        ):
+            ))
+            upsert_ohlcv = _stack.enter_context(patch("historical_backfill.upsert_ohlcv_df", side_effect=lambda df, **_: len(df)))
             summary = historical_backfill.ensure_historical_candles(
                 client=object(),
                 selected_market=selected_market,

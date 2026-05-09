@@ -550,6 +550,45 @@ def dashboard_html() -> str:
       margin-bottom: 10px;
     }
 
+    .validation-banner {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin: 10px 0 12px;
+      display: grid;
+      gap: 4px;
+    }
+
+    .validation-banner-title {
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+    }
+
+    .validation-banner-text {
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .validation-banner.good {
+      border-color: rgba(78,227,141,0.35);
+      background: rgba(78,227,141,0.13);
+      color: #b9f8d8;
+    }
+
+    .validation-banner.warn {
+      border-color: rgba(246,179,91,0.35);
+      background: rgba(246,179,91,0.13);
+      color: #ffe5ba;
+    }
+
+    .validation-banner.bad {
+      border-color: rgba(255,112,112,0.35);
+      background: rgba(255,112,112,0.13);
+      color: #ffc5c5;
+    }
+
     .warning-item {
       border: 1px solid rgba(246,179,91,0.35);
       border-radius: 10px;
@@ -790,6 +829,499 @@ def dashboard_html() -> str:
       canvas { height: 300px; }
       .chart-wrap { min-height: 300px; }
     }
+
+    /* Apple-inspired visual system override. Keeps all DOM IDs, handlers, and API mappings intact. */
+    :root {
+      color-scheme: light;
+      --font-ui: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI", sans-serif;
+      --font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --bg: #f5f5f7;
+      --bg-2: #ffffff;
+      --panel: rgba(255, 255, 255, 0.72);
+      --panel-2: rgba(255, 255, 255, 0.9);
+      --line: rgba(34, 34, 38, 0.12);
+      --line-strong: rgba(34, 34, 38, 0.2);
+      --text: #1d1d1f;
+      --muted: #6e6e73;
+      --teal: #00a889;
+      --blue: #007aff;
+      --amber: #bf7a00;
+      --green: #248a3d;
+      --red: #d70015;
+      --indigo: #5856d6;
+      --surface: rgba(255, 255, 255, 0.58);
+      --surface-solid: #ffffff;
+      --control: rgba(255, 255, 255, 0.82);
+      --control-hover: rgba(255, 255, 255, 0.96);
+      --control-pressed: rgba(235, 235, 240, 0.96);
+      --radius: 22px;
+      --radius-sm: 14px;
+      --shadow: 0 24px 70px rgba(0, 0, 0, 0.12), 0 3px 12px rgba(0, 0, 0, 0.06);
+      --shadow-soft: 0 10px 34px rgba(0, 0, 0, 0.08);
+      --focus-ring: 0 0 0 4px rgba(0, 122, 255, 0.18);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        color-scheme: dark;
+        --bg: #101014;
+        --bg-2: #18181d;
+        --panel: rgba(34, 34, 40, 0.68);
+        --panel-2: rgba(44, 44, 52, 0.86);
+        --line: rgba(245, 245, 247, 0.14);
+        --line-strong: rgba(245, 245, 247, 0.22);
+        --text: #f5f5f7;
+        --muted: #a1a1a6;
+        --teal: #30d5c8;
+        --blue: #0a84ff;
+        --amber: #ffd60a;
+        --green: #32d74b;
+        --red: #ff453a;
+        --indigo: #5e5ce6;
+        --surface: rgba(38, 38, 46, 0.56);
+        --surface-solid: #1f1f26;
+        --control: rgba(58, 58, 66, 0.72);
+        --control-hover: rgba(72, 72, 82, 0.86);
+        --control-pressed: rgba(50, 50, 58, 0.96);
+        --shadow: 0 26px 80px rgba(0, 0, 0, 0.45), 0 2px 18px rgba(0, 0, 0, 0.3);
+        --shadow-soft: 0 12px 36px rgba(0, 0, 0, 0.34);
+        --focus-ring: 0 0 0 4px rgba(10, 132, 255, 0.24);
+      }
+    }
+
+    * { letter-spacing: 0; }
+
+    body {
+      font-family: var(--font-ui);
+      color: var(--text);
+      background:
+        linear-gradient(180deg, rgba(255,255,255,0.78), rgba(255,255,255,0) 28%),
+        linear-gradient(135deg, var(--bg) 0%, #eef1f6 46%, #f9f4ef 100%);
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      body {
+        background:
+          linear-gradient(180deg, rgba(255,255,255,0.05), rgba(255,255,255,0) 32%),
+          linear-gradient(135deg, #101014 0%, #171822 48%, #201d1a 100%);
+      }
+    }
+
+    .ambient {
+      background:
+        linear-gradient(90deg, transparent, rgba(255,255,255,0.2), transparent),
+        linear-gradient(180deg, rgba(255,255,255,0.28), transparent 42%);
+      background-size: auto;
+      opacity: 0.7;
+      mask-image: none;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .ambient {
+        background:
+          linear-gradient(90deg, transparent, rgba(255,255,255,0.05), transparent),
+          linear-gradient(180deg, rgba(255,255,255,0.08), transparent 44%);
+        opacity: 1;
+      }
+    }
+
+    .shell {
+      max-width: 1600px;
+      padding: 24px;
+      gap: 18px;
+    }
+
+    .panel,
+    .meta-card,
+    .kpi,
+    .model-stat,
+    .worker-item,
+    .toggle-card,
+    .tabs,
+    .table-wrap,
+    .validation-banner,
+    .warning-item,
+    pre,
+    iframe,
+    .loader-card,
+    .toast {
+      border-color: var(--line);
+      box-shadow: var(--shadow-soft);
+      backdrop-filter: saturate(180%) blur(22px);
+      -webkit-backdrop-filter: saturate(180%) blur(22px);
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel-2), var(--panel));
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .topbar {
+      padding: 24px;
+      grid-template-columns: minmax(320px, 1.1fr) minmax(360px, 0.9fr);
+      border-radius: 28px;
+    }
+
+    .brand h1 {
+      font-size: clamp(28px, 3vw, 44px);
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .title-price {
+      color: var(--blue);
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+
+    .brand p,
+    .panel-head p,
+    .model-progress-sub,
+    .kpi-sub,
+    .tiny-help {
+      color: var(--muted);
+    }
+
+    .meta-grid {
+      gap: 12px;
+    }
+
+    .meta-card,
+    .kpi,
+    .model-stat,
+    .worker-item,
+    .toggle-card {
+      background: var(--surface);
+      border-radius: var(--radius-sm);
+    }
+
+    .meta-card {
+      min-height: 82px;
+      padding: 14px;
+    }
+
+    .meta-label,
+    .kpi-label,
+    .model-stat-label,
+    .worker-name,
+    .progress-row {
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      font-size: 10px;
+    }
+
+    .chip {
+      border-color: var(--line);
+      background: rgba(118, 118, 128, 0.11);
+      color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.24);
+    }
+
+    .chip.good,
+    .validation-banner.good {
+      color: var(--green);
+      border-color: color-mix(in srgb, var(--green) 34%, transparent);
+      background: color-mix(in srgb, var(--green) 12%, transparent);
+    }
+
+    .chip.warn,
+    .validation-banner.warn,
+    .warning-item {
+      color: var(--amber);
+      border-color: color-mix(in srgb, var(--amber) 34%, transparent);
+      background: color-mix(in srgb, var(--amber) 12%, transparent);
+    }
+
+    .chip.bad,
+    .validation-banner.bad {
+      color: var(--red);
+      border-color: color-mix(in srgb, var(--red) 34%, transparent);
+      background: color-mix(in srgb, var(--red) 12%, transparent);
+    }
+
+    .chip.info {
+      color: var(--blue);
+      border-color: color-mix(in srgb, var(--blue) 30%, transparent);
+      background: color-mix(in srgb, var(--blue) 10%, transparent);
+    }
+
+    .control-board,
+    .model-status-panel,
+    .chart-panel,
+    .details-panel {
+      padding: 18px;
+    }
+
+    .control-head h2,
+    .panel-head h2,
+    .panel-head h3 {
+      font-weight: 700;
+      letter-spacing: -0.005em;
+    }
+
+    .control-grid {
+      gap: 12px;
+    }
+
+    .field {
+      color: var(--muted);
+      letter-spacing: 0.01em;
+    }
+
+    input,
+    select {
+      min-height: 44px;
+      border-radius: 13px;
+      border-color: var(--line);
+      background: var(--control);
+      color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.22);
+    }
+
+    input:hover,
+    select:hover {
+      border-color: var(--line-strong);
+      background: var(--control-hover);
+    }
+
+    input:focus,
+    select:focus {
+      border-color: var(--blue);
+      box-shadow: var(--focus-ring);
+    }
+
+    .toggle-row,
+    .actions {
+      gap: 12px;
+    }
+
+    .toggle-card {
+      min-height: 50px;
+      padding: 10px 12px;
+      color: var(--text);
+    }
+
+    .toggle-card input {
+      accent-color: var(--blue);
+      cursor: pointer;
+    }
+
+    button {
+      min-height: 44px;
+      border-radius: 14px;
+      border-color: var(--line);
+      background: var(--control);
+      color: var(--text);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.25), 0 8px 20px rgba(0,0,0,0.05);
+      transition: transform 140ms ease, border-color 140ms ease, background 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
+    }
+
+    button:hover {
+      background: var(--control-hover);
+      border-color: var(--line-strong);
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.28), 0 12px 24px rgba(0,0,0,0.08);
+    }
+
+    button:active {
+      transform: translateY(0) scale(0.985);
+      background: var(--control-pressed);
+    }
+
+    button:focus-visible {
+      outline: none;
+      box-shadow: var(--focus-ring), 0 8px 20px rgba(0,0,0,0.05);
+    }
+
+    button:disabled {
+      opacity: 0.48;
+      cursor: not-allowed;
+      box-shadow: none;
+    }
+
+    .btn-primary,
+    .tab.active {
+      background: linear-gradient(180deg, color-mix(in srgb, var(--blue) 84%, white), var(--blue));
+      color: #ffffff;
+      border-color: color-mix(in srgb, var(--blue) 70%, transparent);
+      box-shadow: 0 14px 30px color-mix(in srgb, var(--blue) 24%, transparent);
+    }
+
+    .btn-alt {
+      background: color-mix(in srgb, var(--blue) 10%, var(--control));
+      color: var(--blue);
+    }
+
+    .btn-warn {
+      background: color-mix(in srgb, var(--amber) 14%, var(--control));
+      color: var(--amber);
+    }
+
+    .kpi-grid,
+    .model-metrics,
+    .worker-grid {
+      gap: 12px;
+    }
+
+    .kpi {
+      min-height: 116px;
+      padding: 16px;
+      overflow: hidden;
+    }
+
+    .kpi::before {
+      height: 1px;
+      background: linear-gradient(90deg, var(--blue), var(--teal), transparent);
+      opacity: 0.7;
+    }
+
+    .kpi-value,
+    .model-version-title {
+      font-weight: 700;
+      letter-spacing: -0.01em;
+    }
+
+    .progress-track {
+      height: 10px;
+      border-radius: 999px;
+      border-color: var(--line);
+      background: rgba(118, 118, 128, 0.16);
+    }
+
+    .progress-fill {
+      border-radius: 999px;
+      background: linear-gradient(90deg, var(--blue), var(--teal), var(--green));
+    }
+
+    .chart-wrap {
+      border-radius: 18px;
+      border-color: var(--line);
+      background: color-mix(in srgb, var(--surface-solid) 74%, var(--bg));
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.32);
+    }
+
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 6px;
+      border-radius: 18px;
+      background: rgba(118, 118, 128, 0.12);
+      box-shadow: none;
+    }
+
+    .tab {
+      flex: 1 1 120px;
+      min-height: 38px;
+      border-radius: 12px;
+      color: var(--muted);
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .tab:not(.active):hover {
+      color: var(--text);
+      background: var(--control-hover);
+      transform: none;
+    }
+
+    .table-wrap {
+      border-radius: 16px;
+      background: var(--surface);
+    }
+
+    th,
+    td {
+      border-bottom-color: var(--line);
+      padding: 11px 12px;
+    }
+
+    th {
+      background: color-mix(in srgb, var(--surface-solid) 84%, var(--bg));
+      color: var(--muted);
+      letter-spacing: 0.04em;
+    }
+
+    tr:hover td {
+      background: rgba(118, 118, 128, 0.08);
+    }
+
+    pre {
+      font-family: var(--font-mono);
+      background: color-mix(in srgb, var(--surface-solid) 84%, var(--bg));
+      color: var(--text);
+      border-radius: 16px;
+    }
+
+    iframe {
+      border-radius: 18px;
+    }
+
+    .empty {
+      border-color: var(--line-strong);
+      border-radius: 16px;
+      color: var(--muted);
+      background: rgba(118, 118, 128, 0.08);
+    }
+
+    .warning-item,
+    .validation-banner {
+      border-radius: 16px;
+    }
+
+    .mini-copy {
+      min-height: 30px;
+      border-radius: 10px;
+      font-size: 11px;
+    }
+
+    .loader-overlay {
+      background: rgba(242, 242, 247, 0.58);
+      backdrop-filter: saturate(180%) blur(18px);
+      -webkit-backdrop-filter: saturate(180%) blur(18px);
+    }
+
+    @media (prefers-color-scheme: dark) {
+      .loader-overlay {
+        background: rgba(0, 0, 0, 0.42);
+      }
+    }
+
+    .loader-card,
+    .toast {
+      background: var(--panel-2);
+      border-radius: 20px;
+    }
+
+    .spinner {
+      border-color: color-mix(in srgb, var(--blue) 18%, transparent);
+      border-top-color: var(--blue);
+    }
+
+    .toast {
+      right: 22px;
+      bottom: 22px;
+      padding: 12px 14px;
+    }
+
+    @media (max-width: 1280px) {
+      .topbar { grid-template-columns: 1fr; }
+      .tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 640px) {
+      .shell { padding: 12px; gap: 12px; }
+      .topbar,
+      .control-board,
+      .model-status-panel,
+      .chart-panel,
+      .details-panel {
+        padding: 14px;
+      }
+      .tabs { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
   </style>
 </head>
 <body>
@@ -919,6 +1451,7 @@ def dashboard_html() -> str:
     <button class="tab" data-tab="validation">Validation</button>
     <button class="tab" data-tab="modelPerformance">Model Performance</button>
     <button class="tab" data-tab="risk">Risk</button>
+    <button class="tab" data-tab="trades">Executed Signals</button>
     <button class="tab" data-tab="baselines">Baselines</button>
     <button class="tab" data-tab="history">History</button>
     <button class="tab" data-tab="files">Files</button>
@@ -930,6 +1463,7 @@ def dashboard_html() -> str:
   <section id="validation" class="details-panel panel tabPanel hidden"></section>
   <section id="modelPerformance" class="details-panel panel tabPanel hidden"></section>
   <section id="risk" class="details-panel panel tabPanel hidden"></section>
+  <section id="trades" class="details-panel panel tabPanel hidden"></section>
   <section id="baselines" class="details-panel panel tabPanel hidden"></section>
   <section id="history" class="details-panel panel tabPanel hidden"></section>
   <section id="files" class="details-panel panel tabPanel hidden"></section>
@@ -961,6 +1495,8 @@ let refreshInFlight = false;
 let autoPredictBusy = false;
 let signalPage = 1;
 let signalPageSize = 10;
+let tradeExecutionPage = 1;
+const TRADE_EXECUTION_PAGE_SIZE = 10;
 let activeTab = 'overview';
 let lastAutoPredictClosedBucket = null;
 let lastOverviewHtml = '';
@@ -981,6 +1517,14 @@ let signalFilters = {
   status: '',
   signalId: '',
 };
+let tradeExecutionFilters = {
+  lifecycle: '',
+  status: '',
+  outcome: '',
+  side: '',
+  signalId: '',
+  transactionId: '',
+};
 
 const SIGNAL_FILTER_CONTROL_IDS = new Set([
   'signalsTimeframe',
@@ -998,6 +1542,22 @@ const SIGNAL_FILTER_AUTO_APPLY_IDS = new Set([
   'signalsDateTo',
   'signalsDirection',
   'signalsStatus',
+]);
+
+const TRADE_FILTER_CONTROL_IDS = new Set([
+  'tradeLifecycleFilter',
+  'tradeStatusFilter',
+  'tradeOutcomeFilter',
+  'tradeSideFilter',
+  'tradeSignalFilter',
+  'tradeTransactionFilter',
+]);
+
+const TRADE_FILTER_AUTO_APPLY_IDS = new Set([
+  'tradeLifecycleFilter',
+  'tradeStatusFilter',
+  'tradeOutcomeFilter',
+  'tradeSideFilter',
 ]);
 
 let signalIdFilterDebounceTimer = null;
@@ -1088,9 +1648,9 @@ function resolveLatestPriceTime(data) {
 
 function statusClass(value) {
   const text = String(value || '').toUpperCase();
-  if (['OK', 'VALIDATED', 'WIN', 'PROMISING', 'LONG', 'UP', 'APPROVED', 'PROMOTED'].includes(text)) return 'good';
-  if (['PENDING', 'PARTIAL', 'HOLD', 'NEEDS_MORE_SAMPLES', 'FLAT', 'STALE', 'PENDING_REVIEW', 'SKIP'].includes(text)) return 'warn';
-  if (['ERROR', 'LOSS', 'WEAK', 'NOT_TRADABLE', 'SHORT', 'DOWN', 'NOT_READY'].includes(text)) return 'bad';
+  if (['OK', 'VALIDATED', 'WIN', 'GOOD_HOLD', 'PROMISING', 'LONG', 'UP', 'APPROVED', 'PROMOTED', 'OPEN', 'COMPLETED', 'ACTIVE'].includes(text)) return 'good';
+  if (['PENDING', 'PARTIAL', 'HOLD', 'EXPIRED', 'AMBIGUOUS', 'NEEDS_MORE_SAMPLES', 'FLAT', 'STALE', 'PENDING_REVIEW', 'SKIP', 'QUEUED', 'QUEUE', 'PROCESSING', 'SUBMITTED', 'CLOSE_REQUESTED'].includes(text)) return 'warn';
+  if (['ERROR', 'LOSS', 'MISSED_MOVE', 'WEAK', 'NOT_TRADABLE', 'SHORT', 'DOWN', 'NOT_READY', 'FAILED', 'REJECTED', 'VALIDATION_FAILED', 'CLOSE_FAILED'].includes(text)) return 'bad';
   return 'info';
 }
 
@@ -1132,12 +1692,15 @@ function showToast(message) {
 }
 
 function showLoader(text = 'Loading dashboard...') {
-  $('loaderText').textContent = text;
-  $('loader').classList.remove('hidden');
+  const loaderTextEl = $('loaderText');
+  const loaderEl = $('loader');
+  if (loaderTextEl) loaderTextEl.textContent = text;
+  if (loaderEl) loaderEl.classList.remove('hidden');
 }
 
 function hideLoader() {
-  $('loader').classList.add('hidden');
+  const loaderEl = $('loader');
+  if (loaderEl) loaderEl.classList.add('hidden');
 }
 
 function setBusy(isBusy, label = 'Working') {
@@ -1158,6 +1721,11 @@ function isSignalsFilterInteracting() {
   return !!(active && SIGNAL_FILTER_CONTROL_IDS.has(active.id));
 }
 
+function isTradeExecutionFilterInteracting() {
+  const active = document.activeElement;
+  return !!(active && TRADE_FILTER_CONTROL_IDS.has(active.id));
+}
+
 function buildSignalPaginationButtons(currentPage, totalPages) {
   const page = Math.max(1, Number(currentPage || 1));
   const total = Math.max(1, Number(totalPages || 1));
@@ -1172,6 +1740,38 @@ function buildSignalPaginationButtons(currentPage, totalPages) {
 
   const pieces = [];
   const pageButton = (p, active = false) => `<button type="button" class="${active ? 'btn-primary' : 'btn-alt'}" data-signal-page="${p}" style="min-height: 34px; padding: 6px 10px;">${p}</button>`;
+
+  if (start > 1) {
+    pieces.push(pageButton(1, page === 1));
+    if (start > 2) pieces.push('<span class="muted">...</span>');
+  }
+
+  for (let p = start; p <= end; p += 1) {
+    pieces.push(pageButton(p, p === page));
+  }
+
+  if (end < total) {
+    if (end < total - 1) pieces.push('<span class="muted">...</span>');
+    pieces.push(pageButton(total, page === total));
+  }
+
+  return pieces.join('');
+}
+
+function buildTradePaginationButtons(currentPage, totalPages) {
+  const page = Math.max(1, Number(currentPage || 1));
+  const total = Math.max(1, Number(totalPages || 1));
+  const radius = 2;
+  let start = Math.max(1, page - radius);
+  let end = Math.min(total, page + radius);
+
+  if (end - start < radius * 2) {
+    start = Math.max(1, end - (radius * 2));
+    end = Math.min(total, start + (radius * 2));
+  }
+
+  const pieces = [];
+  const pageButton = (p, active = false) => `<button type="button" class="${active ? 'btn-primary' : 'btn-alt'}" data-trade-page="${p}" style="min-height: 34px; padding: 6px 10px;">${p}</button>`;
 
   if (start > 1) {
     pieces.push(pageButton(1, page === 1));
@@ -1220,7 +1820,7 @@ function buildCloseSeries() {
   const forecastEnd = parseTs(forecast[forecast.length - 1]?.timestamps);
   const actualWindow = (forecastStart && forecastEnd)
     ? actual.filter(row => {
-      const t = parseTs(row.timestamps);
+      const t = parseTs(row.timestamps || row.timestamp_utc);
       return t && t >= forecastStart && t <= forecastEnd;
     })
     : [];
@@ -1240,7 +1840,7 @@ function drawCloseChart() {
     return;
   }
 
-  const allTimes = allRows.map(r => parseTs(r.timestamps)?.getTime()).filter(Boolean);
+  const allTimes = allRows.map(r => parseTs(r.timestamps || r.timestamp_utc)?.getTime()).filter(Boolean);
   const allPrices = allRows.map(r => Number(r.close)).filter(v => Number.isFinite(v));
   if (!allTimes.length || !allPrices.length) {
     drawEmptyChart(ctx, w, h, 'Unable to draw chart from current data');
@@ -1277,7 +1877,7 @@ function drawCloseChart() {
 
   const drawSeries = (rows, color, width, dashed = false) => {
     const points = rows.map(row => {
-      const t = parseTs(row.timestamps);
+      const t = parseTs(row.timestamps || row.timestamp_utc);
       return t ? { x: x(t.getTime()), y: y(Number(row.close)) } : null;
     }).filter(Boolean);
     if (points.length < 2) return;
@@ -1564,6 +2164,17 @@ function renderOverview(options = {}) {
     return text ? chip(text) : '<span class="muted">n/a</span>';
   };
 
+  const parseValidationSummary = value => {
+    if (!value) return {};
+    if (typeof value === 'object') return value;
+    try {
+      const parsed = JSON.parse(String(value));
+      return parsed && typeof parsed === 'object' ? parsed : {};
+    } catch {
+      return {};
+    }
+  };
+
   const bodyRows = rows.length
     ? rows.map(r => {
       const validatedCount = Number(r.outcomes_wins || 0) + Number(r.outcomes_losses || 0);
@@ -1572,6 +2183,9 @@ function renderOverview(options = {}) {
       const activeDecision = badgeOrMuted(r.signal);
       const activeOutcome = badgeOrMuted(r.status);
       const activeStatus = badgeOrMuted(r.status_raw || r.status);
+      const validationSummary = parseValidationSummary(r.validation_summary);
+      const validationFinalSignal = String(validationSummary.final_signal || r.validation_status || '').trim();
+      const validationBadge = badgeOrMuted(validationFinalSignal);
       const activeConfidence = pct01(r.confidence);
       const shadowDecision = badgeOrMuted(r.shadow_signal);
       const shadowOutcome = r.shadow_signal ? badgeOrMuted(r.shadow_status || 'PENDING') : '<span class="muted">n/a</span>';
@@ -1584,8 +2198,15 @@ function renderOverview(options = {}) {
       if (r.disagreement) {
         modelNoteParts.push('disagreement');
       }
+      if (validationFinalSignal) {
+        if (validationSummary.blocked) {
+          modelNoteParts.push(`validation ${validationFinalSignal} (${validationSummary.block_reason || 'UNKNOWN'})`);
+        } else {
+          modelNoteParts.push(`validation ${validationFinalSignal}`);
+        }
+      }
       const modelNoteRow = modelNoteParts.length
-        ? `<tr class="signal-note-row"><td colspan="14"><div class="signal-note">Model Note: ${escapeHtml(modelNoteParts.join(' | '))}</div></td></tr>`
+        ? `<tr class="signal-note-row"><td colspan="15"><div class="signal-note">Model Note: ${escapeHtml(modelNoteParts.join(' | '))}</div></td></tr>`
         : '';
       return `<tr class="signal-group-row signal-group-start">
         <td rowspan="2">
@@ -1598,6 +2219,7 @@ function renderOverview(options = {}) {
         <td class="signal-badge-cell">${activeDecision}</td>
         <td class="signal-badge-cell">${activeOutcome}</td>
         <td class="signal-badge-cell">${activeStatus}</td>
+        <td rowspan="2" class="signal-badge-cell">${validationBadge}</td>
         <td class="signal-badge-cell">${runBadge}</td>
         <td rowspan="2" class="signal-numeric">${escapeHtml(String(validatedCount))}/${escapeHtml(String(totalCount))}</td>
         <td class="signal-numeric">${fmtNumber(r.entry_price)}</td>
@@ -1608,6 +2230,7 @@ function renderOverview(options = {}) {
           <div class="signal-actions">
             <button class="mini-copy" data-copy="${escapeHtml(r.signal_id || '')}" data-copy-label="signal id">Copy Signal</button>
             <button class="mini-copy" data-copy="${escapeHtml(r.run_id || '')}" data-copy-label="run id">Copy Run</button>
+            <button class="mini-copy" data-execute-signal="${escapeHtml(r.signal_id || r.run_id || '')}">Execute Signal</button>
             <button class="mini-copy" data-audit-run="${escapeHtml(r.run_id || '')}">Audit</button>
           </div>
         </td>
@@ -1625,7 +2248,7 @@ function renderOverview(options = {}) {
       </tr>
       ${modelNoteRow}`;
     }).join('')
-    : '<tr><td colspan="14"><div class="empty">No signals found for current filters.</div></td></tr>';
+    : '<tr><td colspan="15"><div class="empty">No signals found for current filters.</div></td></tr>';
 
   const warningHtml = warnings.length
     ? `<div class="warning-stack">${warnings.map(w => `<div class="warning-item">${escapeHtml(w)}</div>`).join('')}</div>`
@@ -1677,6 +2300,10 @@ function renderOverview(options = {}) {
           <option value="VALIDATED" ${signalFilters.status === 'VALIDATED' ? 'selected' : ''}>VALIDATED (run)</option>
           <option value="WIN" ${signalFilters.status === 'WIN' ? 'selected' : ''}>WIN</option>
           <option value="LOSS" ${signalFilters.status === 'LOSS' ? 'selected' : ''}>LOSS</option>
+          <option value="EXPIRED" ${signalFilters.status === 'EXPIRED' ? 'selected' : ''}>EXPIRED</option>
+          <option value="GOOD_HOLD" ${signalFilters.status === 'GOOD_HOLD' ? 'selected' : ''}>GOOD_HOLD</option>
+          <option value="MISSED_MOVE" ${signalFilters.status === 'MISSED_MOVE' ? 'selected' : ''}>MISSED_MOVE</option>
+          <option value="AMBIGUOUS" ${signalFilters.status === 'AMBIGUOUS' ? 'selected' : ''}>AMBIGUOUS</option>
         </select>
       </label>
       <label class="field">Signal ID <input id="signalsSignalId" value="${escapeHtml(signalFilters.signalId)}" autocomplete="off"></label>
@@ -1692,7 +2319,7 @@ function renderOverview(options = {}) {
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th>Signal ID / Run ID</th><th>Generated</th><th>Timeframe</th><th>Variant</th><th>Decision</th><th>Shadow / Active Outcome</th><th>Status</th><th>Run</th><th class="signal-numeric">Validated / Total</th><th class="signal-numeric">Entry</th><th class="signal-numeric">TP</th><th class="signal-numeric">SL</th><th class="signal-numeric">Confidence</th><th>Actions</th></tr>
+          <tr><th>Signal ID / Run ID</th><th>Generated</th><th>Timeframe</th><th>Variant</th><th>Decision</th><th>Outcome</th><th>Status</th><th>Validation</th><th>Run</th><th class="signal-numeric">Validated / Total</th><th class="signal-numeric">Entry</th><th class="signal-numeric">TP</th><th class="signal-numeric">SL</th><th class="signal-numeric">Confidence</th><th>Actions</th></tr>
         </thead>
         <tbody>${bodyRows}</tbody>
       </table>
@@ -1746,20 +2373,59 @@ function renderValidation(data) {
   const reasonCodes = sv.reason_codes || [];
   const reasonDetails = sv.reason_details || [];
   const matchedCandles = Number(v.matched_candles || 0);
+  const blockedSignal = Boolean(sv.blocked);
+  const metricsUnavailable = source === 'none' || (source === 'prediction_outcomes' && matchedCandles === 0);
+  const metricPendingLabel = source === 'none'
+    ? 'n/a (validation source unavailable)'
+    : 'n/a (waiting for WIN/LOSS outcomes)';
+  const metricsStatusNote = metricsUnavailable
+    ? 'MAE/RMSE/MAPE/Expected move require matched WIN/LOSS outcomes.'
+    : 'MAE/RMSE/MAPE/Expected move are based on matched WIN/LOSS outcomes.';
+  const scoreStatusNote = blockedSignal
+    ? `All component scores are 0.00 because this run is BLOCKED (${sv.block_reason || 'no block reason provided'}).`
+    : 'Component scores reflect the latest external scoring pass.';
+  const validationHealth = blockedSignal
+    ? {
+      tone: 'bad',
+      title: 'Validation blocked',
+      detail: `Scoring is blocked by ${sv.block_reason || 'one or more hard blockers'}.`,
+    }
+    : metricsUnavailable
+      ? {
+        tone: 'warn',
+        title: 'Awaiting matched outcomes',
+        detail: 'MAE/RMSE/MAPE/Expected move will populate after WIN/LOSS outcomes are recorded.',
+      }
+      : matchedCandles < 20
+        ? {
+          tone: 'warn',
+          title: 'Metrics available with low sample size',
+          detail: `Using ${matchedCandles} matched candles; treat direction accuracy as preliminary.`,
+        }
+        : {
+          tone: 'good',
+          title: 'Validation healthy',
+          detail: `Using ${matchedCandles} matched candles from ${source}.`,
+        };
+  const validationBannerHtml = `<div class="validation-banner ${validationHealth.tone}">
+      <div class="validation-banner-title">${escapeHtml(validationHealth.title)}</div>
+      <div class="validation-banner-text">${escapeHtml(validationHealth.detail)}</div>
+    </div>`;
   const accuracyHint = matchedCandles < 20
     ? `Low sample size (${matchedCandles}) - direction accuracy is noisy.`
     : `Sample size ${matchedCandles} - direction accuracy is more reliable.`;
   const qualityRows = [
     ['Source', source],
     ['Quality', v.quality_status],
-    ['Direction', v.forecast_direction],
+    ['Direction', v.forecast_direction || sv.forecast_direction || 'n/a'],
     ['Matched candles', v.matched_candles],
-    ['Direction accuracy', v.direction_accuracy_pct === undefined || v.direction_accuracy_pct === null ? 'n/a' : `${fmtNumber(v.direction_accuracy_pct, 2)}%`],
+    ['Direction accuracy', v.direction_accuracy_pct === undefined || v.direction_accuracy_pct === null ? metricPendingLabel : `${fmtNumber(v.direction_accuracy_pct, 2)}%`],
     ['Direction accuracy hint', accuracyHint],
-    ['MAE', fmtNumber(v.mae)],
-    ['RMSE', fmtNumber(v.rmse)],
-    ['MAPE', v.mape_pct === undefined || v.mape_pct === null ? 'n/a' : `${fmtNumber(v.mape_pct, 3)}%`],
-    ['Expected move', v.max_abs_close_move_pct === undefined || v.max_abs_close_move_pct === null ? 'n/a' : `${fmtNumber(v.max_abs_close_move_pct, 3)}%`],
+    ['Metrics status', metricsStatusNote],
+    ['MAE', v.mae === undefined || v.mae === null ? metricPendingLabel : fmtNumber(v.mae)],
+    ['RMSE', v.rmse === undefined || v.rmse === null ? metricPendingLabel : fmtNumber(v.rmse)],
+    ['MAPE', v.mape_pct === undefined || v.mape_pct === null ? metricPendingLabel : `${fmtNumber(v.mape_pct, 3)}%`],
+    ['Expected move', v.max_abs_close_move_pct === undefined || v.max_abs_close_move_pct === null ? metricPendingLabel : `${fmtNumber(v.max_abs_close_move_pct, 3)}%`],
   ];
 
   const scoreRows = [
@@ -1783,6 +2449,8 @@ function renderValidation(data) {
     ['Support/resistance location', fmtNumber(componentScores.support_resistance, 2)],
   ];
 
+  const scoreStatusHtml = `<div class="tiny-help" style="margin: 8px 0 6px;">${escapeHtml(scoreStatusNote)}</div>`;
+
   const timeframeRows = tf.length
     ? tf.map(row => {
       const snap = row.indicator_snapshot || {};
@@ -1790,6 +2458,7 @@ function renderValidation(data) {
         <td>${escapeHtml(row.timeframe || '')}</td>
         <td>${chip(row.trend || 'NEUTRAL')}</td>
         <td>${row.confirms_candidate ? 'Yes' : 'No'}</td>
+        <td>${escapeHtml(row.alignment_state || 'n/a')}</td>
         <td>${fmtNumber(row.total_timeframe_score, 2)}</td>
         <td>${fmtNumber(snap.rsi14, 2)}</td>
         <td>${fmtNumber(snap.macd_hist, 4)}</td>
@@ -1801,7 +2470,7 @@ function renderValidation(data) {
         <td>${snap.distance_to_resistance_pct === undefined || snap.distance_to_resistance_pct === null ? 'n/a' : `${fmtNumber(snap.distance_to_resistance_pct, 2)}%`}</td>
       </tr>`;
     }).join('')
-    : '<tr><td colspan="12">No higher-timeframe validation rows available.</td></tr>';
+    : '<tr><td colspan="13">No higher-timeframe validation rows available.</td></tr>';
 
   const reasonHtml = (reasonDetails.length || reasonCodes.length)
     ? `<div class="warning-stack">
@@ -1819,6 +2488,8 @@ function renderValidation(data) {
       ${chip(sv.final_signal || v.quality_status || 'PENDING')}
     </div>
 
+    ${validationBannerHtml}
+
     <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
       ${qualityRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
     </tbody></table></div>
@@ -1829,6 +2500,7 @@ function renderValidation(data) {
     </tbody></table></div>
 
     <h3 style="margin-top: 12px;">Score Breakdown</h3>
+    ${scoreStatusHtml}
     <div class="table-wrap"><table><thead><tr><th>Component</th><th>Score</th></tr></thead><tbody>
       ${componentRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
     </tbody></table></div>
@@ -1836,7 +2508,7 @@ function renderValidation(data) {
     <h3 style="margin-top: 12px;">Higher-Timeframe Context</h3>
     <div class="table-wrap"><table><thead>
       <tr>
-        <th>Timeframe</th><th>Trend</th><th>Confirms</th><th>Score</th>
+        <th>Timeframe</th><th>Trend</th><th>Confirms</th><th>State</th><th>Score</th>
         <th>RSI</th><th>MACD Hist</th><th>EMA20</th><th>EMA50</th>
         <th>ATR</th><th>Volume Z</th><th>Dist Support</th><th>Dist Resistance</th>
       </tr>
@@ -1860,6 +2532,8 @@ function renderValidation(data) {
 function renderRisk(data) {
   const hs = data.human_summary || {};
   const v = data.validation || {};
+  const te = data.trade_execution || {};
+  const queue = te.queue || {};
 
   $('risk').innerHTML = `
     <div class="panel-head">
@@ -1878,7 +2552,336 @@ function renderRisk(data) {
       <tr><td>Confidence</td><td>${hs.confidence_pct === null || hs.confidence_pct === undefined ? 'n/a' : `${fmtNumber(hs.confidence_pct, 2)}%`}</td></tr>
       <tr><td>Expected Move</td><td>${v.max_abs_close_move_pct === undefined || v.max_abs_close_move_pct === null ? 'n/a' : `${fmtNumber(v.max_abs_close_move_pct, 3)}%`}</td></tr>
       <tr><td>Cost Warning</td><td>${v.movement_after_cost_warning ? 'Yes' : 'No'}</td></tr>
+      <tr><td>Execution Queue</td><td>${escapeHtml(JSON.stringify(queue.counts || {}))}</td></tr>
+      <tr><td>Broker Execution Health</td><td>${te.ok ? 'OK' : escapeHtml(te.error || 'Unavailable')}</td></tr>
     </tbody></table></div>`;
+}
+
+function readTradeExecutionFiltersFromUi() {
+  tradeExecutionFilters = {
+    lifecycle: String($('tradeLifecycleFilter')?.value || '').toUpperCase(),
+    status: String($('tradeStatusFilter')?.value || '').toUpperCase(),
+    outcome: String($('tradeOutcomeFilter')?.value || '').toUpperCase(),
+    side: String($('tradeSideFilter')?.value || '').toUpperCase(),
+    signalId: String($('tradeSignalFilter')?.value || '').trim(),
+    transactionId: String($('tradeTransactionFilter')?.value || '').trim(),
+  };
+}
+
+function tradeFilterOption(value, label, selectedValue) {
+  const selected = String(selectedValue || '').toUpperCase() === String(value || '').toUpperCase() ? ' selected' : '';
+  return `<option value="${escapeHtml(value)}"${selected}>${escapeHtml(label || value || 'All')}</option>`;
+}
+
+function tradeFilterOptions(rows, key) {
+  return [...new Set(rows.map(row => String(row[key] || '').toUpperCase()).filter(Boolean))].sort();
+}
+
+function normalizeTradeExecutionRows(active, pending, historical, queueEntries) {
+  const tradeRow = (trade, lifecycle) => ({
+    source: 'TRADE',
+    lifecycle,
+    record_id: trade.id,
+    signal_id: trade.signal_id || '',
+    created_at: trade.created_at || '',
+    updated_at: trade.updated_at || '',
+    status: String(trade.status || 'PENDING').toUpperCase(),
+    signal_status: String(trade.signal_status || '').toUpperCase(),
+    signal_label: trade.signal_label || '',
+    validation_status: trade.validation_status || '',
+    transaction_id: trade.transaction_id || '',
+    transaction_lookup_status: trade.transaction_lookup_status || '',
+    transaction_lookup_error: trade.transaction_lookup_error || '',
+    trade_outcome: String(trade.trade_outcome || '').toUpperCase(),
+    trade_outcome_reason: trade.trade_outcome_reason || '',
+    trade_close_source: trade.trade_close_source || '',
+    trade_close_level: trade.trade_close_level,
+    trade_outcome_lookup_error: trade.trade_outcome_lookup_error || '',
+    epic: trade.epic || '',
+    direction: String(trade.direction || '').toUpperCase(),
+    requested_size: trade.requested_size,
+    executed_size: trade.executed_size,
+    recommended_entry: trade.recommended_entry,
+    actual_entry: trade.actual_entry,
+    take_profit: trade.take_profit,
+    stop_loss: trade.stop_loss,
+    deal_reference: trade.deal_reference || '',
+    deal_id: trade.deal_id || '',
+    requested_by: '',
+    attempt_count: '',
+    next_attempt_at: '',
+    failure_reason: trade.failure_reason || trade.broker_rejection_reason || '',
+    error_details: trade.error_details || trade.broker_rejection_reason || '',
+    sort_ms: parseTs(trade.updated_at || trade.created_at)?.getTime() || 0,
+  });
+  const queueRow = entry => ({
+    source: 'QUEUE',
+    lifecycle: 'QUEUE',
+    record_id: entry.id,
+    signal_id: entry.signal_id || '',
+    created_at: entry.created_at || '',
+    updated_at: entry.updated_at || '',
+    status: String(entry.status || 'QUEUED').toUpperCase(),
+    signal_status: String(entry.signal_status || '').toUpperCase(),
+    signal_label: entry.signal_label || '',
+    validation_status: entry.validation_status || '',
+    epic: entry.epic || entry.symbol || '',
+    direction: String(entry.direction || '').toUpperCase(),
+    requested_size: entry.requested_size,
+    executed_size: '',
+    recommended_entry: entry.recommended_entry,
+    actual_entry: '',
+    take_profit: entry.take_profit,
+    stop_loss: entry.stop_loss,
+    deal_reference: '',
+    deal_id: '',
+    requested_by: entry.requested_by || '',
+    attempt_count: entry.attempt_count ?? 0,
+    next_attempt_at: entry.next_attempt_at || '',
+    failure_reason: entry.failure_reason || '',
+    error_details: entry.error_details || '',
+    sort_ms: parseTs(entry.updated_at || entry.created_at || entry.next_attempt_at)?.getTime() || 0,
+  });
+
+  return [
+    ...active.map(row => tradeRow(row, 'ACTIVE')),
+    ...pending.map(row => tradeRow(row, 'PENDING')),
+    ...queueEntries.map(queueRow),
+    ...historical.map(row => tradeRow(row, 'HISTORICAL')),
+  ].sort((a, b) => b.sort_ms - a.sort_ms);
+}
+
+function filterTradeExecutionRows(rows) {
+  const lifecycle = String(tradeExecutionFilters.lifecycle || '').toUpperCase();
+  const status = String(tradeExecutionFilters.status || '').toUpperCase();
+  const outcome = String(tradeExecutionFilters.outcome || '').toUpperCase();
+  const side = String(tradeExecutionFilters.side || '').toUpperCase();
+  const signalNeedle = String(tradeExecutionFilters.signalId || '').toLowerCase();
+  const transactionNeedle = String(tradeExecutionFilters.transactionId || '').toLowerCase();
+
+  return rows.filter(row => {
+    if (lifecycle && row.lifecycle !== lifecycle) return false;
+    if (status && row.status !== status) return false;
+    if (outcome && row.trade_outcome !== outcome) return false;
+    if (side && row.direction !== side) return false;
+    if (signalNeedle) {
+      const haystack = `${row.signal_id || ''} ${row.record_id ?? ''}`.toLowerCase();
+      if (!haystack.includes(signalNeedle)) return false;
+    }
+    if (transactionNeedle) {
+      const haystack = `${row.transaction_id || ''}`.toLowerCase();
+      if (!haystack.includes(transactionNeedle)) return false;
+    }
+    return true;
+  });
+}
+
+function tradeExecutionReason(row) {
+  const reason = String(row.failure_reason || '').trim();
+  const details = String(row.error_details || '').trim();
+  const reasonText = details || reason;
+  const isMarketClosed = reason === 'MarketNotTradeableError' || /not\s+TRADEABLE|market.*closed/i.test(reasonText);
+  if (isMarketClosed) {
+    const base = reasonText && reasonText !== 'MarketNotTradeableError'
+      ? reasonText.replace(/\.$/, '')
+      : 'Capital.com market is closed or not currently tradeable';
+    const retryText = row.next_attempt_at
+      ? `Retry scheduled ${fmtDate(row.next_attempt_at)}`
+      : 'Queued for retry';
+    return `${base}. ${retryText}.`;
+  }
+  return reasonText;
+}
+
+function tradeTransactionText(row) {
+  if (row.source !== 'TRADE') return '';
+  if (!row.deal_id) return 'n/a';
+  if (row.transaction_id) return row.transaction_id;
+  if (row.transaction_lookup_error) return 'lookup error';
+  if (row.transaction_lookup_status) return row.transaction_lookup_status.toLowerCase();
+  return 'not found';
+}
+
+function tradeOutcomeHtml(row) {
+  if (row.source !== 'TRADE') return '<span class="muted">n/a</span>';
+  const outcome = row.trade_outcome || (row.status === 'CLOSED' ? 'UNKNOWN' : row.status || 'PENDING');
+  const detail = row.trade_close_source
+    ? `Source ${row.trade_close_source}${row.trade_close_level ? ` @ ${fmtNumber(row.trade_close_level)}` : ''}`
+    : (row.trade_outcome_reason || row.trade_outcome_lookup_error || '');
+  return `${chip(outcome)}${detail ? `<br><span class="muted">${escapeHtml(detail)}</span>` : ''}`;
+}
+
+function tradeOutcomeCounts(rows) {
+  const counts = { WIN: 0, LOSS: 0, UNKNOWN: 0, OPEN: 0, OTHER: 0, total: 0 };
+  rows.forEach(row => {
+    if (row.source !== 'TRADE') return;
+    counts.total += 1;
+    const outcome = String(row.trade_outcome || (row.status === 'CLOSED' ? 'UNKNOWN' : row.status || 'UNKNOWN')).toUpperCase();
+    if (Object.prototype.hasOwnProperty.call(counts, outcome)) {
+      counts[outcome] += 1;
+    } else {
+      counts.OTHER += 1;
+    }
+  });
+  return counts;
+}
+
+function formatSignedCount(value) {
+  const number = Number(value || 0);
+  return `${number > 0 ? '+' : ''}${fmtCount(number)}`;
+}
+
+function tradeExecutionTableRows(rows) {
+  if (!rows.length) {
+    return '<tr><td colspan="16"><div class="empty">No trade execution records match the selected filters.</div></td></tr>';
+  }
+
+  return rows.map(row => {
+    const isTrade = row.source === 'TRADE';
+    const hasActualEntry = row.actual_entry !== undefined && row.actual_entry !== null && row.actual_entry !== '';
+    const sizeText = isTrade
+      ? `${fmtNumber(row.requested_size)} / ${fmtNumber(row.executed_size)}`
+      : `${fmtNumber(row.requested_size)} / n/a`;
+    const entryText = isTrade
+      ? `${fmtNumber(row.recommended_entry)} / ${hasActualEntry ? fmtNumber(row.actual_entry) : 'not filled'}`
+      : `${fmtNumber(row.recommended_entry)} / n/a`;
+    const levelsText = `${fmtNumber(row.take_profit)} / ${fmtNumber(row.stop_loss)}`;
+    const referenceHtml = isTrade
+      ? `${escapeHtml(row.deal_reference || '')}<br><span class="muted">${escapeHtml(row.deal_id || '')}</span>`
+      : `${escapeHtml(row.requested_by || 'manual/auto')}<br><span class="muted">${escapeHtml(row.attempt_count)} attempts</span>`;
+    const timingHtml = isTrade
+      ? `${fmtDate(row.updated_at || row.created_at)}<br><span class="muted">Created ${fmtDate(row.created_at)}</span>`
+      : `${fmtDate(row.next_attempt_at)}<br><span class="muted">Updated ${fmtDate(row.updated_at || row.created_at)}</span>`;
+    const actionButtons = [];
+    if (isTrade && row.status === 'OPEN') {
+      actionButtons.push(`<button class="mini-copy" data-force-close="${escapeHtml(row.record_id ?? '')}">Force Close</button>`);
+    }
+    const actionHtml = actionButtons.join('<br>');
+
+    return `<tr>
+      <td>${chip(row.lifecycle)}</td>
+      <td>${escapeHtml(row.source)} #${escapeHtml(row.record_id ?? '')}</td>
+      <td>${escapeHtml(row.signal_id || '')}<br><span class="muted">${fmtDate(row.created_at)}</span></td>
+      <td>${chip(row.status || 'PENDING')}</td>
+      <td>${tradeOutcomeHtml(row)}</td>
+      <td>${chip(row.signal_status || 'n/a')}<br><span class="muted">${escapeHtml(row.signal_label || row.validation_status || '')}</span></td>
+      <td>${escapeHtml(row.epic || '')}</td>
+      <td>${escapeHtml(row.direction || '')}</td>
+      <td>${sizeText}</td>
+      <td>${entryText}</td>
+      <td>${levelsText}</td>
+      <td>${referenceHtml}</td>
+      <td>${escapeHtml(tradeTransactionText(row))}</td>
+      <td>${timingHtml}</td>
+      <td>${escapeHtml(tradeExecutionReason(row) || row.transaction_lookup_error || '')}</td>
+      <td>${actionHtml}</td>
+    </tr>`;
+  }).join('');
+}
+
+function renderTrades(data) {
+  const te = data.trade_execution || {};
+  const queue = te.queue || {};
+  const trades = te.trades || [];
+  const active = te.active_trades || trades.filter(t => ['OPEN', 'CLOSE_REQUESTED'].includes(String(t.status || '').toUpperCase()));
+  const pending = te.pending_trades || trades.filter(t => ['PENDING', 'SUBMITTED'].includes(String(t.status || '').toUpperCase()));
+  const historical = te.historical_trades || trades.filter(t => !['OPEN', 'CLOSE_REQUESTED', 'PENDING', 'SUBMITTED'].includes(String(t.status || '').toUpperCase()));
+  const queueEntries = queue.entries || [];
+  const allRows = normalizeTradeExecutionRows(active, pending, historical, queueEntries);
+  const filteredRows = filterTradeExecutionRows(allRows);
+  const allOutcomeCounts = tradeOutcomeCounts(allRows);
+  const filteredOutcomeCounts = tradeOutcomeCounts(filteredRows);
+  const outcomeKpiSub = key => `${fmtCount(filteredOutcomeCounts[key] || 0)} filtered / ${fmtCount(allOutcomeCounts[key] || 0)} loaded`;
+  const filteredOutcomePnl = (filteredOutcomeCounts.WIN || 0) - (filteredOutcomeCounts.LOSS || 0);
+  const allOutcomePnl = (allOutcomeCounts.WIN || 0) - (allOutcomeCounts.LOSS || 0);
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / TRADE_EXECUTION_PAGE_SIZE));
+  tradeExecutionPage = Math.min(Math.max(1, Number(tradeExecutionPage || 1)), totalPages);
+  const pageStart = (tradeExecutionPage - 1) * TRADE_EXECUTION_PAGE_SIZE;
+  const pageRows = filteredRows.slice(pageStart, pageStart + TRADE_EXECUTION_PAGE_SIZE);
+  const statusOptions = tradeFilterOptions(allRows, 'status')
+    .map(status => tradeFilterOption(status, status, tradeExecutionFilters.status))
+    .join('');
+  const outcomeOptions = tradeFilterOptions(allRows, 'trade_outcome')
+    .filter(outcome => ['WIN', 'LOSS', 'OPEN', 'UNKNOWN'].includes(outcome))
+    .map(outcome => tradeFilterOption(outcome, outcome, tradeExecutionFilters.outcome))
+    .join('');
+  const sideOptions = tradeFilterOptions(allRows, 'direction')
+    .map(side => tradeFilterOption(side, side, tradeExecutionFilters.side))
+    .join('');
+
+  $('trades').innerHTML = `
+    <div class="panel-head">
+      <div>
+        <h2>Executed Signals</h2>
+        <p>Capital.com demo executions, queue requests, transaction IDs, and historical outcomes in one filtered table.</p>
+      </div>
+      ${chip(te.ok ? 'Execution API OK' : te.error || 'Execution unavailable')}
+    </div>
+    <div class="kpi-grid" style="margin-bottom: 12px;">
+      ${kpi('Active Trades', fmtCount(active.length), 'OPEN / close requested')}
+      ${kpi('Pending Trades', fmtCount(pending.length), 'PENDING / submitted')}
+      ${kpi('Queue Requests', fmtCount(queueEntries.length), JSON.stringify(queue.counts || {}))}
+      ${kpi('Historical Trades', fmtCount(historical.length), 'Closed, failed, rejected')}
+    </div>
+    <div class="kpi-grid" style="margin-bottom: 12px;">
+      ${kpi('Outcome Wins', fmtCount(filteredOutcomeCounts.WIN), outcomeKpiSub('WIN'))}
+      ${kpi('Outcome Losses', fmtCount(filteredOutcomeCounts.LOSS), outcomeKpiSub('LOSS'))}
+      ${kpi('Outcome PNL', formatSignedCount(filteredOutcomePnl), `${formatSignedCount(filteredOutcomePnl)} filtered / ${formatSignedCount(allOutcomePnl)} loaded`)}
+      ${kpi('Unknown Outcomes', fmtCount(filteredOutcomeCounts.UNKNOWN), outcomeKpiSub('UNKNOWN'))}
+      ${kpi('Open Outcomes', fmtCount(filteredOutcomeCounts.OPEN), outcomeKpiSub('OPEN'))}
+    </div>
+
+    <div class="control-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 10px;">
+      <label class="field">Lifecycle
+        <select id="tradeLifecycleFilter">
+          ${tradeFilterOption('', 'All lifecycle states', tradeExecutionFilters.lifecycle)}
+          ${tradeFilterOption('ACTIVE', 'Active trades', tradeExecutionFilters.lifecycle)}
+          ${tradeFilterOption('PENDING', 'Pending trades', tradeExecutionFilters.lifecycle)}
+          ${tradeFilterOption('QUEUE', 'Execution queue', tradeExecutionFilters.lifecycle)}
+          ${tradeFilterOption('HISTORICAL', 'Historical trades', tradeExecutionFilters.lifecycle)}
+        </select>
+      </label>
+      <label class="field">Status
+        <select id="tradeStatusFilter">
+          ${tradeFilterOption('', 'All statuses', tradeExecutionFilters.status)}
+          ${statusOptions}
+        </select>
+      </label>
+      <label class="field">Outcome
+        <select id="tradeOutcomeFilter">
+          ${tradeFilterOption('', 'All outcomes', tradeExecutionFilters.outcome)}
+          ${outcomeOptions || `${tradeFilterOption('WIN', 'WIN', tradeExecutionFilters.outcome)}${tradeFilterOption('LOSS', 'LOSS', tradeExecutionFilters.outcome)}`}
+        </select>
+      </label>
+      <label class="field">Side
+        <select id="tradeSideFilter">
+          ${tradeFilterOption('', 'All sides', tradeExecutionFilters.side)}
+          ${sideOptions}
+        </select>
+      </label>
+      <label class="field">Signal / Record ID
+        <input id="tradeSignalFilter" value="${escapeHtml(tradeExecutionFilters.signalId)}" autocomplete="off">
+      </label>
+      <label class="field">Transaction ID
+        <input id="tradeTransactionFilter" value="${escapeHtml(tradeExecutionFilters.transactionId)}" autocomplete="off">
+      </label>
+    </div>
+    <div class="signal-table-footer" style="margin-bottom: 10px;">
+      <div class="signal-pagination-left">
+        <span class="chip info">${fmtCount(filteredRows.length)} of ${fmtCount(allRows.length)} records</span>
+        <span class="chip">Page ${fmtCount(tradeExecutionPage)} / ${fmtCount(totalPages)}</span>
+        <span class="muted">Showing ${filteredRows.length ? fmtCount(pageStart + 1) : 0}-${fmtCount(Math.min(pageStart + pageRows.length, filteredRows.length))} of ${fmtCount(filteredRows.length)}</span>
+        <button id="tradeApply" class="btn-alt" style="min-height: 34px; padding: 6px 10px;">Apply Filters</button>
+        <button id="tradeReset" class="btn-warn" style="min-height: 34px; padding: 6px 10px;">Reset Filters</button>
+      </div>
+      <div class="signal-pagination-right">
+        <button id="tradePrev" class="btn-alt" ${tradeExecutionPage <= 1 ? 'disabled' : ''} style="min-height: 34px; padding: 6px 10px;">Prev</button>
+        <div class="signal-pagination-pages">${buildTradePaginationButtons(tradeExecutionPage, totalPages)}</div>
+        <button id="tradeNext" class="btn-alt" ${tradeExecutionPage >= totalPages ? 'disabled' : ''} style="min-height: 34px; padding: 6px 10px;">Next</button>
+      </div>
+    </div>
+
+    <div class="table-wrap"><table><thead><tr><th>Lifecycle</th><th>Record</th><th>Signal</th><th>Status</th><th>Outcome</th><th>Signal Status</th><th>Epic</th><th>Side</th><th>Req / Exec Size</th><th>Signal / Actual Entry</th><th>TP / SL</th><th>Broker / Queue Ref</th><th>Transaction ID</th><th>Timing</th><th>Reason</th><th>Action</th></tr></thead><tbody>${tradeExecutionTableRows(pageRows)}</tbody></table></div>`;
 }
 
 function renderBaselines(data) {
@@ -1952,6 +2955,12 @@ function renderActiveTabContent(options = {}) {
   }
   if (activeTab === 'risk') {
     renderRisk(latest);
+    return;
+  }
+  if (activeTab === 'trades') {
+    if (!isTradeExecutionFilterInteracting()) {
+      renderTrades(latest);
+    }
     return;
   }
   if (activeTab === 'baselines') {
@@ -2194,7 +3203,10 @@ async function postJson(url, payload = {}, options = {}) {
       throw new Error(message);
     }
     if (!silent) {
-      $('log').textContent = data.output || data.error || JSON.stringify(data, null, 2);
+      const logEl = $('log');
+      if (logEl) {
+        logEl.textContent = data.output || data.error || JSON.stringify(data, null, 2);
+      }
     }
     if (data.report_url) {
       $('reportFrame').src = data.report_url;
@@ -2286,6 +3298,70 @@ document.addEventListener('click', async event => {
     showToast(`Selected run ${selectedRunId}`);
   }
 
+  if (target.dataset.executeSignal) {
+    const signalId = String(target.dataset.executeSignal || '').trim();
+    if (signalId) {
+      try {
+        const result = await postJson('/api/trade-execution/execute-signal', { signal_id: signalId }, { loaderText: 'Executing demo trade...' });
+        const tradeStatus = result.trade?.status || result.status || 'submitted';
+        showToast(result.message || `Demo execution ${tradeStatus}`);
+        refreshStatus({ background: true });
+      } catch (err) {
+        showToast(`Execution failed: ${err.message}`);
+      }
+    }
+  }
+
+  if (target.dataset.forceClose) {
+    const executedTradeId = Number(target.dataset.forceClose || 0);
+    if (executedTradeId > 0) {
+      try {
+        const result = await postJson('/api/trade-execution/force-close', { executed_trade_id: executedTradeId }, { loaderText: 'Closing demo trade...' });
+        showToast(result.message || 'Force close submitted');
+      } catch (err) {
+        showToast(`Force close failed: ${err.message}`);
+      }
+    }
+  }
+
+  if (target.id === 'tradeApply') {
+    readTradeExecutionFiltersFromUi();
+    tradeExecutionPage = 1;
+    renderTrades(latest);
+  }
+
+  if (target.id === 'tradeReset') {
+    tradeExecutionFilters = {
+      lifecycle: '',
+      status: '',
+      outcome: '',
+      side: '',
+      signalId: '',
+      transactionId: '',
+    };
+    tradeExecutionPage = 1;
+    renderTrades(latest);
+  }
+
+  if (target.id === 'tradePrev') {
+    tradeExecutionPage = Math.max(1, tradeExecutionPage - 1);
+    renderTrades(latest);
+  }
+
+  if (target.id === 'tradeNext') {
+    tradeExecutionPage += 1;
+    renderTrades(latest);
+  }
+
+  const numberedTradePageButton = target.closest('[data-trade-page]');
+  if (numberedTradePageButton instanceof HTMLElement) {
+    const page = Number(numberedTradePageButton.dataset.tradePage || 0);
+    if (Number.isFinite(page) && page >= 1) {
+      tradeExecutionPage = page;
+      renderTrades(latest);
+    }
+  }
+
   if (target.id === 'signalsApply') {
     readSignalFiltersFromUi();
     signalPage = 1;
@@ -2342,6 +3418,13 @@ document.addEventListener('change', async event => {
   const target = event.target;
   if (!target || !(target instanceof HTMLElement)) return;
 
+  if (TRADE_FILTER_AUTO_APPLY_IDS.has(target.id)) {
+    readTradeExecutionFiltersFromUi();
+    tradeExecutionPage = 1;
+    renderTrades(latest);
+    return;
+  }
+
   if (SIGNAL_FILTER_AUTO_APPLY_IDS.has(target.id)) {
     readSignalFiltersFromUi();
     signalPage = 1;
@@ -2361,6 +3444,15 @@ document.addEventListener('change', async event => {
 document.addEventListener('input', event => {
   const target = event.target;
   if (!target || !(target instanceof HTMLElement)) return;
+  if (target.id === 'tradeSignalFilter' || target.id === 'tradeTransactionFilter') {
+    if (target.id === 'tradeSignalFilter') {
+      tradeExecutionFilters.signalId = target.value;
+    } else {
+      tradeExecutionFilters.transactionId = target.value;
+    }
+    return;
+  }
+
   if (target.id !== 'signalsSignalId') return;
 
   readSignalFiltersFromUi();
@@ -2374,6 +3466,17 @@ document.addEventListener('input', event => {
 document.addEventListener('focusout', event => {
   const target = event.target;
   if (!target || !(target instanceof HTMLElement)) return;
+  if (TRADE_FILTER_CONTROL_IDS.has(target.id)) {
+    setTimeout(() => {
+      if (activeTab === 'trades' && !isTradeExecutionFilterInteracting()) {
+        readTradeExecutionFiltersFromUi();
+        tradeExecutionPage = 1;
+        renderTrades(latest);
+      }
+    }, 0);
+    return;
+  }
+
   if (!SIGNAL_FILTER_CONTROL_IDS.has(target.id)) return;
   setTimeout(() => {
     if (activeTab === 'overview' && !isSignalsFilterInteracting()) {
@@ -2383,7 +3486,34 @@ document.addEventListener('focusout', event => {
 });
 
 document.addEventListener('keydown', async event => {
+  const target = event.target;
+  if (event.key === 'Enter' && target instanceof HTMLElement && TRADE_FILTER_CONTROL_IDS.has(target.id)) {
+    readTradeExecutionFiltersFromUi();
+    tradeExecutionPage = 1;
+    renderTrades(latest);
+    return;
+  }
+
   if (event.key !== 'Escape') return;
+  if (activeTab === 'trades') {
+    const active = document.activeElement;
+    if (active && ['INPUT', 'TEXTAREA', 'SELECT'].includes(active.tagName)) {
+      active.blur();
+    }
+    tradeExecutionFilters = {
+      lifecycle: '',
+      status: '',
+      outcome: '',
+      side: '',
+      signalId: '',
+      transactionId: '',
+    };
+    tradeExecutionPage = 1;
+    renderTrades(latest);
+    showToast('Trade filters reset');
+    return;
+  }
+
   const overviewPanel = $('overview');
   if (!overviewPanel || overviewPanel.classList.contains('hidden')) return;
   const active = document.activeElement;

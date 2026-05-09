@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import sys
 import tempfile
 import types
@@ -112,13 +113,13 @@ class HistoricalRangePersistenceTests(unittest.TestCase):
                 ]
             )
 
-            with (
-                patch("main_fetch_historical_range.load_settings", return_value=fake_settings),
-                patch("main_fetch_historical_range.CapitalRestClient", return_value=fake_client),
-                patch("main_fetch_historical_range.save_kronos_csv"),
-                patch("main_fetch_historical_range.upsert_instrument") as mocked_upsert_instrument,
-                patch("main_fetch_historical_range.upsert_ohlcv_df", return_value=2) as mocked_upsert_ohlcv,
-                patch(
+            with contextlib.ExitStack() as _stack:
+                _stack.enter_context(patch("main_fetch_historical_range.load_settings", return_value=fake_settings))
+                _stack.enter_context(patch("main_fetch_historical_range.CapitalRestClient", return_value=fake_client))
+                _stack.enter_context(patch("main_fetch_historical_range.save_kronos_csv"))
+                mocked_upsert_instrument = _stack.enter_context(patch("main_fetch_historical_range.upsert_instrument"))
+                mocked_upsert_ohlcv = _stack.enter_context(patch("main_fetch_historical_range.upsert_ohlcv_df", return_value=2))
+                _stack.enter_context(patch(
                     "sys.argv",
                     [
                         "prog",
@@ -135,8 +136,7 @@ class HistoricalRangePersistenceTests(unittest.TestCase):
                         "--postgres-dsn",
                         "postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos",
                     ],
-                ),
-            ):
+                ))
                 main_fetch_historical_range.main()
 
         mocked_upsert_instrument.assert_called_once()

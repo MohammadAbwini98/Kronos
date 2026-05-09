@@ -5,11 +5,13 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 import time
 
 import pandas as pd
 
+from candle_context import resolution_to_timedelta
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
 from data_quality import analyze_ohlcv_quality, grade_meets_minimum, persist_prediction_run_quality
@@ -40,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--env", default="demo", choices=["demo", "live"])
     parser.add_argument("--feature-set", default="auto", choices=["auto", "ohlc", "ohlcv", "ohlcva"])
     parser.add_argument("--repair-ohlc", action="store_true", help="Repair forecast high/low if raw Kronos output violates OHLC envelope.")
-    parser.add_argument("--kronos-python", default=r"C:\AI\Kronos\.venv\Scripts\python.exe")
+    parser.add_argument("--kronos-python", default=sys.executable)
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--symbol", default=None, help="Configured dashboard/signal symbol. Defaults to market.")
     parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN. Defaults to POSTGRES_DSN.")
@@ -53,6 +55,16 @@ def _flag_enabled(name: str, default: bool = True) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _shadow_model_enabled() -> bool:
+    shadow_value = os.getenv("ENABLE_SHADOW_MODEL")
+    if shadow_value is not None:
+        return shadow_value.strip().lower() in {"1", "true", "yes", "on"}
+    auto_finetune_value = os.getenv("ENABLE_AUTO_FINETUNE")
+    if auto_finetune_value is not None:
+        return auto_finetune_value.strip().lower() in {"1", "true", "yes", "on"}
+    return True
 
 
 def _model_ready(path: Path) -> bool:
@@ -207,6 +219,17 @@ def _extract_signal_validation_summary(output_text: str) -> dict[str, object] | 
     }
 
 
+def _closed_candles_only(df: pd.DataFrame, resolution: str, now_utc: pd.Timestamp | None = None) -> pd.DataFrame:
+    if df.empty:
+        return df
+    current = now_utc or pd.Timestamp.now(tz="UTC")
+    cutoff = current - resolution_to_timedelta(resolution)
+    closed = df[df["timestamps"] <= cutoff].copy()
+    if closed.empty:
+        return df
+    return closed.reset_index(drop=True)
+
+
 def main() -> None:
     configure_logging(service_name="forecast_latest")
     args = parse_args()
@@ -260,6 +283,7 @@ def main() -> None:
         epic = selected["epic"]
         symbol = args.symbol or args.market or epic
         market_name = selected.get("instrumentName") or ""
+        input_path = settings.output_dir / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}.csv"
         client.save_market_details(epic)
         log_event(
             LOGGER,
@@ -290,6 +314,24 @@ def main() -> None:
             save_outputs=True,
             min_rows=min(args.lookback, args.max_points, 50),
         )
+        original_rows = len(df)
+        df = _closed_candles_only(df, resolution)
+        dropped_unclosed_rows = max(0, original_rows - len(df))
+        if dropped_unclosed_rows:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.prices.unclosed_dropped",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                dropped_rows=dropped_unclosed_rows,
+            )
+        if df.empty:
+            raise SystemExit("No closed candles available after filtering in-progress data.")
+        # Keep the model input artifact aligned with what is validated and stored.
+        df.to_csv(input_path, index=False)
         log_event(
             LOGGER,
             logging.INFO,
@@ -378,7 +420,6 @@ def main() -> None:
             stored_rows=stored_rows,
         )
 
-        input_path = settings.output_dir / f"kronos_input_{safe_epic_for_filename(epic)}_{resolution}.csv"
         last_input = df["timestamps"].iloc[-1]
         print("\nLatest input fetched")
         print(f"Epic: {epic}")
@@ -567,7 +608,7 @@ def main() -> None:
             )
 
         shadow_model = None if args.disable_shadow_model else _shadow_candidate_model(settings.output_dir)
-        if shadow_model is not None and _flag_enabled("ENABLE_SHADOW_MODEL", True):
+        if shadow_model is not None and _shadow_model_enabled():
             try:
                 _run_shadow_prediction(
                     base_cmd=cmd,

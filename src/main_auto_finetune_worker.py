@@ -56,6 +56,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-dir", default=os.getenv("KRONOS_AUTO_MODEL_DIR", r"C:\AI\Models\Kronos\Kronos-auto-finetuned"))
     parser.add_argument("--status-file", default="output/auto_finetune_status.json")
     parser.add_argument(
+        "--failure-cooldown-minutes",
+        type=int,
+        default=int(os.getenv("AUTO_FINETUNE_FAILURE_COOLDOWN_MINUTES", "360")),
+    )
+    parser.add_argument(
+        "--training-heartbeat-seconds",
+        type=int,
+        default=int(os.getenv("AUTO_FINETUNE_TRAINING_HEARTBEAT_SECONDS", "60")),
+    )
+    parser.add_argument(
         "--promotion-min-direction-accuracy",
         type=float,
         default=float(os.getenv("AUTO_FINETUNE_PROMOTION_MIN_DIRECTION_ACCURACY", "55.0")),
@@ -202,6 +212,71 @@ def _promotion_decision(
     return "pending_evaluation", "candidate_ready_for_evaluation"
 
 
+def _heartbeat_status_for_cycle(latest: dict[str, Any]) -> str:
+    action = str(latest.get("action") or "").lower()
+    reason = str(latest.get("reason") or "").lower()
+    if action == "skip" and reason in {"no_finetune_command_configured", "invalid_finetune_command_template"}:
+        return "PAUSED"
+    if action == "train" and int(latest.get("exit_code") or 0) != 0:
+        return "ERROR"
+    return "OK"
+
+
+def _training_cooldown_until(previous: dict[str, Any], cooldown_minutes: int) -> pd.Timestamp | None:
+    if cooldown_minutes <= 0:
+        return None
+    if str(previous.get("action") or "").lower() != "train":
+        return None
+    if str(previous.get("reason") or "").lower() != "finetune_command_failed":
+        return None
+    try:
+        if int(previous.get("exit_code") or 0) == 0:
+            return None
+    except (TypeError, ValueError):
+        return None
+    finished_at = previous.get("finished_at_utc") or previous.get("last_checked_utc")
+    if not finished_at:
+        return None
+    try:
+        finished_ts = pd.to_datetime(finished_at, utc=True)
+    except Exception:  # noqa: BLE001
+        return None
+    return finished_ts + pd.Timedelta(minutes=max(0, int(cooldown_minutes)))
+
+
+def _run_command_with_training_heartbeat(
+    *,
+    command: str,
+    heartbeat_details: dict[str, Any],
+    dsn: str | None,
+    heartbeat_interval_seconds: int,
+) -> subprocess.CompletedProcess[str]:
+    interval = max(1, int(heartbeat_interval_seconds))
+    started = time.monotonic()
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    while True:
+        try:
+            stdout, stderr = process.communicate(timeout=interval)
+            return subprocess.CompletedProcess(command, int(process.returncode or 0), stdout, stderr)
+        except subprocess.TimeoutExpired:
+            details = dict(heartbeat_details)
+            details.update(
+                {
+                    "state": "training",
+                    "current_operation": "finetune_command",
+                    "elapsed_seconds": int(time.monotonic() - started),
+                    "checked_at_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+                }
+            )
+            _heartbeat("TRAINING", details, dsn)
+
+
 def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) -> None:
     now_utc = pd.Timestamp.now(tz="UTC").isoformat()
     model_dir = Path(args.model_dir)
@@ -311,6 +386,7 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
     if model_is_ready:
         try:
             registered = register_model_version(
+                model_version_id=model_dir.name,
                 model_name="Kronos-auto-finetuned",
                 model_path=str(model_dir),
                 symbol=args.symbol,
@@ -362,6 +438,22 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
         _write_status(status_path, status)
         return
 
+    cooldown_until = _training_cooldown_until(previous, int(args.failure_cooldown_minutes))
+    if cooldown_until is not None and pd.Timestamp.now(tz="UTC") < cooldown_until:
+        status.update(
+            {
+                "action": "skip",
+                "reason": "finetune_failure_cooldown",
+                "cooldown_until_utc": cooldown_until.isoformat(),
+                "last_failure_reason": previous.get("reason"),
+                "last_failure_exit_code": previous.get("exit_code"),
+                "last_failure_finished_at_utc": previous.get("finished_at_utc"),
+                "last_trained_rows": previous_rows,
+            }
+        )
+        _write_status(status_path, status)
+        return
+
     if (row_count - previous_rows) < args.min_new_rows and model_is_ready:
         status.update(
             {
@@ -383,7 +475,52 @@ def _run_cycle(args: argparse.Namespace, output_dir: Path, status_path: Path) ->
         resolution=args.resolution,
     )
     started_utc = pd.Timestamp.now(tz="UTC").isoformat()
-    result = subprocess.run(rendered, shell=True, text=True, capture_output=True)
+    status.update(
+        {
+            "action": "train",
+            "reason": "training_running",
+            "command": rendered,
+            "dataset_path": str(dataset_path),
+            "dataset_window_utc": {
+                "start": df["timestamps"].iloc[0].isoformat(),
+                "end": df["timestamps"].iloc[-1].isoformat(),
+            },
+            "started_at_utc": started_utc,
+            "last_trained_rows": previous_rows,
+        }
+    )
+    _write_status(status_path, status)
+    _heartbeat(
+        "TRAINING",
+        {
+            "state": "training",
+            "action": "train",
+            "reason": "training_running",
+            "symbol": args.symbol,
+            "resolution": args.resolution,
+            "dataset_rows": row_count,
+            "required_dataset_rows": int(args.min_rows),
+            "promotion_progress_pct": status.get("promotion_progress_pct"),
+            "started_at_utc": started_utc,
+            "current_operation": "finetune_command",
+        },
+        args.postgres_dsn,
+    )
+    result = _run_command_with_training_heartbeat(
+        command=rendered,
+        heartbeat_details={
+            "action": "train",
+            "reason": "training_running",
+            "symbol": args.symbol,
+            "resolution": args.resolution,
+            "dataset_rows": row_count,
+            "required_dataset_rows": int(args.min_rows),
+            "promotion_progress_pct": status.get("promotion_progress_pct"),
+            "started_at_utc": started_utc,
+        },
+        dsn=args.postgres_dsn,
+        heartbeat_interval_seconds=int(args.training_heartbeat_seconds),
+    )
     finished_utc = pd.Timestamp.now(tz="UTC").isoformat()
 
     model_is_ready = _model_ready(model_dir)
@@ -471,6 +608,7 @@ def main() -> None:
         try:
             _run_cycle(args, output_dir, status_path)
             latest = _read_status(status_path)
+            heartbeat_status = _heartbeat_status_for_cycle(latest)
             heartbeat_details.update(
                 {
                     "action": latest.get("action"),

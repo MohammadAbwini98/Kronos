@@ -107,6 +107,46 @@ class ShadowValidationSummaryTests(unittest.TestCase):
         self.assertEqual("PENDING", summary["status"])
         self.assertEqual(1, summary["pending"])
 
+    def test_shadow_trade_status_uses_tp_sl_when_signal_context_is_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            forecast_path = Path(temp_dir) / "shadow.csv"
+            pd.DataFrame(
+                [
+                    {
+                        "timestamps": "2026-05-01T00:05:00Z",
+                        "open": 100.0,
+                        "high": 102.0,
+                        "low": 99.0,
+                        "close": 101.5,
+                        "volume": 0.0,
+                        "amount": 0.0,
+                    }
+                ]
+            ).to_csv(forecast_path, index=False)
+            actual_by_ts = {
+                pd.Timestamp("2026-05-01T00:05:00Z").isoformat(): pd.Series(
+                    {"open": 100.0, "high": 99.8, "low": 98.8, "close": 99.0}
+                ),
+            }
+
+            summary = prediction_store._shadow_validation_summary(
+                forecast_csv_path=forecast_path,
+                actual_by_ts=actual_by_ts,
+                last_input_close=100.0,
+                flat_threshold_pct=0.02,
+                signal="LONG",
+                entry_price=100.0,
+                tp_price=102.0,
+                sl_price=99.0,
+                cost_threshold_pct=0.05,
+                forecast_end_timestamp_utc="2026-05-01T00:05:00Z",
+            )
+
+        self.assertEqual("LOSS", summary["status"])
+        self.assertEqual(0, summary["wins"])
+        self.assertEqual(1, summary["losses"])
+        self.assertEqual("LOSS", summary["trade_outcome"]["status"])
+
 
 class SignalStatusPrimaryWindowTests(unittest.TestCase):
     def test_uses_first_horizon_status_only(self):

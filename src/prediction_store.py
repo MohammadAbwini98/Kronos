@@ -15,9 +15,11 @@ from forecast_scoring import (
     DEFAULT_COST_THRESHOLD_PCT,
     DEFAULT_FLAT_THRESHOLD_PCT,
     DEFAULT_SCORING_VERSION,
+    DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
     direction_from_prices,
     score_forecast_against_actuals,
     score_signal_quality,
+    score_trade_signal_outcome,
     signal_status_from_counts,
 )
 from model_registry import associate_run_model_version, model_version_id_for_path, register_model_version
@@ -34,6 +36,8 @@ SOURCE_PRIORITY = {
     "latest_fetch": 2,
     "websocket_ohlc": 3,
 }
+ACTIONABLE_VALIDATION_SIGNALS = {"LONG", "SHORT", "STRONG_LONG", "STRONG_SHORT", "WEAK_LONG", "WEAK_SHORT"}
+NON_ACTIONABLE_VALIDATION_SIGNALS = {"BLOCKED", "HOLD", "WATCH", "VALIDATION_UNAVAILABLE"}
 
 
 class PredictionStoreError(ValueError):
@@ -100,6 +104,34 @@ def preferred_candle_source(existing: str | None, incoming: str | None) -> str:
 
 def _safe_symbol(metadata: dict[str, Any]) -> str:
     return str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD")
+
+
+def _as_validation_summary(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if value is None:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except Exception:  # noqa: BLE001
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _validation_gated_trade_signal(signal_row: Any) -> tuple[str, str | None]:
+    candidate = str((signal_row or {}).get("signal") or "HOLD").upper()
+    validation_status = str((signal_row or {}).get("validation_status") or "").strip().upper()
+    summary = _as_validation_summary((signal_row or {}).get("validation_summary"))
+    final_signal = str(summary.get("final_signal") or validation_status).strip().upper()
+
+    if final_signal in ACTIONABLE_VALIDATION_SIGNALS:
+        if "LONG" in final_signal:
+            return "LONG", final_signal
+        if "SHORT" in final_signal:
+            return "SHORT", final_signal
+    if final_signal in NON_ACTIONABLE_VALIDATION_SIGNALS:
+        return "HOLD", final_signal
+    return candidate, None
 
 
 def run_id_from_metadata_path(metadata_path: str | Path) -> str:
@@ -699,9 +731,9 @@ def save_prediction_run(
                 INSERT INTO signals(
                     run_id, signal_id, symbol, epic, resolution, timestamp_utc, signal, direction, confidence,
                     expected_move_pct, cost_threshold_pct, entry_price, tp_price, sl_price,
-                    scoring_version, actionable, quality_grade, status, reason, updated_at
+                    scoring_version, actionable, quality_grade, outcome_policy_version, status, reason, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', %s, now())
                 ON CONFLICT(run_id) DO UPDATE SET
                     signal_id = EXCLUDED.signal_id,
                     signal = EXCLUDED.signal,
@@ -715,6 +747,7 @@ def save_prediction_run(
                     scoring_version = EXCLUDED.scoring_version,
                     actionable = EXCLUDED.actionable,
                     quality_grade = EXCLUDED.quality_grade,
+                    outcome_policy_version = EXCLUDED.outcome_policy_version,
                     status = EXCLUDED.status,
                     reason = EXCLUDED.reason,
                     updated_at = now()
@@ -737,6 +770,7 @@ def save_prediction_run(
                     DEFAULT_SCORING_VERSION,
                     signal["signal"] in {"LONG", "SHORT"},
                     data_quality_grade,
+                    DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
                     signal["reason"],
                 ),
             )
@@ -842,9 +876,9 @@ def save_shadow_prediction(
                     active_run_id, shadow_run_id, model_name, model_path, generated_at_utc,
                     signal, direction, confidence, expected_move_pct, cost_threshold_pct,
                     entry_price, tp_price, sl_price, reason, metadata_path, forecast_csv_path,
-                    validation_report_path, shadow_model_version_id, scoring_version, status, updated_at
+                    validation_report_path, shadow_model_version_id, scoring_version, outcome_policy_version, status, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING', now())
                 ON CONFLICT(active_run_id) DO UPDATE SET
                     shadow_run_id = EXCLUDED.shadow_run_id,
                     model_name = EXCLUDED.model_name,
@@ -864,6 +898,7 @@ def save_shadow_prediction(
                     validation_report_path = EXCLUDED.validation_report_path,
                     shadow_model_version_id = EXCLUDED.shadow_model_version_id,
                     scoring_version = EXCLUDED.scoring_version,
+                    outcome_policy_version = EXCLUDED.outcome_policy_version,
                     status = 'PENDING',
                     outcome_updated_at = NULL,
                     updated_at = now()
@@ -888,6 +923,7 @@ def save_shadow_prediction(
                     str(metadata.get("validation_report_path") or ""),
                     shadow_model_version_id,
                     DEFAULT_SCORING_VERSION,
+                    DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
                 ),
             )
         summary = {
@@ -934,11 +970,26 @@ def _shadow_validation_summary(
     actual_by_ts: dict[str, pd.Series],
     last_input_close: float,
     flat_threshold_pct: float,
+    signal: str | None = None,
+    entry_price: float | None = None,
+    tp_price: float | None = None,
+    sl_price: float | None = None,
+    cost_threshold_pct: float = DEFAULT_COST_THRESHOLD_PCT,
+    forecast_end_timestamp_utc: Any | None = None,
 ) -> dict[str, Any]:
     forecast = _load_ohlcv_csv(forecast_csv_path, "shadow forecast")
     actual = pd.DataFrame(
-        [{"timestamps": timestamp, "close": _safe_float(row["close"])} for timestamp, row in actual_by_ts.items()],
-        columns=["timestamps", "close"],
+        [
+            {
+                "timestamps": timestamp,
+                "open": _safe_float(row.get("open", row["close"])),
+                "high": _safe_float(row.get("high", row["close"])),
+                "low": _safe_float(row.get("low", row["close"])),
+                "close": _safe_float(row["close"]),
+            }
+            for timestamp, row in actual_by_ts.items()
+        ],
+        columns=["timestamps", "open", "high", "low", "close"],
     )
     score = score_forecast_against_actuals(
         forecast,
@@ -947,13 +998,29 @@ def _shadow_validation_summary(
         flat_threshold_pct=flat_threshold_pct,
     )
     summary = score["summary"]
+    trade_outcome = None
+    if signal is not None and entry_price is not None and tp_price is not None and sl_price is not None:
+        trade_outcome = score_trade_signal_outcome(
+            signal=signal,
+            entry_price=float(entry_price),
+            tp_price=float(tp_price),
+            sl_price=float(sl_price),
+            actual_df=actual,
+            cost_threshold_pct=float(cost_threshold_pct),
+            forecast_end_timestamp_utc=forecast_end_timestamp_utc,
+        )
+    status = (trade_outcome or {}).get("status") or summary["status"]
     return {
-        "status": summary["status"],
-        "wins": summary["wins"],
-        "losses": summary["losses"],
+        "status": status,
+        "wins": summary["wins"] if trade_outcome is None else (1 if status == "WIN" else 0),
+        "losses": summary["losses"] if trade_outcome is None else (1 if status == "LOSS" else 0),
         "pending": summary["pending"],
         "validated": summary["validated"],
-        "horizon_metrics": score["rows"],
+        "horizon_metrics": {
+            "forecast_accuracy": score["rows"],
+            "trade_outcome": trade_outcome,
+        },
+        "trade_outcome": trade_outcome,
     }
 
 
@@ -998,8 +1065,8 @@ def _upsert_shadow_evaluation(conn: Any, *, active_run_id: str, shadow_summary: 
     ).fetchone()
     if not row or not row.get("shadow_model_version_id"):
         return
-    # Use persisted signals.status (primary-window semantics) instead of recomputing
-    # from aggregate win/loss counts which use the old aggregate semantics.
+    # Use persisted trade-signal statuses for active and shadow rows. Forecast
+    # horizon win/loss counts remain in prediction_outcomes/forecast_horizon_metrics.
     active_status = str(row.get("active_status") or "PENDING")
     shadow_status = str(shadow_summary.get("status") or row.get("shadow_status") or "PENDING")
     disagreement = str(row.get("active_signal") or "") != str(row.get("shadow_signal") or "")
@@ -1039,8 +1106,8 @@ def _upsert_shadow_evaluation(conn: Any, *, active_run_id: str, shadow_summary: 
             row["shadow_signal"],
             shadow_status,
             disagreement,
-            int(row.get("active_wins") or 0),
-            int(row.get("active_losses") or 0),
+            1 if active_status == "WIN" else 0,
+            1 if active_status == "LOSS" else 0,
             int(shadow_summary.get("wins") or 0),
             int(shadow_summary.get("losses") or 0),
             int(shadow_summary.get("validated") or 0),
@@ -1064,7 +1131,12 @@ def refresh_shadow_prediction_statuses(*, dsn: str | None = None, limit: int = 5
                 r.price_side,
                 r.last_input_close,
                 r.forecast_start_timestamp_utc,
-                r.forecast_end_timestamp_utc
+                r.forecast_end_timestamp_utc,
+                shp.signal,
+                shp.entry_price,
+                shp.tp_price,
+                shp.sl_price,
+                shp.cost_threshold_pct
             FROM signal_shadow_predictions shp
             JOIN prediction_runs r ON r.run_id = shp.active_run_id
             WHERE shp.status = 'PENDING'
@@ -1079,7 +1151,7 @@ def refresh_shadow_prediction_statuses(*, dsn: str | None = None, limit: int = 5
             try:
                 actual_rows = conn.execute(
                     """
-                    SELECT timestamp_utc AS timestamps, close
+                    SELECT timestamp_utc AS timestamps, open, high, low, close
                     FROM ohlcv_candles
                     WHERE symbol = %s
                       AND epic = %s
@@ -1098,12 +1170,28 @@ def refresh_shadow_prediction_statuses(*, dsn: str | None = None, limit: int = 5
                         shadow["forecast_end_timestamp_utc"],
                     ),
                 ).fetchall()
-                actual_by_ts = {_to_utc_iso(row["timestamps"]): pd.Series({"close": row["close"]}) for row in actual_rows}
+                actual_by_ts = {
+                    _to_utc_iso(row["timestamps"]): pd.Series(
+                        {
+                            "open": row["open"],
+                            "high": row["high"],
+                            "low": row["low"],
+                            "close": row["close"],
+                        }
+                    )
+                    for row in actual_rows
+                }
                 summary = _shadow_validation_summary(
                     forecast_csv_path=shadow["forecast_csv_path"],
                     actual_by_ts=actual_by_ts,
                     last_input_close=float(shadow["last_input_close"]),
                     flat_threshold_pct=0.02,
+                    signal=shadow["signal"],
+                    entry_price=float(shadow["entry_price"]),
+                    tp_price=float(shadow["tp_price"]),
+                    sl_price=float(shadow["sl_price"]),
+                    cost_threshold_pct=float(shadow["cost_threshold_pct"]),
+                    forecast_end_timestamp_utc=shadow["forecast_end_timestamp_utc"],
                 )
                 if summary["status"] == "PENDING":
                     pending += 1
@@ -1114,11 +1202,21 @@ def refresh_shadow_prediction_statuses(*, dsn: str | None = None, limit: int = 5
                     SET status = %s,
                         disagreement = (signal <> (SELECT signal FROM signals WHERE signals.run_id = signal_shadow_predictions.active_run_id)),
                         horizon_metrics = %s,
+                        outcome_policy_version = %s,
+                        outcome_reason = %s,
+                        outcome_hit_timestamp_utc = %s,
                         outcome_updated_at = now(),
                         updated_at = now()
                     WHERE active_run_id = %s
                     """,
-                    (summary["status"], Jsonb(summary.get("horizon_metrics") or {}), shadow["active_run_id"]),
+                    (
+                        summary["status"],
+                        Jsonb(summary.get("horizon_metrics") or {}),
+                        (summary.get("trade_outcome") or {}).get("policy_version") or DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
+                        (summary.get("trade_outcome") or {}).get("reason"),
+                        (summary.get("trade_outcome") or {}).get("hit_timestamp_utc"),
+                        shadow["active_run_id"],
+                    ),
                 )
                 _upsert_shadow_evaluation(conn, active_run_id=shadow["active_run_id"], shadow_summary=summary)
                 updated += 1
@@ -1154,7 +1252,12 @@ def update_predictions_with_actuals(
     with connect(dsn) as conn:
         _ensure_scoring_version(conn, scoring_version=scoring_version, flat_threshold_pct=flat_threshold_pct)
         run = conn.execute(
-            "SELECT symbol, epic, resolution, price_side, provider, last_input_close FROM prediction_runs WHERE run_id = %s",
+            """
+            SELECT symbol, epic, resolution, price_side, provider, last_input_close,
+                   forecast_end_timestamp_utc
+            FROM prediction_runs
+            WHERE run_id = %s
+            """,
             (run_id,),
         ).fetchone()
         if not run:
@@ -1340,29 +1443,71 @@ def update_predictions_with_actuals(
             run_status = "VALIDATED"
         else:
             run_status = "PARTIAL"
-        signal_status = _signal_status_for_primary_window(score["rows"])
         conn.execute("UPDATE prediction_runs SET run_status = %s, updated_at = now() WHERE run_id = %s", (run_status, run_id))
         signal_row = conn.execute(
-            "SELECT signal, confidence, expected_move_pct, cost_threshold_pct FROM signals WHERE run_id = %s",
+            """
+             SELECT signal, confidence, expected_move_pct, cost_threshold_pct,
+                 entry_price, tp_price, sl_price, validation_status, validation_summary
+            FROM signals
+            WHERE run_id = %s
+            """,
             (run_id,),
         ).fetchone()
         signal_quality = None
+        trade_outcome = None
+        signal_status = _signal_status_for_primary_window(score["rows"])
         if signal_row:
+            trade_signal, validation_final_signal = _validation_gated_trade_signal(signal_row)
+            candidate_signal = str(signal_row["signal"] or "HOLD").upper()
+            entry_price = float(signal_row["entry_price"] or run["last_input_close"])
+            if signal_row["tp_price"] is None or signal_row["sl_price"] is None:
+                fallback_levels = _trade_levels_from_signal(
+                    entry_price=entry_price,
+                    signal={
+                        "signal": trade_signal,
+                        "expected_move_pct": float(signal_row["expected_move_pct"]),
+                    },
+                    cost_threshold_pct=float(signal_row["cost_threshold_pct"]),
+                )
+                tp_price = fallback_levels["tp_price"]
+                sl_price = fallback_levels["sl_price"]
+            else:
+                tp_price = float(signal_row["tp_price"])
+                sl_price = float(signal_row["sl_price"])
+            trade_outcome = score_trade_signal_outcome(
+                signal=trade_signal,
+                entry_price=entry_price,
+                tp_price=tp_price,
+                sl_price=sl_price,
+                actual_df=actual,
+                cost_threshold_pct=float(signal_row["cost_threshold_pct"]),
+                forecast_end_timestamp_utc=run["forecast_end_timestamp_utc"],
+            )
+            if trade_signal != candidate_signal:
+                gate_reason = (
+                    f"Validation final signal {validation_final_signal or 'UNSPECIFIED'} "
+                    f"overrode candidate {candidate_signal} for outcome scoring."
+                )
+                prior_reason = str(trade_outcome.get("reason") or "").strip()
+                trade_outcome["reason"] = f"{gate_reason} {prior_reason}".strip()
+            signal_status = str(trade_outcome["status"])
             signal_quality = score_signal_quality(
-                signal=signal_row["signal"],
+                signal=trade_signal,
                 confidence=float(signal_row["confidence"]),
                 expected_move_pct=float(signal_row["expected_move_pct"]),
                 cost_threshold_pct=float(signal_row["cost_threshold_pct"]),
                 scoring_summary=score["summary"],
+                trade_outcome=trade_outcome,
             )
             conn.execute(
                 """
                 INSERT INTO signal_quality_metrics(
                     run_id, scoring_version, signal, status, actionable, confidence,
                     expected_move_pct, realized_move_pct, cost_threshold_pct,
-                    movement_after_cost_pct, precision_bucket, false_positive, hold_quality, updated_at
+                    movement_after_cost_pct, precision_bucket, false_positive, hold_quality,
+                    outcome_policy_version, outcome_reason, outcome_hit_timestamp_utc, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
                 ON CONFLICT(run_id) DO UPDATE SET
                     scoring_version = EXCLUDED.scoring_version,
                     signal = EXCLUDED.signal,
@@ -1376,6 +1521,9 @@ def update_predictions_with_actuals(
                     precision_bucket = EXCLUDED.precision_bucket,
                     false_positive = EXCLUDED.false_positive,
                     hold_quality = EXCLUDED.hold_quality,
+                    outcome_policy_version = EXCLUDED.outcome_policy_version,
+                    outcome_reason = EXCLUDED.outcome_reason,
+                    outcome_hit_timestamp_utc = EXCLUDED.outcome_hit_timestamp_utc,
                     updated_at = now()
                 """,
                 (
@@ -1392,6 +1540,9 @@ def update_predictions_with_actuals(
                     signal_quality["precision_bucket"],
                     signal_quality["false_positive"],
                     signal_quality["hold_quality"],
+                    signal_quality["outcome_policy_version"] or DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
+                    signal_quality["outcome_reason"],
+                    signal_quality["outcome_hit_timestamp_utc"],
                 ),
             )
         movement_after_cost = None if signal_quality is None else signal_quality.get("movement_after_cost_pct")
@@ -1404,15 +1555,26 @@ def update_predictions_with_actuals(
             UPDATE signals
             SET movement_after_cost_pct = %s,
                 scoring_version = %s,
-                actionable = signal IN ('LONG','SHORT'),
+                outcome_policy_version = %s,
+                outcome_reason = %s,
+                outcome_hit_timestamp_utc = %s,
+                actionable = %s,
                 updated_at = now()
             WHERE run_id = %s
             """,
-            (movement_after_cost, scoring_version, run_id),
+            (
+                movement_after_cost,
+                scoring_version,
+                (trade_outcome or {}).get("policy_version") or DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
+                (trade_outcome or {}).get("reason"),
+                (trade_outcome or {}).get("hit_timestamp_utc"),
+                bool(signal_quality and signal_quality.get("actionable")),
+                run_id,
+            ),
         )
         shadow = conn.execute(
             """
-            SELECT forecast_csv_path
+            SELECT forecast_csv_path, signal, entry_price, tp_price, sl_price, cost_threshold_pct
             FROM signal_shadow_predictions
             WHERE active_run_id = %s
             """,
@@ -1425,6 +1587,12 @@ def update_predictions_with_actuals(
                     actual_by_ts=actual_by_ts,
                     last_input_close=float(run["last_input_close"]),
                     flat_threshold_pct=flat_threshold_pct,
+                    signal=shadow["signal"],
+                    entry_price=float(shadow["entry_price"]),
+                    tp_price=float(shadow["tp_price"]),
+                    sl_price=float(shadow["sl_price"]),
+                    cost_threshold_pct=float(shadow["cost_threshold_pct"]),
+                    forecast_end_timestamp_utc=run["forecast_end_timestamp_utc"],
                 )
                 conn.execute(
                     """
@@ -1432,11 +1600,21 @@ def update_predictions_with_actuals(
                     SET status = %s,
                         disagreement = (signal <> (SELECT signal FROM signals WHERE signals.run_id = signal_shadow_predictions.active_run_id)),
                         horizon_metrics = %s,
+                        outcome_policy_version = %s,
+                        outcome_reason = %s,
+                        outcome_hit_timestamp_utc = %s,
                         outcome_updated_at = now(),
                         updated_at = now()
                     WHERE active_run_id = %s
                     """,
-                    (shadow_summary["status"], Jsonb(shadow_summary.get("horizon_metrics") or {}), run_id),
+                    (
+                        shadow_summary["status"],
+                        Jsonb(shadow_summary.get("horizon_metrics") or {}),
+                        (shadow_summary.get("trade_outcome") or {}).get("policy_version") or DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
+                        (shadow_summary.get("trade_outcome") or {}).get("reason"),
+                        (shadow_summary.get("trade_outcome") or {}).get("hit_timestamp_utc"),
+                        run_id,
+                    ),
                 )
                 _upsert_shadow_evaluation(conn, active_run_id=run_id, shadow_summary=shadow_summary)
             except Exception:  # noqa: BLE001

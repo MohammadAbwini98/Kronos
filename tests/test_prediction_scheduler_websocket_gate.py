@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from argparse import Namespace
 from pathlib import Path
+import contextlib
 import subprocess
 import sys
 import unittest
@@ -70,10 +71,9 @@ class WebSocketGateTests(unittest.TestCase):
             [{"timestamp_utc": now - pd.Timedelta(minutes=5), "updated_at": now - pd.Timedelta(seconds=200)}],
             [{"status": "OK", "updated_at": now - pd.Timedelta(seconds=5)}],
         ]
-        with (
-            patch("main_prediction_scheduler.connect", return_value=_FakeConnection(responses)),
-            patch("main_prediction_scheduler.pd.Timestamp.now", return_value=now),
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_prediction_scheduler.connect", return_value=_FakeConnection(responses)))
+            _stack.enter_context(patch("main_prediction_scheduler.pd.Timestamp.now", return_value=now))
             gate = main_prediction_scheduler._websocket_prediction_gate(args)
 
         self.assertFalse(gate.allow)
@@ -91,10 +91,9 @@ class WebSocketGateTests(unittest.TestCase):
             [{"timestamp_utc": latest_candle, "updated_at": now - pd.Timedelta(seconds=3)}],
             [{"status": "OK", "updated_at": now - pd.Timedelta(seconds=2)}],
         ]
-        with (
-            patch("main_prediction_scheduler.connect", return_value=_FakeConnection(responses)),
-            patch("main_prediction_scheduler.pd.Timestamp.now", return_value=now),
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_prediction_scheduler.connect", return_value=_FakeConnection(responses)))
+            _stack.enter_context(patch("main_prediction_scheduler.pd.Timestamp.now", return_value=now))
             gate = main_prediction_scheduler._websocket_prediction_gate(args)
 
         self.assertFalse(gate.allow)
@@ -113,11 +112,10 @@ class SchedulerCycleGateTests(unittest.TestCase):
             details={"state": "paused_websocket_gate", "gate_reason": "websocket_stale"},
             latest_candle_timestamp_utc=None,
         )
-        with (
-            patch("main_prediction_scheduler._websocket_prediction_gate", return_value=gate),
-            patch("main_prediction_scheduler._run_forecast_command") as run_forecast,
-            patch("main_prediction_scheduler._heartbeat") as heartbeat,
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_prediction_scheduler._websocket_prediction_gate", return_value=gate))
+            run_forecast = _stack.enter_context(patch("main_prediction_scheduler._run_forecast_command"))
+            heartbeat = _stack.enter_context(patch("main_prediction_scheduler._heartbeat"))
             code = main_prediction_scheduler._run_cycle(args)
 
         self.assertEqual(0, code)
@@ -135,11 +133,10 @@ class SchedulerCycleGateTests(unittest.TestCase):
             latest_candle_timestamp_utc=candle_ts,
         )
         result = subprocess.CompletedProcess(["python", "src/main_forecast_latest.py"], 0, "", "")
-        with (
-            patch("main_prediction_scheduler._websocket_prediction_gate", return_value=gate),
-            patch("main_prediction_scheduler._run_forecast_command", return_value=result),
-            patch("main_prediction_scheduler._heartbeat"),
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_prediction_scheduler._websocket_prediction_gate", return_value=gate))
+            _stack.enter_context(patch("main_prediction_scheduler._run_forecast_command", return_value=result))
+            _stack.enter_context(patch("main_prediction_scheduler._heartbeat"))
             code = main_prediction_scheduler._run_cycle(args)
 
         self.assertEqual(0, code)

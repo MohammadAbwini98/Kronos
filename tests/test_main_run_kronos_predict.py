@@ -5,7 +5,9 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
+import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -62,6 +64,30 @@ class AutoFinetunedModelSelectionTests(unittest.TestCase):
 
             selected = main_run_kronos_predict._auto_finetuned_model_dir(output_dir)
             self.assertEqual(model_dir, selected)
+
+
+class PostgresDsnArgumentTests(unittest.TestCase):
+    def test_postgres_dsn_is_not_converted_to_windows_path(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            input_csv = root / "input.csv"
+            input_csv.write_text("timestamps,open,high,low,close,volume,amount\n", encoding="utf-8")
+            dsn = "postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos"
+            fake_df = pd.DataFrame({"timestamps": [pd.Timestamp("2026-01-01T00:00:00Z")], "close": [1.0]})
+
+            argv = [
+                "main_run_kronos_predict.py",
+                "--input",
+                str(input_csv),
+                "--output-dir",
+                str(root),
+                "--postgres-dsn",
+                dsn,
+            ]
+            with patch.object(sys, "argv", argv), patch.object(main_run_kronos_predict, "run_prediction", return_value=fake_df) as run_prediction:
+                main_run_kronos_predict.main()
+
+            self.assertEqual(dsn, run_prediction.call_args.kwargs["prediction_db"])
 
 
 if __name__ == "__main__":

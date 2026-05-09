@@ -93,6 +93,19 @@ def _extract_validation_summary(output: str) -> dict[str, Any]:
     }
 
 
+def _default_kronos_python() -> str:
+    return os.getenv("KRONOS_PYTHON") or sys.executable
+
+
+def _resolve_kronos_python(value: str | None) -> tuple[str, str | None]:
+    candidate = str(value or "").strip()
+    if not candidate:
+        return sys.executable, "empty_kronos_python_path"
+    if Path(candidate).exists():
+        return candidate, None
+    return sys.executable, f"kronos_python_path_not_found:{candidate}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the data-only Kronos signal scheduler every N minutes.")
     parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
@@ -107,7 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pred-len", type=int, default=int(os.getenv("SIGNAL_PRED_LEN", "12")))
     parser.add_argument("--env", default=os.getenv("CAPITAL_ENV", "demo"), choices=["demo", "live"])
     parser.add_argument("--postgres-dsn", default=None)
-    parser.add_argument("--kronos-python", default=r"C:\AI\Kronos\.venv\Scripts\python.exe")
+    parser.add_argument("--kronos-python", default=_default_kronos_python())
     parser.add_argument(
         "--websocket-stale-seconds",
         type=int,
@@ -118,6 +131,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     args.resolution = str(args.resolution).upper()
     args.websocket_stale_seconds = max(30, int(args.websocket_stale_seconds))
+    args.kronos_python, args.kronos_python_warning = _resolve_kronos_python(args.kronos_python)
     if args.interval_minutes is None:
         args.interval_minutes = RESOLUTION_TO_MINUTES.get(args.resolution, 5)
     return args
@@ -277,7 +291,12 @@ def _heartbeat(name: str, status: str, details: dict, dsn: str | None) -> None:
         )
 
 
-def _sleep_to_next_boundary(args: argparse.Namespace, heartbeat_interval_seconds: int = 60) -> None:
+def _sleep_to_next_boundary(
+    args: argparse.Namespace,
+    heartbeat_interval_seconds: int = 60,
+    last_cycle_status: str = "OK",
+    last_cycle_details: dict[str, Any] | None = None,
+) -> None:
     scheduler_cycle_id = new_correlation_id("sched")
     now = pd.Timestamp.now(tz="UTC")
     interval_seconds = int(args.interval_minutes) * 60
@@ -308,19 +327,25 @@ def _sleep_to_next_boundary(args: argparse.Namespace, heartbeat_interval_seconds
             resolution=args.resolution,
             seconds_until_next_cycle=int(remaining),
         )
+        heartbeat_status = str(last_cycle_status or "OK").upper()
+        if heartbeat_status not in {"OK", "COOLDOWN", "ERROR"}:
+            heartbeat_status = "OK"
+        state = "sleeping" if heartbeat_status == "OK" else f"sleeping_after_{heartbeat_status.lower()}"
+        details = {
+            "state": state,
+            "current_operation": "sleep",
+            "seconds_until_next_cycle": int(remaining),
+            "symbol": args.symbol,
+            "resolution": args.resolution,
+            "interval_minutes": int(args.interval_minutes),
+            "scheduler_cycle_id": scheduler_cycle_id,
+            "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+        details.update(last_cycle_details or {})
         _heartbeat(
             "prediction_scheduler",
-            "OK",
-            {
-                "state": "sleeping",
-                "current_operation": "sleep",
-                "seconds_until_next_cycle": int(remaining),
-                "symbol": args.symbol,
-                "resolution": args.resolution,
-                "interval_minutes": int(args.interval_minutes),
-                "scheduler_cycle_id": scheduler_cycle_id,
-                "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
-            },
+            heartbeat_status,
+            details,
             args.postgres_dsn,
         )
 
@@ -391,6 +416,8 @@ def _run_cycle(args: argparse.Namespace) -> int:
         lookback=args.lookback,
         pred_len=args.pred_len,
         env=args.env,
+        kronos_python=args.kronos_python,
+        kronos_python_warning=getattr(args, "kronos_python_warning", None),
     )
     log_event(
         LOGGER,
@@ -518,6 +545,10 @@ def _run_cycle(args: argparse.Namespace) -> int:
             "checked_at": pd.Timestamp.now(tz="UTC").isoformat(),
             **gate.details,
         }
+        kronos_python_warning = getattr(args, "kronos_python_warning", None)
+        if kronos_python_warning:
+            details["kronos_python_warning"] = kronos_python_warning
+            details["kronos_python_effective"] = args.kronos_python
         if result.returncode != 0 and output_tail_text:
             details["output_tail"] = output_tail_text
         heartbeat_status = "OK" if result.returncode == 0 else ("COOLDOWN" if _looks_like_rate_limit(output_tail_text) else "ERROR")
@@ -590,12 +621,22 @@ def main() -> None:
         lookback=args.lookback,
         pred_len=args.pred_len,
         env=args.env,
+        kronos_python=args.kronos_python,
+        kronos_python_warning=getattr(args, "kronos_python_warning", None),
     )
     while True:
         code = _run_cycle(args)
         if args.once:
             raise SystemExit(code)
-        _sleep_to_next_boundary(args)
+        sleep_status = "OK" if code == 0 else "ERROR"
+        _sleep_to_next_boundary(
+            args,
+            last_cycle_status=sleep_status,
+            last_cycle_details={
+                "last_cycle_returncode": int(code),
+                "last_error": None if code == 0 else f"last_cycle_returncode={code}",
+            },
+        )
 
 
 if __name__ == "__main__":

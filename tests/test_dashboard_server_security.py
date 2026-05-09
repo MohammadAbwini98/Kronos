@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 import sys
 import tempfile
@@ -73,10 +74,9 @@ class MetadataContextTests(unittest.TestCase):
         fake_row = {"metadata_path": "output/forecast_metadata_ETHUSD_MINUTE_1.json"}
         fake_metadata = {"epic": "ETHUSD", "resolution": "MINUTE"}
 
-        with (
-            patch.object(dashboard_server, "connect", return_value=_FakeConnection(fake_row)),
-            patch.object(dashboard_server, "_safe_json", return_value=fake_metadata),
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(dashboard_server, "connect", return_value=_FakeConnection(fake_row)))
+            _stack.enter_context(patch.object(dashboard_server, "_safe_json", return_value=fake_metadata))
             path, metadata = dashboard_server._metadata_for_run_id(
                 "run-123",
                 symbol="BTCUSD",
@@ -90,11 +90,10 @@ class MetadataContextTests(unittest.TestCase):
         fake_row = {"metadata_path": "output/forecast_metadata_ETHUSD_MINUTE_1.json"}
         fake_metadata = {"epic": "ETHUSD", "resolution": "MINUTE"}
 
-        with (
-            patch.object(dashboard_server, "connect", return_value=_FakeConnection(fake_row)),
-            patch.object(dashboard_server, "_safe_json", return_value=fake_metadata),
-            patch.object(dashboard_server, "ROOT", ROOT),
-        ):
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(dashboard_server, "connect", return_value=_FakeConnection(fake_row)))
+            _stack.enter_context(patch.object(dashboard_server, "_safe_json", return_value=fake_metadata))
+            _stack.enter_context(patch.object(dashboard_server, "ROOT", ROOT))
             path, metadata = dashboard_server._metadata_for_run_id(
                 "run-123",
                 symbol="ethusd",

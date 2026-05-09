@@ -50,7 +50,8 @@ class StatusWarningsTests(unittest.TestCase):
             },
         }
 
-        warnings = dashboard_server._status_warnings(snapshot)
+        with patch.dict("os.environ", {"ENABLE_AUTO_FINETUNE": "true"}):
+            warnings = dashboard_server._status_warnings(snapshot)
 
         self.assertTrue(any("source is latest_fetch" in item for item in warnings))
         self.assertTrue(any("Websocket health warning" in item and "125s" in item for item in warnings))
@@ -59,6 +60,26 @@ class StatusWarningsTests(unittest.TestCase):
         self.assertIn("Worker websocket_stream heartbeat is stale (240s).", warnings)
         self.assertIn("Worker auto_finetune_worker heartbeat appears stale (241s).", warnings)
         self.assertIn("Worker maintenance_worker status is ERROR.", warnings)
+
+    def test_status_warnings_skip_disabled_auto_finetune_worker(self):
+        snapshot = {
+            "live_quote": {"source": "websocket"},
+            "worker_statuses": {
+                "prediction_scheduler": {"status": "OK", "stale_alert": False},
+                "validation_worker": {"status": "OK", "stale_alert": False},
+                "websocket_stream": {"status": "OK", "stale_alert": False},
+                "auto_finetune_worker": {
+                    "status": "ERROR",
+                    "stale_alert": True,
+                    "stale_seconds": 999,
+                },
+            },
+        }
+
+        with patch.dict("os.environ", {"ENABLE_AUTO_FINETUNE": "false"}):
+            warnings = dashboard_server._status_warnings(snapshot)
+
+        self.assertFalse(any("auto_finetune_worker" in item for item in warnings))
 
 
 class AutoFinetuneStatusTests(unittest.TestCase):
@@ -81,7 +102,8 @@ class AutoFinetuneStatusTests(unittest.TestCase):
             )
 
             with patch.object(dashboard_server, "OUTPUT_DIR", output_dir):
-                payload = dashboard_server._auto_finetune_status()
+                with patch.dict("os.environ", {"ENABLE_AUTO_FINETUNE": "true"}):
+                    payload = dashboard_server._auto_finetune_status()
 
         self.assertEqual(25.0, payload["promotion_progress_pct"])
         self.assertEqual("Kronos-auto-finetuned", payload["current_model_label"])
@@ -104,7 +126,8 @@ class AutoFinetuneStatusTests(unittest.TestCase):
             )
 
             with patch.object(dashboard_server, "OUTPUT_DIR", output_dir):
-                payload = dashboard_server._auto_finetune_status()
+                with patch.dict("os.environ", {"ENABLE_AUTO_FINETUNE": "true"}):
+                    payload = dashboard_server._auto_finetune_status()
 
         self.assertEqual(50.0, payload["promotion_progress_pct"])
         self.assertEqual("Kronos-base", payload["current_model_label"])

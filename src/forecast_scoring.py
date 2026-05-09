@@ -8,6 +8,7 @@ import pandas as pd
 
 
 DEFAULT_SCORING_VERSION = "v1"
+DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION = "signal_trade_v1"
 DEFAULT_FLAT_THRESHOLD_PCT = 0.02
 DEFAULT_COST_THRESHOLD_PCT = 0.05
 
@@ -46,6 +47,21 @@ def _clean_close_frame(df: pd.DataFrame, label: str) -> pd.DataFrame:
     clean["timestamps"] = pd.to_datetime(clean["timestamps"], utc=True)
     clean["close"] = pd.to_numeric(clean["close"], errors="coerce")
     clean = clean.dropna(subset=["timestamps", "close"])
+    clean = clean.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+    return clean
+
+
+def _clean_ohlc_frame(df: pd.DataFrame, label: str) -> pd.DataFrame:
+    if "timestamps" not in df.columns or "close" not in df.columns:
+        raise ValueError(f"{label} requires timestamps and close columns")
+    clean = df.copy()
+    clean["timestamps"] = pd.to_datetime(clean["timestamps"], utc=True)
+    for column in ("open", "high", "low", "close"):
+        if column not in clean.columns:
+            clean[column] = clean["close"]
+        clean[column] = pd.to_numeric(clean[column], errors="coerce")
+    clean = clean[["timestamps", "open", "high", "low", "close"]]
+    clean = clean.dropna(subset=["timestamps", "open", "high", "low", "close"])
     clean = clean.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
     return clean
 
@@ -193,6 +209,166 @@ def score_forecast_against_actuals(
     return {"summary": summary, "rows": rows}
 
 
+def _signal_final_move_pct(signal: str, entry_price: float, close: float) -> float | None:
+    move_pct = move_pct_from_prices(entry_price, close)
+    if move_pct is None:
+        return None
+    signal_text = str(signal or "HOLD").upper()
+    if signal_text == "SHORT":
+        return -move_pct
+    return move_pct
+
+
+def score_trade_signal_outcome(
+    *,
+    signal: str,
+    entry_price: float,
+    tp_price: float,
+    sl_price: float,
+    actual_df: pd.DataFrame,
+    cost_threshold_pct: float = DEFAULT_COST_THRESHOLD_PCT,
+    forecast_end_timestamp_utc: Any | None = None,
+    policy_version: str = DEFAULT_SIGNAL_OUTCOME_POLICY_VERSION,
+) -> dict[str, Any]:
+    """Score the trade signal outcome using TP/SL and final-close fallback.
+
+    Forecast accuracy remains per-horizon direction scoring. This function is
+    intentionally trade-specific: actionable signals use TP/SL first-touch,
+    HOLD signals are not counted as WIN/LOSS, and ambiguous same-candle TP/SL
+    touches are excluded from win-rate by returning AMBIGUOUS.
+    """
+    signal_text = str(signal or "HOLD").upper()
+    actionable = signal_text in {"LONG", "SHORT"}
+    actual = _clean_ohlc_frame(actual_df, "actual")
+    result = {
+        "policy_version": policy_version,
+        "signal": signal_text,
+        "status": "PENDING",
+        "reason": "No actual candles are available for the signal window.",
+        "hit_timestamp_utc": None,
+        "exit_price": None,
+        "realized_move_pct": None,
+        "movement_after_cost_pct": None,
+        "validated_candles": int(len(actual)),
+        "hold_quality": None,
+        "ambiguous": False,
+    }
+    if actual.empty:
+        return result
+
+    entry = float(entry_price)
+    tp = float(tp_price)
+    sl = float(sl_price)
+    cost = float(cost_threshold_pct)
+    forecast_end = None if forecast_end_timestamp_utc is None else pd.to_datetime(forecast_end_timestamp_utc, utc=True)
+    complete = forecast_end is None or pd.Timestamp(actual["timestamps"].max()) >= forecast_end
+    final_row = actual.iloc[-1]
+    final_close = float(final_row["close"])
+    final_move_pct = _signal_final_move_pct(signal_text, entry, final_close)
+    movement_after_cost = None if final_move_pct is None else float(final_move_pct) - cost
+
+    if not actionable:
+        if not complete:
+            result.update(
+                {
+                    "reason": "HOLD signal is waiting for the forecast window to complete.",
+                    "realized_move_pct": final_move_pct,
+                    "movement_after_cost_pct": movement_after_cost,
+                }
+            )
+            return result
+        missed = final_move_pct is not None and abs(float(final_move_pct)) >= cost
+        result.update(
+            {
+                "status": "MISSED_MOVE" if missed else "GOOD_HOLD",
+                "reason": (
+                    "HOLD missed a move beyond the cost threshold."
+                    if missed
+                    else "HOLD avoided trading a move inside the cost threshold."
+                ),
+                "hit_timestamp_utc": pd.Timestamp(final_row["timestamps"]).isoformat(),
+                "exit_price": final_close,
+                "realized_move_pct": final_move_pct,
+                "movement_after_cost_pct": movement_after_cost,
+                "hold_quality": "MISSED_MOVE" if missed else "GOOD_HOLD",
+            }
+        )
+        return result
+
+    for _, row in actual.iterrows():
+        high = float(row["high"])
+        low = float(row["low"])
+        timestamp = pd.Timestamp(row["timestamps"]).isoformat()
+        if signal_text == "LONG":
+            tp_hit = high >= tp
+            sl_hit = low <= sl
+            win_price = tp
+            loss_price = sl
+        else:
+            tp_hit = low <= tp
+            sl_hit = high >= sl
+            win_price = tp
+            loss_price = sl
+        if tp_hit and sl_hit:
+            result.update(
+                {
+                    "status": "AMBIGUOUS",
+                    "reason": "TP and SL were both touched in the same candle; intrabar order is unknown.",
+                    "hit_timestamp_utc": timestamp,
+                    "realized_move_pct": final_move_pct,
+                    "movement_after_cost_pct": movement_after_cost,
+                    "ambiguous": True,
+                }
+            )
+            return result
+        if tp_hit or sl_hit:
+            won = bool(tp_hit)
+            exit_price = win_price if won else loss_price
+            realized_move_pct = _signal_final_move_pct(signal_text, entry, float(exit_price))
+            result.update(
+                {
+                    "status": "WIN" if won else "LOSS",
+                    "reason": "Take-profit was touched first." if won else "Stop-loss was touched first.",
+                    "hit_timestamp_utc": timestamp,
+                    "exit_price": exit_price,
+                    "realized_move_pct": realized_move_pct,
+                    "movement_after_cost_pct": None if realized_move_pct is None else float(realized_move_pct) - cost,
+                }
+            )
+            return result
+
+    if not complete:
+        result.update(
+            {
+                "reason": "Signal is still open; neither TP nor SL has been touched yet.",
+                "exit_price": final_close,
+                "realized_move_pct": final_move_pct,
+                "movement_after_cost_pct": movement_after_cost,
+            }
+        )
+        return result
+
+    status = "EXPIRED"
+    reason = "Signal expired without touching TP or SL and ended inside the cost threshold."
+    if movement_after_cost is not None and movement_after_cost > 0:
+        status = "WIN"
+        reason = "Signal expired without touching TP/SL but final close cleared cost in the signal direction."
+    elif final_move_pct is not None and final_move_pct < -cost:
+        status = "LOSS"
+        reason = "Signal expired without touching TP/SL and final close moved against the signal beyond cost."
+    result.update(
+        {
+            "status": status,
+            "reason": reason,
+            "hit_timestamp_utc": pd.Timestamp(final_row["timestamps"]).isoformat(),
+            "exit_price": final_close,
+            "realized_move_pct": final_move_pct,
+            "movement_after_cost_pct": movement_after_cost,
+        }
+    )
+    return result
+
+
 def signal_status_from_counts(wins: int, losses: int) -> str:
     validated = int(wins) + int(losses)
     if validated <= 0:
@@ -207,17 +383,23 @@ def score_signal_quality(
     expected_move_pct: float,
     cost_threshold_pct: float,
     scoring_summary: dict[str, Any],
+    trade_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     signal_text = str(signal or "HOLD").upper()
     actionable = signal_text in {"LONG", "SHORT"}
     realized_move_pct = scoring_summary.get("realized_movement_pct")
-    status = str(scoring_summary.get("status") or "PENDING").upper()
+    status = str((trade_outcome or {}).get("status") or scoring_summary.get("status") or "PENDING").upper()
     movement_after_cost_pct = scoring_summary.get("average_movement_after_cost_pct")
+    if trade_outcome is not None:
+        realized_move_pct = trade_outcome.get("realized_move_pct")
+        movement_after_cost_pct = trade_outcome.get("movement_after_cost_pct")
     false_positive = None
     hold_quality = None
     if actionable and status in {"WIN", "LOSS"}:
         false_positive = status == "LOSS"
-    if not actionable and realized_move_pct is not None:
+    if trade_outcome is not None and trade_outcome.get("hold_quality"):
+        hold_quality = trade_outcome.get("hold_quality")
+    elif not actionable and realized_move_pct is not None:
         hold_quality = "GOOD_HOLD" if abs(float(realized_move_pct)) < float(cost_threshold_pct) else "MISSED_MOVE"
     precision_bucket = None
     if actionable:
@@ -242,4 +424,7 @@ def score_signal_quality(
         "precision_bucket": precision_bucket,
         "false_positive": false_positive,
         "hold_quality": hold_quality,
+        "outcome_policy_version": (trade_outcome or {}).get("policy_version"),
+        "outcome_reason": (trade_outcome or {}).get("reason"),
+        "outcome_hit_timestamp_utc": (trade_outcome or {}).get("hit_timestamp_utc"),
     }

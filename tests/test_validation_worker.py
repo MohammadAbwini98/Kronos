@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 from pathlib import Path
 import sys
 import unittest
@@ -88,17 +89,16 @@ class ValidationCycleTests(unittest.TestCase):
 
     def test_cycle_stops_after_rate_limit(self):
         args = argparse.Namespace(postgres_dsn=None, batch_size=5, env="demo")
-        with (
-            patch("main_validation_worker._due_runs", return_value=[_run("one"), _run("two")]),
-            patch(
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_validation_worker._due_runs", return_value=[_run("one"), _run("two")]))
+            validate = _stack.enter_context(patch(
                 "main_validation_worker._validate_run",
                 return_value=(1, 'Capital.com authentication failed with HTTP 429: {"errorCode":"error.too-many.requests"}'),
-            ) as validate,
-            patch(
+            ))
+            _stack.enter_context(patch(
                 "main_validation_worker.refresh_shadow_prediction_statuses",
                 return_value={"checked": 0, "updated": 0, "pending": 0, "errors": 0},
-            ),
-        ):
+            ))
             details = main_validation_worker._run_validation_cycle(args, "val_test_cycle")
 
         self.assertEqual(1, validate.call_count)
@@ -108,14 +108,13 @@ class ValidationCycleTests(unittest.TestCase):
 
     def test_cycle_keeps_child_error_tail(self):
         args = argparse.Namespace(postgres_dsn=None, batch_size=5, env="demo")
-        with (
-            patch("main_validation_worker._due_runs", return_value=[_run("one")]),
-            patch("main_validation_worker._validate_run", return_value=(2, "actual CSV contains null OHLC values")),
-            patch(
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_validation_worker._due_runs", return_value=[_run("one")]))
+            _stack.enter_context(patch("main_validation_worker._validate_run", return_value=(2, "actual CSV contains null OHLC values")))
+            _stack.enter_context(patch(
                 "main_validation_worker.refresh_shadow_prediction_statuses",
                 return_value={"checked": 0, "updated": 0, "pending": 0, "errors": 0},
-            ),
-        ):
+            ))
             details = main_validation_worker._run_validation_cycle(args, "val_test_cycle")
 
         self.assertEqual(1, details["errors"])
