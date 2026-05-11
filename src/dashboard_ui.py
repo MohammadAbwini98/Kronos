@@ -1519,6 +1519,8 @@ let signalFilters = {
 };
 let tradeExecutionFilters = {
   lifecycle: '',
+  dateFrom: '',
+  dateTo: '',
   status: '',
   outcome: '',
   side: '',
@@ -1546,6 +1548,8 @@ const SIGNAL_FILTER_AUTO_APPLY_IDS = new Set([
 
 const TRADE_FILTER_CONTROL_IDS = new Set([
   'tradeLifecycleFilter',
+  'tradeDateFromFilter',
+  'tradeDateToFilter',
   'tradeStatusFilter',
   'tradeOutcomeFilter',
   'tradeSideFilter',
@@ -1555,6 +1559,8 @@ const TRADE_FILTER_CONTROL_IDS = new Set([
 
 const TRADE_FILTER_AUTO_APPLY_IDS = new Set([
   'tradeLifecycleFilter',
+  'tradeDateFromFilter',
+  'tradeDateToFilter',
   'tradeStatusFilter',
   'tradeOutcomeFilter',
   'tradeSideFilter',
@@ -1648,9 +1654,9 @@ function resolveLatestPriceTime(data) {
 
 function statusClass(value) {
   const text = String(value || '').toUpperCase();
-  if (['OK', 'VALIDATED', 'WIN', 'GOOD_HOLD', 'PROMISING', 'LONG', 'UP', 'APPROVED', 'PROMOTED', 'OPEN', 'COMPLETED', 'ACTIVE'].includes(text)) return 'good';
+  if (['OK', 'VALIDATED', 'WIN', 'GOOD_HOLD', 'PROMISING', 'LONG', 'UP', 'APPROVED', 'PROMOTED', 'OPEN', 'COMPLETED', 'ACTIVE', 'ALLOW'].includes(text)) return 'good';
   if (['PENDING', 'PARTIAL', 'HOLD', 'EXPIRED', 'AMBIGUOUS', 'NEEDS_MORE_SAMPLES', 'FLAT', 'STALE', 'PENDING_REVIEW', 'SKIP', 'QUEUED', 'QUEUE', 'PROCESSING', 'SUBMITTED', 'CLOSE_REQUESTED'].includes(text)) return 'warn';
-  if (['ERROR', 'LOSS', 'MISSED_MOVE', 'WEAK', 'NOT_TRADABLE', 'SHORT', 'DOWN', 'NOT_READY', 'FAILED', 'REJECTED', 'VALIDATION_FAILED', 'CLOSE_FAILED'].includes(text)) return 'bad';
+  if (['ERROR', 'LOSS', 'MISSED_MOVE', 'WEAK', 'NOT_TRADABLE', 'SHORT', 'DOWN', 'NOT_READY', 'FAILED', 'REJECTED', 'VALIDATION_FAILED', 'CLOSE_FAILED', 'BLOCK'].includes(text)) return 'bad';
   return 'info';
 }
 
@@ -1660,6 +1666,18 @@ function chip(value, extra = '') {
 
 function kpi(label, value, sub = '') {
   return `<article class="kpi"><div class="kpi-label">${escapeHtml(label)}</div><div class="kpi-value">${escapeHtml(value ?? 'n/a')}</div>${sub ? `<div class="kpi-sub">${escapeHtml(sub)}</div>` : ''}</article>`;
+}
+
+function displayValue(value, digits = 4) {
+  if (value === null || value === undefined || value === '') return 'n/a';
+  if (typeof value === 'number') return Number.isFinite(value) ? fmtNumber(value, digits) : 'n/a';
+  if (typeof value === 'boolean') return value ? 'Yes' : 'No';
+  if (typeof value === 'object') return JSON.stringify(value);
+  return String(value);
+}
+
+function metricRows(rows) {
+  return rows.map(([label, value]) => `<tr><td>${escapeHtml(label)}</td><td>${escapeHtml(displayValue(value))}</td></tr>`).join('');
 }
 
 function setTextIfChanged(element, text) {
@@ -2368,6 +2386,11 @@ function renderValidation(data) {
   const v = data.validation || {};
   const source = data.validation_source || 'none';
   const sv = data.signal_validation || {};
+  const trust = data.dashboard_trust || {};
+  const forecastTrust = trust.forecast_quality || {};
+  const signalTrust = trust.signal_quality || {};
+  const inputTrust = trust.data_input_health || {};
+  const latestState = trust.latest_state || {};
   const tf = data.timeframe_validations || [];
   const componentScores = sv.component_scores || {};
   const reasonCodes = sv.reason_codes || [];
@@ -2416,11 +2439,14 @@ function renderValidation(data) {
     : `Sample size ${matchedCandles} - direction accuracy is more reliable.`;
   const qualityRows = [
     ['Source', source],
+    ['Partial / final status', forecastTrust.partial_or_final || 'UNKNOWN'],
+    ['Actual future horizon complete', forecastTrust.actual_future_horizon_complete],
     ['Quality', v.quality_status],
     ['Direction', v.forecast_direction || sv.forecast_direction || 'n/a'],
     ['Matched candles', v.matched_candles],
-    ['Direction accuracy', v.direction_accuracy_pct === undefined || v.direction_accuracy_pct === null ? metricPendingLabel : `${fmtNumber(v.direction_accuracy_pct, 2)}%`],
-    ['Direction accuracy hint', accuracyHint],
+    ['Directional Forecast Hit Rate', forecastTrust.directional_forecast_hit_rate_pct === undefined || forecastTrust.directional_forecast_hit_rate_pct === null ? metricPendingLabel : `${fmtNumber(forecastTrust.directional_forecast_hit_rate_pct, 2)}%`],
+    ['Per-horizon direction accuracy', v.direction_accuracy_pct === undefined || v.direction_accuracy_pct === null ? metricPendingLabel : `${fmtNumber(v.direction_accuracy_pct, 2)}%`],
+    ['Directional hit-rate hint', accuracyHint],
     ['Metrics status', metricsStatusNote],
     ['MAE', v.mae === undefined || v.mae === null ? metricPendingLabel : fmtNumber(v.mae)],
     ['RMSE', v.rmse === undefined || v.rmse === null ? metricPendingLabel : fmtNumber(v.rmse)],
@@ -2437,6 +2463,55 @@ function renderValidation(data) {
     ['Block reason', sv.block_reason || 'n/a'],
     ['Net edge %', sv.net_edge_pct === undefined || sv.net_edge_pct === null ? 'n/a' : `${fmtNumber(sv.net_edge_pct, 4)}%`],
     ['Estimated cost %', sv.estimated_cost_pct === undefined || sv.estimated_cost_pct === null ? 'n/a' : `${fmtNumber(sv.estimated_cost_pct, 4)}%`],
+  ];
+
+  const inputHealthRows = [
+    ['Latest prediction time', latestState.latest_prediction_time],
+    ['Latest input candle time', latestState.latest_input_candle_time || inputTrust.latest_input_candle_time],
+    ['Latest input complete', latestState.latest_input_complete],
+    ['Missing candle count', inputTrust.missing_candle_count],
+    ['Largest gap minutes', inputTrust.largest_gap_minutes],
+    ['Source counts', inputTrust.source_counts || {}],
+    ['Amount available', inputTrust.amount_available],
+    ['Feature mode', inputTrust.feature_mode],
+    ['Requested lookback', inputTrust.requested_lookback],
+    ['Actual lookback used', inputTrust.actual_lookback || inputTrust.actual_rows_used],
+    ['Max supported lookback', inputTrust.max_supported_lookback],
+    ['Lookback honored', inputTrust.lookback_honored],
+    ['Stale/unclosed warning', inputTrust.stale_or_unclosed_warning || 'none'],
+  ];
+
+  const horizonRows = (forecastTrust.per_horizon || data.horizon_metrics || []).length
+    ? (forecastTrust.per_horizon || data.horizon_metrics || []).map(row => `<tr>
+      <td>${escapeHtml(row.horizon_index || row.horizon || '')}</td>
+      <td>${fmtCount(row.samples || row.sample_count || 0)}</td>
+      <td>${row.directional_forecast_hit_rate_pct === null || row.directional_forecast_hit_rate_pct === undefined ? 'n/a' : `${fmtNumber(row.directional_forecast_hit_rate_pct, 2)}%`}</td>
+      <td>${row.mae === null || row.mae === undefined ? 'n/a' : fmtNumber(row.mae)}</td>
+      <td>${row.rmse === null || row.rmse === undefined ? 'n/a' : fmtNumber(row.rmse)}</td>
+      <td>${row.mape_pct === null || row.mape_pct === undefined ? 'n/a' : `${fmtNumber(row.mape_pct, 4)}%`}</td>
+      <td>${row.enough_samples ? 'Yes' : 'No'}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="7">No per-horizon forecast quality rows available.</td></tr>';
+
+  const baselineRows = ((forecastTrust.baseline_comparison || {}).rows || []).length
+    ? forecastTrust.baseline_comparison.rows.map(row => `<tr>
+      <td>${escapeHtml(row.baseline_name || '')}</td>
+      <td>${escapeHtml(row.metric_name || '')}</td>
+      <td>${row.model_metric === null || row.model_metric === undefined ? 'n/a' : fmtNumber(row.model_metric, 2)}</td>
+      <td>${row.baseline_metric === null || row.baseline_metric === undefined ? 'n/a' : fmtNumber(row.baseline_metric, 2)}</td>
+      <td>${row.delta === null || row.delta === undefined ? 'n/a' : fmtNumber(row.delta, 2)}</td>
+      <td>${fmtCount(row.sample_count || 0)}</td>
+      <td>${row.enough_samples ? 'Yes' : 'No'}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="7">No stored baseline comparison rows available.</td></tr>';
+
+  const distributionRows = [
+    ['Raw signal distribution', signalTrust.raw_signal_distribution || {}],
+    ['Signal status distribution', signalTrust.signal_status_distribution || {}],
+    ['Validation status distribution', signalTrust.validation_status_distribution || {}],
+    ['Average validation score', signalTrust.average_validation_score],
+    ['Blocked / watch / hold counts', signalTrust.blocked_watch_hold_counts || {}],
+    ['Direction vs validation mismatch count', signalTrust.raw_signal_validation_mismatch_count],
   ];
 
   const componentRows = [
@@ -2482,8 +2557,8 @@ function renderValidation(data) {
   $('validation').innerHTML = `
     <div class="panel-head">
       <div>
-        <h2>Validation Summary</h2>
-        <p>Forecast quality plus external higher-timeframe validation and signal scoring.</p>
+        <h2>Forecast Quality</h2>
+        <p>Directional forecast hit rate, per-horizon quality, final/partial state, and baseline context.</p>
       </div>
       ${chip(sv.final_signal || v.quality_status || 'PENDING')}
     </div>
@@ -2494,9 +2569,25 @@ function renderValidation(data) {
       ${qualityRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
     </tbody></table></div>
 
+    <h3 style="margin-top: 12px;">Per-Horizon Forecast Quality</h3>
+    <div class="table-wrap"><table><thead><tr><th>Horizon</th><th>Samples</th><th>Directional Forecast Hit Rate</th><th>MAE</th><th>RMSE</th><th>MAPE</th><th>Enough Samples</th></tr></thead><tbody>${horizonRows}</tbody></table></div>
+
+    <h3 style="margin-top: 12px;">Baseline Comparison</h3>
+    <div class="table-wrap"><table><thead><tr><th>Baseline</th><th>Metric</th><th>Model</th><th>Baseline</th><th>Delta</th><th>Samples</th><th>Enough Samples</th></tr></thead><tbody>${baselineRows}</tbody></table></div>
+
+    <h3 style="margin-top: 12px;">Signal Quality</h3>
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+      ${metricRows(distributionRows)}
+    </tbody></table></div>
+
     <h3 style="margin-top: 12px;">External Signal Validation</h3>
     <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
       ${scoreRows.map(([k, val]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(val ?? 'n/a')}</td></tr>`).join('')}
+    </tbody></table></div>
+
+    <h3 style="margin-top: 12px;">Data/Input Health</h3>
+    <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Value</th></tr></thead><tbody>
+      ${metricRows(inputHealthRows)}
     </tbody></table></div>
 
     <h3 style="margin-top: 12px;">Score Breakdown</h3>
@@ -2560,6 +2651,8 @@ function renderRisk(data) {
 function readTradeExecutionFiltersFromUi() {
   tradeExecutionFilters = {
     lifecycle: String($('tradeLifecycleFilter')?.value || '').toUpperCase(),
+    dateFrom: String($('tradeDateFromFilter')?.value || '').trim(),
+    dateTo: String($('tradeDateToFilter')?.value || '').trim(),
     status: String($('tradeStatusFilter')?.value || '').toUpperCase(),
     outcome: String($('tradeOutcomeFilter')?.value || '').toUpperCase(),
     side: String($('tradeSideFilter')?.value || '').toUpperCase(),
@@ -2577,7 +2670,7 @@ function tradeFilterOptions(rows, key) {
   return [...new Set(rows.map(row => String(row[key] || '').toUpperCase()).filter(Boolean))].sort();
 }
 
-function normalizeTradeExecutionRows(active, pending, historical, queueEntries) {
+function normalizeTradeExecutionRows(active, pending, historical, queueEntries, decisions) {
   const tradeRow = (trade, lifecycle) => ({
     source: 'TRADE',
     lifecycle,
@@ -2588,7 +2681,15 @@ function normalizeTradeExecutionRows(active, pending, historical, queueEntries) 
     status: String(trade.status || 'PENDING').toUpperCase(),
     signal_status: String(trade.signal_status || '').toUpperCase(),
     signal_label: trade.signal_label || '',
-    validation_status: trade.validation_status || '',
+    validation_status: trade.validation_status_at_execution || trade.validation_status || '',
+    validation_score_at_execution: trade.validation_score_at_execution,
+    expected_move_pct_at_execution: trade.expected_move_pct_at_execution,
+    entry_spread_pct: trade.entry_spread_pct,
+    execution_decision: String(trade.execution_decision || '').toUpperCase(),
+    execution_block_reason: trade.execution_block_reason || '',
+    execution_decision_details: trade.execution_decision_details || {},
+    execution_net_expected_edge_pct: trade.execution_net_expected_edge_pct,
+    execution_spread_pct: trade.execution_spread_pct,
     transaction_id: trade.transaction_id || '',
     transaction_lookup_status: trade.transaction_lookup_status || '',
     transaction_lookup_error: trade.transaction_lookup_error || '',
@@ -2603,6 +2704,11 @@ function normalizeTradeExecutionRows(active, pending, historical, queueEntries) 
     executed_size: trade.executed_size,
     recommended_entry: trade.recommended_entry,
     actual_entry: trade.actual_entry,
+    net_pnl: trade.net_pnl,
+    gross_pnl: trade.gross_pnl,
+    fee_amount: trade.fee_amount,
+    spread_cost: trade.spread_cost,
+    slippage_estimate: trade.slippage_estimate,
     take_profit: trade.take_profit,
     stop_loss: trade.stop_loss,
     deal_reference: trade.deal_reference || '',
@@ -2625,6 +2731,11 @@ function normalizeTradeExecutionRows(active, pending, historical, queueEntries) 
     signal_status: String(entry.signal_status || '').toUpperCase(),
     signal_label: entry.signal_label || '',
     validation_status: entry.validation_status || '',
+    execution_decision: String(entry.execution_decision || '').toUpperCase(),
+    execution_block_reason: entry.execution_block_reason || '',
+    execution_decision_details: entry.execution_decision_details || {},
+    execution_net_expected_edge_pct: entry.execution_net_expected_edge_pct,
+    execution_spread_pct: entry.execution_spread_pct,
     epic: entry.epic || entry.symbol || '',
     direction: String(entry.direction || '').toUpperCase(),
     requested_size: entry.requested_size,
@@ -2642,17 +2753,60 @@ function normalizeTradeExecutionRows(active, pending, historical, queueEntries) 
     error_details: entry.error_details || '',
     sort_ms: parseTs(entry.updated_at || entry.created_at || entry.next_attempt_at)?.getTime() || 0,
   });
+  const coveredSignals = new Set([
+    ...active,
+    ...pending,
+    ...historical,
+    ...queueEntries,
+  ].map(row => String(row.signal_id || '')).filter(Boolean));
+  const decisionRow = decision => ({
+    source: 'DECISION',
+    lifecycle: String(decision.execution_decision || 'DECISION').toUpperCase() === 'BLOCK' ? 'BLOCKED' : 'DECISION',
+    record_id: decision.id,
+    signal_id: decision.signal_id || '',
+    created_at: decision.evaluated_at || '',
+    updated_at: decision.evaluated_at || '',
+    status: String(decision.execution_decision || 'UNKNOWN').toUpperCase(),
+    signal_status: String(decision.signal_status || '').toUpperCase(),
+    signal_label: decision.signal_label || decision.raw_signal || '',
+    validation_status: decision.validation_status || decision.signal_validation_status || '',
+    execution_decision: String(decision.execution_decision || '').toUpperCase(),
+    execution_block_reason: decision.block_reason || '',
+    execution_decision_details: decision.details || {},
+    execution_net_expected_edge_pct: decision.net_expected_edge_pct,
+    execution_spread_pct: decision.spread_pct,
+    epic: decision.epic || decision.symbol || '',
+    direction: String(decision.direction || '').toUpperCase(),
+    requested_size: '',
+    executed_size: '',
+    recommended_entry: decision.recommended_entry,
+    actual_entry: '',
+    take_profit: decision.take_profit,
+    stop_loss: decision.stop_loss,
+    deal_reference: '',
+    deal_id: '',
+    requested_by: '',
+    attempt_count: '',
+    next_attempt_at: '',
+    failure_reason: decision.block_reason || '',
+    error_details: '',
+    trade_outcome: '',
+    sort_ms: parseTs(decision.evaluated_at)?.getTime() || 0,
+  });
 
   return [
     ...active.map(row => tradeRow(row, 'ACTIVE')),
     ...pending.map(row => tradeRow(row, 'PENDING')),
     ...queueEntries.map(queueRow),
     ...historical.map(row => tradeRow(row, 'HISTORICAL')),
+    ...(decisions || []).filter(row => !coveredSignals.has(String(row.signal_id || ''))).map(decisionRow),
   ].sort((a, b) => b.sort_ms - a.sort_ms);
 }
 
 function filterTradeExecutionRows(rows) {
   const lifecycle = String(tradeExecutionFilters.lifecycle || '').toUpperCase();
+  const dateFrom = String(tradeExecutionFilters.dateFrom || '');
+  const dateTo = String(tradeExecutionFilters.dateTo || '');
   const status = String(tradeExecutionFilters.status || '').toUpperCase();
   const outcome = String(tradeExecutionFilters.outcome || '').toUpperCase();
   const side = String(tradeExecutionFilters.side || '').toUpperCase();
@@ -2660,6 +2814,15 @@ function filterTradeExecutionRows(rows) {
   const transactionNeedle = String(tradeExecutionFilters.transactionId || '').toLowerCase();
 
   return rows.filter(row => {
+    const rowTime = parseTs(row.updated_at || row.created_at || row.next_attempt_at)?.getTime();
+    if (dateFrom) {
+      const fromTime = parseTs(`${dateFrom}T00:00:00+03:00`)?.getTime();
+      if (Number.isFinite(fromTime) && (!Number.isFinite(rowTime) || rowTime < fromTime)) return false;
+    }
+    if (dateTo) {
+      const toTime = parseTs(`${dateTo}T23:59:59+03:00`)?.getTime();
+      if (Number.isFinite(toTime) && (!Number.isFinite(rowTime) || rowTime > toTime)) return false;
+    }
     if (lifecycle && row.lifecycle !== lifecycle) return false;
     if (status && row.status !== status) return false;
     if (outcome && row.trade_outcome !== outcome) return false;
@@ -2677,8 +2840,24 @@ function filterTradeExecutionRows(rows) {
 }
 
 function tradeExecutionReason(row) {
-  const reason = String(row.failure_reason || '').trim();
+  const executionReason = String(row.execution_block_reason || '').trim();
+  const reason = String(executionReason || row.failure_reason || '').trim();
   const details = String(row.error_details || '').trim();
+  const edge = row.execution_net_expected_edge_pct === null || row.execution_net_expected_edge_pct === undefined
+    ? ''
+    : `Net edge ${fmtNumber(row.execution_net_expected_edge_pct, 4)}%`;
+  const spread = row.execution_spread_pct === null || row.execution_spread_pct === undefined
+    ? ''
+    : `Spread ${fmtNumber(row.execution_spread_pct, 4)}%`;
+  const decisionContext = [edge, spread].filter(Boolean).join(' · ');
+  const validationContext = row.validation_status
+    ? `Validation ${row.validation_status}${row.validation_score_at_execution === null || row.validation_score_at_execution === undefined ? '' : ` (${fmtNumber(row.validation_score_at_execution, 2)})`}`
+    : '';
+  const costContext = [
+    row.expected_move_pct_at_execution === null || row.expected_move_pct_at_execution === undefined ? '' : `Expected ${fmtNumber(row.expected_move_pct_at_execution, 4)}%`,
+    row.spread_cost === null || row.spread_cost === undefined ? '' : `Spread cost ${fmtNumber(row.spread_cost, 4)}`,
+    row.slippage_estimate === null || row.slippage_estimate === undefined ? '' : `Slippage ${fmtNumber(row.slippage_estimate, 4)}`,
+  ].filter(Boolean).join(' · ');
   const reasonText = details || reason;
   const isMarketClosed = reason === 'MarketNotTradeableError' || /not\s+TRADEABLE|market.*closed/i.test(reasonText);
   if (isMarketClosed) {
@@ -2690,7 +2869,7 @@ function tradeExecutionReason(row) {
       : 'Queued for retry';
     return `${base}. ${retryText}.`;
   }
-  return reasonText;
+  return [reasonText, validationContext, decisionContext, costContext].filter(Boolean).join(' · ');
 }
 
 function tradeTransactionText(row) {
@@ -2703,7 +2882,7 @@ function tradeTransactionText(row) {
 }
 
 function tradeOutcomeHtml(row) {
-  if (row.source !== 'TRADE') return '<span class="muted">n/a</span>';
+  if (row.source !== 'TRADE') return '<span class="muted">not a trade</span>';
   const outcome = row.trade_outcome || (row.status === 'CLOSED' ? 'UNKNOWN' : row.status || 'PENDING');
   const detail = row.trade_close_source
     ? `Source ${row.trade_close_source}${row.trade_close_level ? ` @ ${fmtNumber(row.trade_close_level)}` : ''}`
@@ -2762,9 +2941,9 @@ function tradeExecutionTableRows(rows) {
       <td>${chip(row.lifecycle)}</td>
       <td>${escapeHtml(row.source)} #${escapeHtml(row.record_id ?? '')}</td>
       <td>${escapeHtml(row.signal_id || '')}<br><span class="muted">${fmtDate(row.created_at)}</span></td>
-      <td>${chip(row.status || 'PENDING')}</td>
+      <td>${chip(row.status || 'PENDING')}${row.execution_decision ? `<br><span class="muted">${escapeHtml(row.execution_decision)}</span>` : ''}</td>
       <td>${tradeOutcomeHtml(row)}</td>
-      <td>${chip(row.signal_status || 'n/a')}<br><span class="muted">${escapeHtml(row.signal_label || row.validation_status || '')}</span></td>
+      <td>${chip(row.signal_status || 'UNKNOWN')}<br><span class="muted">${escapeHtml(row.signal_label || row.validation_status || '')}</span></td>
       <td>${escapeHtml(row.epic || '')}</td>
       <td>${escapeHtml(row.direction || '')}</td>
       <td>${sizeText}</td>
@@ -2781,19 +2960,34 @@ function tradeExecutionTableRows(rows) {
 
 function renderTrades(data) {
   const te = data.trade_execution || {};
+  const execPerf = ((data.dashboard_trust || {}).executed_trade_performance) || {};
   const queue = te.queue || {};
   const trades = te.trades || [];
   const active = te.active_trades || trades.filter(t => ['OPEN', 'CLOSE_REQUESTED'].includes(String(t.status || '').toUpperCase()));
   const pending = te.pending_trades || trades.filter(t => ['PENDING', 'SUBMITTED'].includes(String(t.status || '').toUpperCase()));
   const historical = te.historical_trades || trades.filter(t => !['OPEN', 'CLOSE_REQUESTED', 'PENDING', 'SUBMITTED'].includes(String(t.status || '').toUpperCase()));
   const queueEntries = queue.entries || [];
-  const allRows = normalizeTradeExecutionRows(active, pending, historical, queueEntries);
+  const decisions = te.execution_decisions || [];
+  const allRows = normalizeTradeExecutionRows(active, pending, historical, queueEntries, decisions);
   const filteredRows = filterTradeExecutionRows(allRows);
   const allOutcomeCounts = tradeOutcomeCounts(allRows);
   const filteredOutcomeCounts = tradeOutcomeCounts(filteredRows);
   const outcomeKpiSub = key => `${fmtCount(filteredOutcomeCounts[key] || 0)} filtered / ${fmtCount(allOutcomeCounts[key] || 0)} loaded`;
   const filteredOutcomePnl = (filteredOutcomeCounts.WIN || 0) - (filteredOutcomeCounts.LOSS || 0);
   const allOutcomePnl = (allOutcomeCounts.WIN || 0) - (allOutcomeCounts.LOSS || 0);
+  const closedCount = Number(execPerf.closed_trade_count || 0);
+  const finalizedCount = Number(execPerf.finalized_trade_count || 0);
+  const unknownOutcomeCount = Number(execPerf.unknown_outcome_count || 0);
+  const brokerLookupBlocked = te.trade_outcome_lookup_error || te.transaction_lookup_error;
+  const pendingOutcomeText = closedCount > 0
+    ? (brokerLookupBlocked ? 'Broker lookup blocked' : 'Awaiting broker outcome')
+    : 'No closed trades yet';
+  const pendingOutcomeSub = brokerLookupBlocked
+    ? 'Capital.com close activity lookup failed'
+    : `${fmtCount(unknownOutcomeCount)} closed trades need finalized P/L`;
+  const perfValue = (value, formatter = v => fmtNumber(v, 4)) =>
+    value === null || value === undefined ? pendingOutcomeText : formatter(value);
+  const perfSub = fallback => (finalizedCount > 0 ? fallback : pendingOutcomeSub);
   const totalPages = Math.max(1, Math.ceil(filteredRows.length / TRADE_EXECUTION_PAGE_SIZE));
   tradeExecutionPage = Math.min(Math.max(1, Number(tradeExecutionPage || 1)), totalPages);
   const pageStart = (tradeExecutionPage - 1) * TRADE_EXECUTION_PAGE_SIZE;
@@ -2808,6 +3002,21 @@ function renderTrades(data) {
   const sideOptions = tradeFilterOptions(allRows, 'direction')
     .map(side => tradeFilterOption(side, side, tradeExecutionFilters.side))
     .join('');
+  const decisionRows = (((data.dashboard_trust || {}).execution_decision_reasons || {}).rows || []).slice(0, 12);
+  const decisionTableRows = decisionRows.length
+    ? decisionRows.map(row => `<tr>
+      <td>${fmtDate(row.evaluated_at || row.created_at || '')}</td>
+      <td>${escapeHtml(row.signal_id || '')}</td>
+      <td>${chip(row.execution_decision || 'UNKNOWN')}</td>
+      <td>${escapeHtml(row.block_reason || '')}</td>
+      <td>${escapeHtml(row.validation_status || '')}</td>
+      <td>${row.validation_score === null || row.validation_score === undefined ? 'not stored' : fmtNumber(row.validation_score, 2)}</td>
+      <td>${row.net_expected_edge_pct === null || row.net_expected_edge_pct === undefined ? 'not evaluated' : `${fmtNumber(row.net_expected_edge_pct, 4)}%`}</td>
+      <td>${row.spread_pct === null || row.spread_pct === undefined ? 'not evaluated' : `${fmtNumber(row.spread_pct, 4)}%`}</td>
+      <td>${row.estimated_fee_pct === null || row.estimated_fee_pct === undefined ? 'not evaluated' : `${fmtNumber(row.estimated_fee_pct, 4)}%`}</td>
+      <td>${row.estimated_slippage_pct === null || row.estimated_slippage_pct === undefined ? 'not evaluated' : `${fmtNumber(row.estimated_slippage_pct, 4)}%`}</td>
+    </tr>`).join('')
+    : '<tr><td colspan="10">No execution decision audit rows available.</td></tr>';
 
   $('trades').innerHTML = `
     <div class="panel-head">
@@ -2824,12 +3033,19 @@ function renderTrades(data) {
       ${kpi('Historical Trades', fmtCount(historical.length), 'Closed, failed, rejected')}
     </div>
     <div class="kpi-grid" style="margin-bottom: 12px;">
-      ${kpi('Outcome Wins', fmtCount(filteredOutcomeCounts.WIN), outcomeKpiSub('WIN'))}
-      ${kpi('Outcome Losses', fmtCount(filteredOutcomeCounts.LOSS), outcomeKpiSub('LOSS'))}
-      ${kpi('Outcome PNL', formatSignedCount(filteredOutcomePnl), `${formatSignedCount(filteredOutcomePnl)} filtered / ${formatSignedCount(allOutcomePnl)} loaded`)}
-      ${kpi('Unknown Outcomes', fmtCount(filteredOutcomeCounts.UNKNOWN), outcomeKpiSub('UNKNOWN'))}
-      ${kpi('Open Outcomes', fmtCount(filteredOutcomeCounts.OPEN), outcomeKpiSub('OPEN'))}
+      ${kpi('Executed Win Rate', perfValue(execPerf.executed_trade_win_rate_pct, v => `${fmtNumber(v, 2)}%`), perfSub('Closed finalized executed trades only'))}
+      ${kpi('Total Net P/L', perfValue(execPerf.total_net_pnl), `${fmtCount(finalizedCount)} finalized / ${fmtCount(closedCount)} closed`)}
+      ${kpi('Expectancy', perfValue(execPerf.expectancy), perfSub('Average net P/L per finalized trade'))}
+      ${kpi('Average Win', perfValue(execPerf.average_win), `${fmtCount(execPerf.wins || 0)} wins`)}
+      ${kpi('Average Loss', perfValue(execPerf.average_loss), `${fmtCount(execPerf.losses || 0)} losses`)}
+      ${kpi('Drawdown', perfValue(execPerf.max_drawdown), perfSub('From finalized trade net P/L sequence'))}
+      ${kpi('Spread Impact', perfValue(execPerf.average_spread_cost), perfSub('Average finalized spread cost'))}
+      ${kpi('Slippage Impact', perfValue(execPerf.average_slippage_estimate), perfSub('Average finalized slippage estimate'))}
+      ${kpi('Finalization Pending', fmtCount(execPerf.unknown_outcome_count || 0), 'Closed trades missing finalized P/L outcome')}
     </div>
+
+    <h3 style="margin-top: 12px;">Execution Decision Reasons</h3>
+    <div class="table-wrap" style="margin-bottom: 12px;"><table><thead><tr><th>Date / Time</th><th>Signal</th><th>Decision</th><th>Block Reason</th><th>Validation</th><th>Score</th><th>Net Edge</th><th>Spread</th><th>Fee</th><th>Slippage</th></tr></thead><tbody>${decisionTableRows}</tbody></table></div>
 
     <div class="control-grid" style="grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); margin-bottom: 10px;">
       <label class="field">Lifecycle
@@ -2840,6 +3056,12 @@ function renderTrades(data) {
           ${tradeFilterOption('QUEUE', 'Execution queue', tradeExecutionFilters.lifecycle)}
           ${tradeFilterOption('HISTORICAL', 'Historical trades', tradeExecutionFilters.lifecycle)}
         </select>
+      </label>
+      <label class="field">From Date
+        <input id="tradeDateFromFilter" type="date" value="${escapeHtml(tradeExecutionFilters.dateFrom)}" title="Dates are interpreted in Asia/Amman timezone.">
+      </label>
+      <label class="field">To Date
+        <input id="tradeDateToFilter" type="date" value="${escapeHtml(tradeExecutionFilters.dateTo)}" title="Dates are interpreted in Asia/Amman timezone.">
       </label>
       <label class="field">Status
         <select id="tradeStatusFilter">
@@ -2897,7 +3119,7 @@ function renderBaselines(data) {
 
   $('baselines').innerHTML = `
     <div class="panel-head"><h2>Baselines</h2><span class="chip info">${entries.length} reports</span></div>
-    <div class="table-wrap"><table><thead><tr><th>Baseline</th><th>Direction</th><th>Quality</th><th>Direction Accuracy</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+    <div class="table-wrap"><table><thead><tr><th>Baseline</th><th>Direction</th><th>Quality</th><th>Directional Forecast Hit Rate</th></tr></thead><tbody>${rows}</tbody></table></div>`;
 }
 
 function renderFiles(data) {
@@ -2997,19 +3219,19 @@ function renderModelPerformance(perf) {
   const gateRows = gates.length
     ? gates.map(g => `<tr><td>${escapeHtml(g.gate_name)}</td><td>${chip(g.status)}</td><td>${fmtNumber(g.metric_value)}</td><td>${fmtNumber(g.threshold_value)}</td></tr>`).join('')
     : '<tr><td colspan="4">No promotion gates evaluated yet.</td></tr>';
-  const matchedRows = `<tr><th>Wins / Losses</th><td>${fmtCount(activeMatched.wins)} / ${fmtCount(activeMatched.losses)}</td><td>${fmtCount(shadowMatched.wins)} / ${fmtCount(shadowMatched.losses)}</td></tr>
+  const matchedRows = `<tr><th>Directional Wins / Losses</th><td>${fmtCount(activeMatched.wins)} / ${fmtCount(activeMatched.losses)}</td><td>${fmtCount(shadowMatched.wins)} / ${fmtCount(shadowMatched.losses)}</td></tr>
     <tr><th>Directional Samples</th><td>${fmtCount(activeMatched.samples)}</td><td>${fmtCount(shadowMatched.samples)}</td></tr>
-    <tr><th>Win Rate</th><td>${activeMatched.win_rate_pct === null || activeMatched.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(activeMatched.win_rate_pct, 2)}%`}</td><td>${shadowMatched.win_rate_pct === null || shadowMatched.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(shadowMatched.win_rate_pct, 2)}%`}</td></tr>
+    <tr><th>Matched Directional Hit Rate</th><td>${activeMatched.win_rate_pct === null || activeMatched.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(activeMatched.win_rate_pct, 2)}%`}</td><td>${shadowMatched.win_rate_pct === null || shadowMatched.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(shadowMatched.win_rate_pct, 2)}%`}</td></tr>
     <tr><th>Shadow Lift</th><td colspan="2">${matched.shadow_minus_active_pct === null || matched.shadow_minus_active_pct === undefined ? 'n/a' : `${fmtNumber(matched.shadow_minus_active_pct, 2)}%`}</td></tr>
     <tr><th>Disagreements</th><td>${fmtCount(matched.disagreement?.active_wins_when_disagree)} active wins / ${fmtCount(matched.disagreement?.samples)} samples</td><td>${fmtCount(matched.disagreement?.shadow_wins_when_disagree)} shadow wins / ${fmtCount(matched.disagreement?.samples)} samples</td></tr>`;
   const statusRows = `<tr><th>Wins / Losses / Pending</th><td>${fmtCount(statusActiveAll.wins)} / ${fmtCount(statusActiveAll.losses)} / ${fmtCount(statusActiveAll.pending)}</td><td>${fmtCount(statusActiveCovered.wins)} / ${fmtCount(statusActiveCovered.losses)} / ${fmtCount(statusActiveCovered.pending)}</td><td>${fmtCount(statusShadowRuns.wins)} / ${fmtCount(statusShadowRuns.losses)} / ${fmtCount(statusShadowRuns.pending)}</td></tr>
     <tr><th>Run Count</th><td>${fmtCount(statusActiveAll.total)}</td><td>${fmtCount(statusActiveCovered.total)}</td><td>${fmtCount(statusShadowRuns.total)}</td></tr>
-    <tr><th>Win Rate</th><td>${statusActiveAll.win_rate_pct === null || statusActiveAll.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusActiveAll.win_rate_pct, 2)}%`}</td><td>${statusActiveCovered.win_rate_pct === null || statusActiveCovered.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusActiveCovered.win_rate_pct, 2)}%`}</td><td>${statusShadowRuns.win_rate_pct === null || statusShadowRuns.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusShadowRuns.win_rate_pct, 2)}%`}</td></tr>`;
+    <tr><th>Signal Outcome Hit Rate</th><td>${statusActiveAll.win_rate_pct === null || statusActiveAll.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusActiveAll.win_rate_pct, 2)}%`}</td><td>${statusActiveCovered.win_rate_pct === null || statusActiveCovered.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusActiveCovered.win_rate_pct, 2)}%`}</td><td>${statusShadowRuns.win_rate_pct === null || statusShadowRuns.win_rate_pct === undefined ? 'n/a' : `${fmtNumber(statusShadowRuns.win_rate_pct, 2)}%`}</td></tr>`;
   $('modelPerformance').innerHTML = `
     <div class="panel-head"><h2>Model Performance</h2><span class="chip info">${escapeHtml(shadow.model_version_id || shadow.shadow_model_version_id || 'no shadow')}</span></div>
     <div class="kpi-grid" style="margin-bottom: 12px;">
-      ${kpi('Active Accuracy', active.direction_accuracy_pct === null || active.direction_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(active.direction_accuracy_pct, 2)}%`, `${fmtCount(active.samples)} samples`)}
-      ${kpi('Shadow Accuracy', shadow.direction_accuracy_pct === null || shadow.direction_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(shadow.direction_accuracy_pct, 2)}%`, `${fmtCount(shadow.samples)} samples`)}
+      ${kpi('Active Directional Hit Rate', active.direction_accuracy_pct === null || active.direction_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(active.direction_accuracy_pct, 2)}%`, `${fmtCount(active.samples)} samples`)}
+      ${kpi('Shadow Directional Hit Rate', shadow.direction_accuracy_pct === null || shadow.direction_accuracy_pct === undefined ? 'n/a' : `${fmtNumber(shadow.direction_accuracy_pct, 2)}%`, `${fmtCount(shadow.samples)} samples`)}
       ${kpi('Shadow Lift', shadow.lift_pct === null || shadow.lift_pct === undefined ? 'n/a' : `${fmtNumber(shadow.lift_pct, 2)}%`, 'Shadow minus active')}
       ${kpi('Disagreements', fmtCount(disagreement.samples), `${fmtCount(disagreement.shadow_wins_when_disagree)} shadow wins`)}
     </div>
@@ -3019,7 +3241,7 @@ function renderModelPerformance(perf) {
     <h3 style="margin-top: 14px;">Signal Status Comparison (Run-level)</h3>
     <div class="table-wrap"><table><thead><tr><th>Metric</th><th>Active (all runs)</th><th>Active (shadow-covered runs)</th><th>Shadow runs</th></tr></thead><tbody>${statusRows}</tbody></table></div>
     <h3>Horizon Metrics</h3>
-    <div class="table-wrap"><table><thead><tr><th>Horizon</th><th>Samples</th><th>Active Accuracy</th><th>Shadow Accuracy</th><th>MAPE</th></tr></thead><tbody>${horizonRows}</tbody></table></div>
+    <div class="table-wrap"><table><thead><tr><th>Horizon</th><th>Samples</th><th>Active Per-Horizon Hit Rate</th><th>Shadow Per-Horizon Hit Rate</th><th>MAPE</th></tr></thead><tbody>${horizonRows}</tbody></table></div>
     <h3 style="margin-top: 14px;">Promotion Gates</h3>
     <div class="table-wrap"><table><thead><tr><th>Gate</th><th>Status</th><th>Metric</th><th>Threshold</th></tr></thead><tbody>${gateRows}</tbody></table></div>`;
 }
@@ -3096,7 +3318,7 @@ function render(data, options = {}) {
     kpi('Confidence', hs.confidence_pct === null || hs.confidence_pct === undefined ? 'n/a' : `${fmtNumber(hs.confidence_pct, 2)}%`, 'Model confidence'),
     kpi('Last Prediction', fmtDate(hs.last_prediction_time), hs.last_prediction_run_id ? `Run: ${hs.last_prediction_run_id}` : 'No run id'),
     kpi('Last Auto Prediction', fmtDate(hs.last_auto_prediction_time), 'Scheduler heartbeat timestamp'),
-    kpi('Win Rate', db.win_rate_pct === null || db.win_rate_pct === undefined ? 'n/a' : `${Number(db.win_rate_pct).toFixed(2)}%`, `${db.wins ?? 0} WIN / ${db.losses ?? 0} LOSS`),
+    kpi('Directional Forecast Hit Rate', db.metric_categories?.forecast_quality?.directional_forecast_hit_rate_pct === null || db.metric_categories?.forecast_quality?.directional_forecast_hit_rate_pct === undefined ? 'n/a' : `${Number(db.metric_categories.forecast_quality.directional_forecast_hit_rate_pct).toFixed(2)}%`, `${db.wins ?? 0} forecast WIN / ${db.losses ?? 0} forecast LOSS`),
     kpi('Pending Candles', db.pending ?? 0, 'Awaiting actual candle close'),
   ].join('');
   const summaryCardsKey = [
@@ -3111,7 +3333,7 @@ function render(data, options = {}) {
     hs.last_prediction_time || '',
     hs.last_prediction_run_id || '',
     hs.last_auto_prediction_time || '',
-    db.win_rate_pct === null || db.win_rate_pct === undefined ? 'n/a' : Number(db.win_rate_pct).toFixed(2),
+    db.metric_categories?.forecast_quality?.directional_forecast_hit_rate_pct === null || db.metric_categories?.forecast_quality?.directional_forecast_hit_rate_pct === undefined ? 'n/a' : Number(db.metric_categories.forecast_quality.directional_forecast_hit_rate_pct).toFixed(2),
     String(db.pending ?? 0),
   ].join('|');
   if (summaryCardsKey !== lastSummaryCardsKey) {
@@ -3333,6 +3555,8 @@ document.addEventListener('click', async event => {
   if (target.id === 'tradeReset') {
     tradeExecutionFilters = {
       lifecycle: '',
+      dateFrom: '',
+      dateTo: '',
       status: '',
       outcome: '',
       side: '',
@@ -3502,6 +3726,8 @@ document.addEventListener('keydown', async event => {
     }
     tradeExecutionFilters = {
       lifecycle: '',
+      dateFrom: '',
+      dateTo: '',
       status: '',
       outcome: '',
       side: '',

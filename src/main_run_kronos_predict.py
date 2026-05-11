@@ -13,6 +13,7 @@ import pandas as pd
 from config import configure_logging
 from logging_utils import log_event, new_correlation_id
 from prediction_store import save_prediction_run
+from prediction_input_quality import input_window_audit, resolve_feature_experiment, select_feature_columns
 from time_utils import display_timezone_name, format_local_timestamp
 from signal_config import load_signal_config
 from trade_execution import enqueue_signal_for_execution
@@ -118,9 +119,18 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--feature-set",
-        default="auto",
-        choices=["auto", "ohlc", "ohlcv", "ohlcva"],
-        help="Columns passed to Kronos. auto omits unavailable all-zero amount but keeps volume.",
+        default="ohlcv_only",
+        choices=[
+            "auto",
+            "ohlc",
+            "ohlcv",
+            "ohlcva",
+            "ohlcv_only",
+            "ohlcva_derived_amount",
+            "ohlcv_with_regime_context",
+            "multi_timeframe_validation_only",
+        ],
+        help="Controlled feature/input experiment mode. Default production mode is explicit OHLCV_ONLY.",
     )
     parser.add_argument(
         "--repair-ohlc",
@@ -237,23 +247,7 @@ def _validate_kronos_df(df: pd.DataFrame) -> None:
 
 
 def _select_feature_columns(df: pd.DataFrame, feature_set: str) -> list[str]:
-    if feature_set == "ohlc":
-        return ["open", "high", "low", "close"]
-    if feature_set == "ohlcv":
-        return ["open", "high", "low", "close", "volume"]
-    if feature_set == "ohlcva":
-        return ["open", "high", "low", "close", "volume", "amount"]
-
-    # NaN-aware checks: None/NaN volume means the data source doesn't provide it.
-    amount_col = pd.to_numeric(df["amount"], errors="coerce")
-    volume_col = pd.to_numeric(df["volume"], errors="coerce")
-    amount_is_unavailable = bool(amount_col.isna().all() or (amount_col.fillna(0).abs() < 1e-12).all())
-    volume_is_available = bool(volume_col.notna().any() and (volume_col.fillna(0).abs() > 1e-12).any())
-    if amount_is_unavailable and volume_is_available:
-        return ["open", "high", "low", "close", "volume"]
-    if amount_is_unavailable:
-        return ["open", "high", "low", "close"]
-    return ["open", "high", "low", "close", "volume", "amount"]
+    return select_feature_columns(df, feature_set)
 
 
 def _repair_ohlc(pred_df: pd.DataFrame) -> pd.DataFrame:
@@ -354,7 +348,19 @@ def _write_metadata(
     forecast_csv: Path,
     input_copy_csv: Path,
     validation_report: Path | None,
+    selected_feature_columns: list[str],
+    feature_mode: str,
+    input_quality_snapshot: dict[str, object] | None = None,
+    forecast_timestamp_check_status: str = "PASS",
+    forecast_timestamp_mismatches: list[dict[str, object]] | None = None,
 ) -> None:
+    input_quality = input_quality_snapshot or {}
+    amount_mode = (
+        "DERIVED"
+        if input_quality.get("amount_derivation_method")
+        else ("AVAILABLE" if input_quality.get("amount_available") else "UNAVAILABLE")
+    )
+    forecast_timestamp_verified = forecast_timestamp_check_status == "PASS" and not (forecast_timestamp_mismatches or [])
     metadata = {
         "epic": epic,
         "market_name": market_name,
@@ -382,6 +388,23 @@ def _write_metadata(
         "forecast_csv_path": str(forecast_csv),
         "input_csv_path": str(input_copy_csv),
         "validation_report_path": str(validation_report) if validation_report else None,
+        "selected_feature_columns": list(selected_feature_columns),
+        "feature_mode": feature_mode,
+        "input_feature_columns": list(selected_feature_columns),
+        "amount_mode": amount_mode,
+        "amount_available": bool(input_quality.get("amount_available", "amount" in selected_feature_columns)),
+        "amount_derivation_method": input_quality.get("amount_derivation_method"),
+        "regime_context_used": bool(input_quality.get("regime_context_used", False)),
+        "volume_available": bool(input_quality.get("volume_available", "volume" in selected_feature_columns)),
+        "input_missing_candle_count": input_quality.get("missing_candle_count"),
+        "input_largest_gap_minutes": input_quality.get("largest_gap_minutes"),
+        "input_gap_list": input_quality.get("gap_list") or [],
+        "input_source_counts": input_quality.get("source_counts") or {},
+        "input_closed_candle_verified": bool(input_quality.get("strict_policy_passed", True)),
+        "forecast_timestamp_verified": forecast_timestamp_verified,
+        "input_quality_snapshot": input_quality,
+        "forecast_timestamp_check_status": forecast_timestamp_check_status,
+        "forecast_timestamp_mismatches": forecast_timestamp_mismatches or [],
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
@@ -409,6 +432,27 @@ def _future_timestamps(last_timestamp: pd.Timestamp, resolution: str, pred_len: 
     freq = RESOLUTION_TO_PANDAS_FREQ[resolution]
     start = last_timestamp + pd.tseries.frequencies.to_offset(freq)
     return pd.Series(pd.date_range(start=start, periods=pred_len, freq=freq, tz="UTC"))
+
+
+def _forecast_timestamp_mismatches(
+    pred_df: pd.DataFrame,
+    *,
+    last_input_timestamp: pd.Timestamp,
+    resolution: str,
+) -> list[dict[str, object]]:
+    expected = _future_timestamps(last_input_timestamp, resolution, len(pred_df))
+    actual = pd.to_datetime(pred_df["timestamps"], utc=True).reset_index(drop=True)
+    mismatches: list[dict[str, object]] = []
+    for index, (expected_ts, actual_ts) in enumerate(zip(expected, actual), start=1):
+        if pd.Timestamp(expected_ts) != pd.Timestamp(actual_ts):
+            mismatches.append(
+                {
+                    "horizon_index": index,
+                    "expected_timestamp_utc": pd.Timestamp(expected_ts).isoformat(),
+                    "actual_timestamp_utc": pd.Timestamp(actual_ts).isoformat(),
+                }
+            )
+    return mismatches
 
 
 def _run_external_signal_validation(
@@ -579,7 +623,7 @@ def run_prediction(
         )
         df = pd.read_csv(input_csv)
         df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
-        df = df.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+        df = df.sort_values("timestamps").reset_index(drop=True)
         log_event(
             LOGGER,
             logging.INFO,
@@ -611,8 +655,25 @@ def run_prediction(
             price_side=price_side,
         )
 
-        feature_columns = _select_feature_columns(df, feature_set)
         input_used_df = df.tail(input_rows_used).reset_index(drop=True)
+        feature_selection = resolve_feature_experiment(input_used_df, feature_set)
+        input_used_df = feature_selection.dataframe.reset_index(drop=True)
+        feature_columns = feature_selection.feature_columns
+        amount_available = feature_selection.amount_available
+        feature_mode = feature_selection.feature_mode
+        input_quality_snapshot = input_window_audit(
+            input_used_df,
+            resolution=resolution,
+            requested_lookback=lookback,
+            selected_feature_columns=feature_columns,
+            source_label=source,
+            symbol=epic,
+            price_side=price_side,
+        )
+        input_quality_snapshot["feature_mode"] = feature_mode
+        input_quality_snapshot["amount_derivation_method"] = feature_selection.amount_derivation_method
+        input_quality_snapshot["regime_context_used"] = feature_selection.regime_context_used
+        input_quality_snapshot["feature_experiment_notes"] = feature_selection.notes
         x_df = input_used_df[feature_columns].reset_index(drop=True)
         x_timestamp = input_used_df["timestamps"].reset_index(drop=True)
         y_timestamp = _future_timestamps(x_timestamp.iloc[-1], resolution, pred_len)
@@ -624,6 +685,10 @@ def run_prediction(
             prediction_request_id=request_id,
             feature_set=feature_set,
             feature_columns=feature_columns,
+            feature_mode=feature_mode,
+            amount_available=amount_available,
+            amount_derivation_method=feature_selection.amount_derivation_method,
+            regime_context_used=feature_selection.regime_context_used,
             input_rows_used=input_rows_used,
             device=device,
         )
@@ -704,6 +769,20 @@ def run_prediction(
             if col not in pred_df.columns:
                 pred_df[col] = 0.0
         pred_df = pred_df[KRONOS_COLUMNS]
+        timestamp_mismatches = _forecast_timestamp_mismatches(
+            pred_df,
+            last_input_timestamp=x_timestamp.iloc[-1],
+            resolution=resolution,
+        )
+        if timestamp_mismatches:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "kronos.forecast.timestamp_mismatch",
+                prediction_request_id=request_id,
+                mismatches=timestamp_mismatches,
+            )
+            raise ValueError(f"Forecast timestamp equality check failed: {timestamp_mismatches[:3]}")
         if repair_ohlc:
             pred_df = _repair_ohlc(pred_df)
         report = _validate_forecast(
@@ -785,6 +864,11 @@ def run_prediction(
                 forecast_csv=output_csv,
                 input_copy_csv=input_copy_output,
                 validation_report=validation_report,
+                selected_feature_columns=feature_columns,
+                feature_mode=feature_mode,
+                input_quality_snapshot=input_quality_snapshot,
+                forecast_timestamp_check_status="PASS",
+                forecast_timestamp_mismatches=timestamp_mismatches,
             )
             log_event(
                 LOGGER,

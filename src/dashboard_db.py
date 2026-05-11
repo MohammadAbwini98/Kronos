@@ -466,11 +466,31 @@ def horizon_metric_summary(*, symbol: str, resolution: str, dsn: str | None = No
                 """
                 SELECT
                     hm.horizon_index,
-                    COUNT(*) FILTER (WHERE hm.status IN ('WIN','LOSS'))::int AS samples,
-                    COALESCE(SUM(CASE WHEN hm.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
-                    COALESCE(SUM(CASE WHEN hm.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
-                    AVG(ABS(hm.close_error)) FILTER (WHERE hm.status IN ('WIN','LOSS'))::double precision AS mae,
-                    AVG(ABS(hm.close_error_pct)) FILTER (WHERE hm.status IN ('WIN','LOSS'))::double precision AS mape_pct
+                    COUNT(*) FILTER (
+                        WHERE hm.status IN ('WIN','LOSS')
+                          AND hm.validation_state = 'FINAL'
+                          AND hm.actual_window_complete = true
+                    )::int AS samples,
+                    COALESCE(SUM(CASE
+                        WHEN hm.status = 'WIN'
+                         AND hm.validation_state = 'FINAL'
+                         AND hm.actual_window_complete = true THEN 1 ELSE 0
+                    END), 0)::int AS wins,
+                    COALESCE(SUM(CASE
+                        WHEN hm.status = 'LOSS'
+                         AND hm.validation_state = 'FINAL'
+                         AND hm.actual_window_complete = true THEN 1 ELSE 0
+                    END), 0)::int AS losses,
+                    AVG(ABS(hm.close_error)) FILTER (
+                        WHERE hm.status IN ('WIN','LOSS')
+                          AND hm.validation_state = 'FINAL'
+                          AND hm.actual_window_complete = true
+                    )::double precision AS mae,
+                    AVG(ABS(hm.close_error_pct)) FILTER (
+                        WHERE hm.status IN ('WIN','LOSS')
+                          AND hm.validation_state = 'FINAL'
+                          AND hm.actual_window_complete = true
+                    )::double precision AS mape_pct
                 FROM forecast_horizon_metrics hm
                 JOIN prediction_runs r ON r.run_id = hm.run_id
                 WHERE r.symbol = %s AND r.resolution = %s

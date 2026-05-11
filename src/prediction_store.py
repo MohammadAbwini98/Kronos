@@ -22,6 +22,7 @@ from forecast_scoring import (
     score_trade_signal_outcome,
     signal_status_from_counts,
 )
+from metrics_validation import compute_baseline_comparisons, terminal_direction_outcome
 from model_registry import associate_run_model_version, model_version_id_for_path, register_model_version
 from logging_utils import log_event, new_correlation_id
 
@@ -30,6 +31,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 PREDICTION_COLUMNS = ["timestamps", "open", "high", "low", "close", "volume", "amount"]
+RESOLUTION_TO_PANDAS_FREQ = {
+    "MINUTE": "1min",
+    "MINUTE_5": "5min",
+    "MINUTE_15": "15min",
+    "MINUTE_30": "30min",
+    "HOUR": "1h",
+    "HOUR_4": "4h",
+    "DAY": "1D",
+    "WEEK": "1W",
+}
 SOURCE_PRIORITY = {
     "historical": 0,
     "actual_validation": 1,
@@ -80,10 +91,10 @@ def _coerce_finite_float(
     field: str,
     timestamp_utc: str,
     allow_null: bool = False,
-) -> float:
+) -> float | None:
     if pd.isna(value):
         if allow_null:
-            return 0.0
+            return None
         raise PredictionStoreError(f"Candle field {field!r} is null at {timestamp_utc}")
     try:
         result = float(value)
@@ -102,8 +113,77 @@ def preferred_candle_source(existing: str | None, incoming: str | None) -> str:
     return incoming_value if incoming_rank >= existing_rank else existing_value
 
 
+def persist_prediction_input_rejection(
+    *,
+    prediction_request_id: str | None,
+    symbol: str,
+    epic: str,
+    resolution: str,
+    price_side: str,
+    requested_lookback: int,
+    actual_lookback: int,
+    reason: str,
+    rejection_reasons: list[str],
+    quality_snapshot: dict[str, Any],
+    metadata_path: str | Path | None = None,
+    input_csv_path: str | Path | None = None,
+    dsn: str | None = None,
+) -> None:
+    with connect(dsn) as conn:
+        conn.execute(
+            """
+            INSERT INTO prediction_input_rejections(
+                prediction_request_id, symbol, epic, resolution, price_side,
+                requested_lookback, actual_lookback, reason, rejection_reasons,
+                quality_snapshot, metadata_path, input_csv_path
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """,
+            (
+                prediction_request_id,
+                symbol,
+                epic,
+                resolution,
+                price_side,
+                int(requested_lookback),
+                int(actual_lookback),
+                reason,
+                Jsonb(rejection_reasons or []),
+                Jsonb(quality_snapshot or {}),
+                str(metadata_path) if metadata_path else None,
+                str(input_csv_path) if input_csv_path else None,
+            ),
+        )
+
+
 def _safe_symbol(metadata: dict[str, Any]) -> str:
     return str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD")
+
+
+def _forecast_timestamp_mismatches_for_metadata(metadata: dict[str, Any], forecast: pd.DataFrame) -> list[dict[str, Any]]:
+    resolution = str(metadata["resolution"])
+    freq = RESOLUTION_TO_PANDAS_FREQ.get(resolution)
+    if not freq:
+        return [{"error": f"Unsupported resolution for timestamp equality: {resolution}"}]
+    last_input = pd.to_datetime(metadata.get("input_end_timestamp_utc") or metadata.get("input_end_timestamp"), utc=True)
+    expected = pd.date_range(
+        start=last_input + pd.tseries.frequencies.to_offset(freq),
+        periods=len(forecast),
+        freq=freq,
+        tz="UTC",
+    )
+    actual = pd.to_datetime(forecast["timestamps"], utc=True).reset_index(drop=True)
+    mismatches: list[dict[str, Any]] = []
+    for index, (expected_ts, actual_ts) in enumerate(zip(expected, actual), start=1):
+        if pd.Timestamp(expected_ts) != pd.Timestamp(actual_ts):
+            mismatches.append(
+                {
+                    "horizon_index": index,
+                    "expected_timestamp_utc": pd.Timestamp(expected_ts).isoformat(),
+                    "actual_timestamp_utc": pd.Timestamp(actual_ts).isoformat(),
+                }
+            )
+    return mismatches
 
 
 def _as_validation_summary(value: Any) -> dict[str, Any]:
@@ -199,9 +279,9 @@ def upsert_ohlcv_df(
         missing_list = ", ".join(missing_required)
         raise PredictionStoreError(f"OHLC DataFrame missing required columns: {missing_list}")
     if "volume" not in clean.columns:
-        clean["volume"] = 0.0
+        clean["volume"] = None
     if "amount" not in clean.columns:
-        clean["amount"] = 0.0
+        clean["amount"] = None
     clean["timestamps"] = pd.to_datetime(clean["timestamps"], utc=True)
     rows = []
     for _, row in clean.iterrows():
@@ -212,6 +292,9 @@ def upsert_ohlcv_df(
         close_price = _coerce_finite_float(row["close"], field="close", timestamp_utc=timestamp_utc)
         volume_value = _coerce_finite_float(row["volume"], field="volume", timestamp_utc=timestamp_utc, allow_null=True)
         amount_value = _coerce_finite_float(row["amount"], field="amount", timestamp_utc=timestamp_utc, allow_null=True)
+        websocket_source = source == "websocket_ohlc"
+        incoming_volume_unavailable = volume_value is None or (websocket_source and abs(float(volume_value or 0.0)) <= 1e-12)
+        incoming_amount_unavailable = amount_value is None or (websocket_source and abs(float(amount_value or 0.0)) <= 1e-12)
 
         if high_price < max(open_price, close_price, low_price) or low_price > min(open_price, close_price, high_price):
             raise PredictionStoreError(
@@ -234,7 +317,14 @@ def upsert_ohlcv_df(
                 volume_value,
                 amount_value,
                 source,
-                Jsonb({}),
+                Jsonb(
+                    {
+                        "incoming_volume_missing": incoming_volume_unavailable,
+                        "incoming_amount_missing": incoming_amount_unavailable,
+                        "incoming_source": source,
+                        "websocket_provisional": websocket_source,
+                    }
+                ),
             )
         )
     with connect(dsn) as conn:
@@ -245,21 +335,54 @@ def upsert_ohlcv_df(
                     provider, symbol, epic, resolution, price_side, timestamp_utc,
                     open, high, low, close, volume, amount, source, raw_payload, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, COALESCE(%s, 0), COALESCE(%s, 0), %s, %s, now())
                 ON CONFLICT(provider, symbol, epic, resolution, price_side, timestamp_utc) DO UPDATE SET
                     open = EXCLUDED.open,
                     high = EXCLUDED.high,
                     low = EXCLUDED.low,
                     close = EXCLUDED.close,
-                    volume = EXCLUDED.volume,
-                    amount = EXCLUDED.amount,
+                    volume = CASE
+                        WHEN EXCLUDED.source = 'websocket_ohlc'
+                         AND COALESCE((EXCLUDED.raw_payload->>'incoming_volume_missing')::boolean, false)
+                        THEN ohlcv_candles.volume
+                        ELSE COALESCE(EXCLUDED.volume, ohlcv_candles.volume, 0)
+                    END,
+                    amount = CASE
+                        WHEN EXCLUDED.source = 'websocket_ohlc'
+                         AND COALESCE((EXCLUDED.raw_payload->>'incoming_amount_missing')::boolean, false)
+                        THEN ohlcv_candles.amount
+                        ELSE COALESCE(EXCLUDED.amount, ohlcv_candles.amount, 0)
+                    END,
                     source = CASE
-                        WHEN EXCLUDED.source = 'websocket_ohlc' OR ohlcv_candles.source = 'websocket_ohlc' THEN 'websocket_ohlc'
+                        WHEN EXCLUDED.source = 'websocket_ohlc'
+                         AND ohlcv_candles.source IN ('latest_fetch', 'historical', 'actual_validation')
+                        THEN ohlcv_candles.source
                         WHEN EXCLUDED.source = 'latest_fetch' OR ohlcv_candles.source = 'latest_fetch' THEN 'latest_fetch'
                         WHEN EXCLUDED.source = 'actual_validation' OR ohlcv_candles.source = 'actual_validation' THEN 'actual_validation'
+                        WHEN EXCLUDED.source = 'websocket_ohlc' OR ohlcv_candles.source = 'websocket_ohlc' THEN 'websocket_ohlc'
                         ELSE EXCLUDED.source
                     END,
-                    raw_payload = EXCLUDED.raw_payload,
+                    raw_payload = jsonb_build_object(
+                        'previous_source', ohlcv_candles.source,
+                        'incoming_source', EXCLUDED.source,
+                        'effective_source', CASE
+                            WHEN EXCLUDED.source = 'websocket_ohlc'
+                             AND ohlcv_candles.source IN ('latest_fetch', 'historical', 'actual_validation')
+                            THEN ohlcv_candles.source
+                            WHEN EXCLUDED.source = 'latest_fetch' OR ohlcv_candles.source = 'latest_fetch' THEN 'latest_fetch'
+                            WHEN EXCLUDED.source = 'actual_validation' OR ohlcv_candles.source = 'actual_validation' THEN 'actual_validation'
+                            WHEN EXCLUDED.source = 'websocket_ohlc' OR ohlcv_candles.source = 'websocket_ohlc' THEN 'websocket_ohlc'
+                            ELSE EXCLUDED.source
+                        END,
+                        'incoming_volume_missing', COALESCE((EXCLUDED.raw_payload->>'incoming_volume_missing')::boolean, false),
+                        'incoming_amount_missing', COALESCE((EXCLUDED.raw_payload->>'incoming_amount_missing')::boolean, false),
+                        'websocket_provisional', COALESCE((EXCLUDED.raw_payload->>'websocket_provisional')::boolean, false),
+                        'preserved_volume_from_existing',
+                            EXCLUDED.source = 'websocket_ohlc' AND COALESCE((EXCLUDED.raw_payload->>'incoming_volume_missing')::boolean, false),
+                        'preserved_amount_from_existing',
+                            EXCLUDED.source = 'websocket_ohlc' AND COALESCE((EXCLUDED.raw_payload->>'incoming_amount_missing')::boolean, false),
+                        'updated_at', now()
+                    ),
                     updated_at = now()
                 """,
                 rows,
@@ -565,6 +688,17 @@ def save_prediction_run(
         price_side = str(metadata.get("price_side", "mid"))
         provider = str(metadata.get("source_provider", "Capital.com"))
         last_input_close = float(metadata["last_input_close"])
+        timestamp_mismatches = metadata.get("forecast_timestamp_mismatches") or _forecast_timestamp_mismatches_for_metadata(metadata, forecast)
+        if timestamp_mismatches:
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "prediction_store.forecast_timestamp_mismatch",
+                prediction_request_id=request_id,
+                run_id=run_id,
+                mismatches=timestamp_mismatches,
+            )
+            raise PredictionStoreError(f"Forecast timestamp equality check failed for {run_id}: {timestamp_mismatches[:3]}")
         final_close = float(forecast["close"].iloc[-1])
         signal = _signal_from_forecast(
             last_input_close=last_input_close,
@@ -575,7 +709,12 @@ def save_prediction_run(
             recent_volatility_pct=_load_recent_volatility_pct(metadata.get("input_csv_path")),
         )
         data_quality = metadata.get("data_quality") or {}
+        input_quality_snapshot = metadata.get("input_quality_snapshot") or data_quality
         data_quality_grade = data_quality.get("quality_grade")
+        selected_feature_columns = list(metadata.get("selected_feature_columns") or input_quality_snapshot.get("selected_feature_columns") or [])
+        amount_available = bool(metadata.get("amount_available", input_quality_snapshot.get("amount_available", False)))
+        amount_derivation_method = metadata.get("amount_derivation_method") or input_quality_snapshot.get("amount_derivation_method")
+        regime_context_used = bool(metadata.get("regime_context_used", input_quality_snapshot.get("regime_context_used", False)))
         model_name = str(metadata.get("model_name", "Kronos"))
         model_path = metadata.get("model_path") or ""
         tokenizer_path = metadata.get("tokenizer_path")
@@ -613,7 +752,13 @@ def save_prediction_run(
                     forecast_start_timestamp_utc, forecast_end_timestamp_utc,
                     input_rows_used, forecast_rows, forecast_horizon_minutes, last_input_close,
                     metadata_path, input_csv_path, forecast_csv_path, validation_report_path,
-                    scoring_version, data_quality_grade, model_version_id, run_status, updated_at
+                    scoring_version, data_quality_grade, model_version_id,
+                    feature_mode, input_quality_snapshot, forecast_timestamp_check_status,
+                    forecast_timestamp_mismatches, feature_set_name, feature_columns, lookback, horizon,
+                    amount_available, amount_derivation_method, regime_context_used, amount_mode,
+                    horizon_policy, regime_feature_version, calibration_version,
+                    training_data_start, training_data_end, validation_data_start, validation_data_end,
+                    leakage_check_status, baseline_comparison_summary_json, run_status, updated_at
                 )
                 VALUES (
                     %(run_id)s, %(provider)s, %(symbol)s, %(epic)s, %(market_name)s, %(resolution)s, %(price_side)s, %(source_provider)s,
@@ -621,7 +766,13 @@ def save_prediction_run(
                     %(input_start)s, %(input_end)s, %(forecast_start)s, %(forecast_end)s,
                     %(input_rows_used)s, %(forecast_rows)s, %(forecast_horizon_minutes)s, %(last_input_close)s,
                     %(metadata_path)s, %(input_csv_path)s, %(forecast_csv_path)s, %(validation_report_path)s,
-                    %(scoring_version)s, %(data_quality_grade)s, %(model_version_id)s, 'PENDING', now()
+                    %(scoring_version)s, %(data_quality_grade)s, %(model_version_id)s,
+                    %(feature_mode)s, %(input_quality_snapshot)s, %(forecast_timestamp_check_status)s,
+                    %(forecast_timestamp_mismatches)s, %(feature_set_name)s, %(feature_columns)s, %(lookback)s, %(horizon)s,
+                    %(amount_available)s, %(amount_derivation_method)s, %(regime_context_used)s, %(amount_mode)s,
+                    %(horizon_policy)s, %(regime_feature_version)s, %(calibration_version)s,
+                    %(training_data_start)s, %(training_data_end)s, %(validation_data_start)s, %(validation_data_end)s,
+                    %(leakage_check_status)s, %(baseline_comparison_summary_json)s, 'PENDING', now()
                 )
                 ON CONFLICT(run_id) DO UPDATE SET
                     forecast_rows = EXCLUDED.forecast_rows,
@@ -634,6 +785,23 @@ def save_prediction_run(
                     scoring_version = EXCLUDED.scoring_version,
                     data_quality_grade = EXCLUDED.data_quality_grade,
                     model_version_id = EXCLUDED.model_version_id,
+                    feature_mode = EXCLUDED.feature_mode,
+                    input_quality_snapshot = EXCLUDED.input_quality_snapshot,
+                    forecast_timestamp_check_status = EXCLUDED.forecast_timestamp_check_status,
+                    forecast_timestamp_mismatches = EXCLUDED.forecast_timestamp_mismatches,
+                    feature_set_name = EXCLUDED.feature_set_name,
+                    feature_columns = EXCLUDED.feature_columns,
+                    lookback = EXCLUDED.lookback,
+                    horizon = EXCLUDED.horizon,
+                    amount_available = EXCLUDED.amount_available,
+                    amount_derivation_method = EXCLUDED.amount_derivation_method,
+                    regime_context_used = EXCLUDED.regime_context_used,
+                    amount_mode = EXCLUDED.amount_mode,
+                    horizon_policy = EXCLUDED.horizon_policy,
+                    regime_feature_version = EXCLUDED.regime_feature_version,
+                    calibration_version = EXCLUDED.calibration_version,
+                    leakage_check_status = EXCLUDED.leakage_check_status,
+                    baseline_comparison_summary_json = EXCLUDED.baseline_comparison_summary_json,
                     updated_at = now()
                 """,
                 {
@@ -664,6 +832,27 @@ def save_prediction_run(
                     "scoring_version": DEFAULT_SCORING_VERSION,
                     "data_quality_grade": data_quality_grade,
                     "model_version_id": model_version_id,
+                    "feature_mode": metadata.get("feature_mode"),
+                    "input_quality_snapshot": Jsonb(input_quality_snapshot or {}),
+                    "forecast_timestamp_check_status": metadata.get("forecast_timestamp_check_status") or "PASS",
+                    "forecast_timestamp_mismatches": Jsonb(timestamp_mismatches or []),
+                    "feature_set_name": metadata.get("feature_set_name") or metadata.get("feature_mode"),
+                    "feature_columns": Jsonb(selected_feature_columns),
+                    "lookback": int(metadata.get("input_rows_used") or metadata.get("lookback") or 0),
+                    "horizon": int(metadata.get("forecast_rows") or metadata.get("horizon") or 0),
+                    "amount_available": amount_available,
+                    "amount_derivation_method": amount_derivation_method,
+                    "regime_context_used": regime_context_used,
+                    "amount_mode": metadata.get("amount_mode") or ("DERIVED" if amount_derivation_method else ("AVAILABLE" if amount_available else "UNAVAILABLE")),
+                    "horizon_policy": metadata.get("horizon_policy") or "PER_HORIZON_AND_TERMINAL_SEPARATE",
+                    "regime_feature_version": metadata.get("regime_feature_version"),
+                    "calibration_version": metadata.get("calibration_version") or "empirical_untrusted_v1",
+                    "training_data_start": _to_utc_iso(metadata.get("training_data_start")) if metadata.get("training_data_start") else None,
+                    "training_data_end": _to_utc_iso(metadata.get("training_data_end")) if metadata.get("training_data_end") else None,
+                    "validation_data_start": _to_utc_iso(metadata.get("validation_data_start")) if metadata.get("validation_data_start") else None,
+                    "validation_data_end": _to_utc_iso(metadata.get("validation_data_end")) if metadata.get("validation_data_end") else None,
+                    "leakage_check_status": metadata.get("leakage_check_status") or "NOT_RUN",
+                    "baseline_comparison_summary_json": Jsonb(metadata.get("baseline_comparison_summary") or {}),
                 },
             )
             anchor_close = last_input_close
@@ -1230,6 +1419,64 @@ def refresh_shadow_prediction_statuses(*, dsn: str | None = None, limit: int = 5
     }
 
 
+def _upsert_baseline_comparison_metrics(
+    conn: Any,
+    *,
+    run_id: str,
+    scoring_version: str,
+    input_csv_path: str | None,
+    forecast_df: pd.DataFrame,
+    actual_df: pd.DataFrame,
+    last_input_close: float,
+    flat_threshold_pct: float,
+) -> int:
+    if not input_csv_path:
+        return 0
+    path = Path(input_csv_path)
+    if not path.exists():
+        return 0
+    input_df = _load_ohlcv_csv(path, "baseline input")
+    comparisons = compute_baseline_comparisons(
+        input_df,
+        forecast_df,
+        actual_df,
+        last_input_close=last_input_close,
+        flat_threshold_pct=flat_threshold_pct,
+    )
+    for item in comparisons:
+        conn.execute(
+            """
+            INSERT INTO baseline_comparison_metrics(
+                run_id, scoring_version, baseline_name, metric_name,
+                model_metric, baseline_metric, delta, sample_count, enough_samples,
+                details, updated_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            ON CONFLICT(run_id, scoring_version, baseline_name, metric_name) DO UPDATE SET
+                model_metric = EXCLUDED.model_metric,
+                baseline_metric = EXCLUDED.baseline_metric,
+                delta = EXCLUDED.delta,
+                sample_count = EXCLUDED.sample_count,
+                enough_samples = EXCLUDED.enough_samples,
+                details = EXCLUDED.details,
+                updated_at = now()
+            """,
+            (
+                run_id,
+                scoring_version,
+                item["baseline_name"],
+                item["metric_name"],
+                item["model_metric"],
+                item["baseline_metric"],
+                item["delta"],
+                item["sample_count"],
+                bool(item["enough_samples"]),
+                Jsonb(item.get("details") or {}),
+            ),
+        )
+    return len(comparisons)
+
+
 def update_predictions_with_actuals(
     *,
     run_id: str | None = None,
@@ -1254,7 +1501,7 @@ def update_predictions_with_actuals(
         run = conn.execute(
             """
             SELECT symbol, epic, resolution, price_side, provider, last_input_close,
-                   forecast_end_timestamp_utc
+                   forecast_end_timestamp_utc, input_csv_path
             FROM prediction_runs
             WHERE run_id = %s
             """,
@@ -1299,6 +1546,14 @@ def update_predictions_with_actuals(
             flat_threshold_pct=flat_threshold_pct,
         )
         score_by_horizon = {row["horizon_index"]: row for row in score["rows"]}
+        full_window_available = bool(total_records) and int(score["summary"].get("missing_actual_candles") or 0) == 0
+        validation_state_for_matched = "FINAL" if full_window_available else "PARTIAL_PROGRESS"
+        terminal_outcome = terminal_direction_outcome(
+            forecast_for_score,
+            actual,
+            last_input_close=float(run["last_input_close"]),
+            flat_threshold_pct=flat_threshold_pct,
+        )
         for record in records:
             score_row = score_by_horizon[int(record["horizon_index"])]
             ts = _to_utc_iso(record["timestamp_utc"])
@@ -1308,7 +1563,10 @@ def update_predictions_with_actuals(
                 conn.execute(
                     """
                     UPDATE prediction_outcomes
-                    SET status = 'PENDING', updated_at = now()
+                    SET status = 'PENDING',
+                        validation_state = 'NEEDS_MORE_SAMPLES',
+                        actual_window_complete = false,
+                        updated_at = now()
                     WHERE run_id = %s AND forecast_candle_id = %s
                     """,
                     (run_id, record["id"]),
@@ -1319,9 +1577,11 @@ def update_predictions_with_actuals(
                         run_id, scoring_version, horizon_index, forecast_timestamp_utc,
                         predicted_direction, actual_direction, status, forecast_close, actual_close,
                         close_error, close_error_pct, abs_close_error, expected_move_pct,
-                        realized_move_pct, movement_after_cost_pct, updated_at
+                        realized_move_pct, movement_after_cost_pct,
+                        validation_state, actual_window_complete, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, NULL, 'PENDING', %s, NULL, NULL, NULL, NULL, %s, NULL, NULL, now())
+                    VALUES (%s, %s, %s, %s, %s, NULL, 'PENDING', %s, NULL, NULL, NULL, NULL, %s, NULL, NULL,
+                            'NEEDS_MORE_SAMPLES', false, now())
                     ON CONFLICT(run_id, scoring_version, horizon_index) DO UPDATE SET
                         forecast_timestamp_utc = EXCLUDED.forecast_timestamp_utc,
                         predicted_direction = EXCLUDED.predicted_direction,
@@ -1335,6 +1595,8 @@ def update_predictions_with_actuals(
                         expected_move_pct = EXCLUDED.expected_move_pct,
                         realized_move_pct = EXCLUDED.realized_move_pct,
                         movement_after_cost_pct = EXCLUDED.movement_after_cost_pct,
+                        validation_state = EXCLUDED.validation_state,
+                        actual_window_complete = EXCLUDED.actual_window_complete,
                         updated_at = now()
                     """,
                     (
@@ -1351,6 +1613,7 @@ def update_predictions_with_actuals(
             actual_close = score_row["actual_close"]
             actual_direction = score_row["actual_direction"]
             status = score_row["status"]
+            persisted_status = status if full_window_available else "PENDING"
             close_error = score_row["close_error"]
             close_error_pct = score_row["close_error_pct"]
             candle = conn.execute(
@@ -1373,7 +1636,12 @@ def update_predictions_with_actuals(
                     close_error = %s,
                     close_error_pct = %s,
                     status = %s,
-                    validated_at_utc = now(),
+                    validation_state = %s,
+                    actual_window_complete = %s,
+                    terminal_predicted_direction = %s,
+                    terminal_actual_direction = %s,
+                    terminal_direction_status = %s,
+                    validated_at_utc = CASE WHEN %s THEN now() ELSE validated_at_utc END,
                     updated_at = now()
                 WHERE run_id = %s AND forecast_candle_id = %s
                 """,
@@ -1385,7 +1653,13 @@ def update_predictions_with_actuals(
                     actual_close,
                     close_error,
                     close_error_pct,
-                    status,
+                    persisted_status,
+                    validation_state_for_matched,
+                    full_window_available,
+                    terminal_outcome.get("terminal_predicted_direction"),
+                    terminal_outcome.get("terminal_actual_direction"),
+                    terminal_outcome.get("terminal_direction_status"),
+                    full_window_available,
                     run_id,
                     record["id"],
                 ),
@@ -1396,9 +1670,11 @@ def update_predictions_with_actuals(
                     run_id, scoring_version, horizon_index, forecast_timestamp_utc,
                     predicted_direction, actual_direction, status, forecast_close, actual_close,
                     close_error, close_error_pct, abs_close_error, expected_move_pct,
-                    realized_move_pct, movement_after_cost_pct, updated_at
+                    realized_move_pct, movement_after_cost_pct,
+                    validation_state, actual_window_complete, updated_at
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                        %s, %s, now())
                 ON CONFLICT(run_id, scoring_version, horizon_index) DO UPDATE SET
                     forecast_timestamp_utc = EXCLUDED.forecast_timestamp_utc,
                     predicted_direction = EXCLUDED.predicted_direction,
@@ -1412,6 +1688,8 @@ def update_predictions_with_actuals(
                     expected_move_pct = EXCLUDED.expected_move_pct,
                     realized_move_pct = EXCLUDED.realized_move_pct,
                     movement_after_cost_pct = EXCLUDED.movement_after_cost_pct,
+                    validation_state = EXCLUDED.validation_state,
+                    actual_window_complete = EXCLUDED.actual_window_complete,
                     updated_at = now()
                 """,
                 (
@@ -1421,7 +1699,7 @@ def update_predictions_with_actuals(
                     ts,
                     score_row["predicted_direction"] or "FLAT",
                     actual_direction,
-                    status,
+                    persisted_status,
                     score_row["forecast_close"],
                     actual_close,
                     close_error,
@@ -1430,20 +1708,48 @@ def update_predictions_with_actuals(
                     score_row["expected_move_pct"],
                     score_row["realized_move_pct"],
                     score_row["movement_after_cost_pct"],
+                    validation_state_for_matched,
+                    full_window_available,
                 ),
             )
+            if not full_window_available:
+                pending += 1
+                continue
             if status == "WIN":
                 wins += 1
             else:
                 losses += 1
             validated += 1
-        if pending == total_records:
-            run_status = "PENDING"
-        elif pending == 0:
+        matched_actual_candles = int(score["summary"].get("matched_candles") or 0)
+        if full_window_available:
             run_status = "VALIDATED"
-        else:
+        elif matched_actual_candles > 0:
             run_status = "PARTIAL"
-        conn.execute("UPDATE prediction_runs SET run_status = %s, updated_at = now() WHERE run_id = %s", (run_status, run_id))
+        else:
+            run_status = "PENDING"
+        actual_window_status = "FINAL" if full_window_available else ("PARTIAL_PROGRESS" if matched_actual_candles > 0 else "NEEDS_MORE_SAMPLES")
+        conn.execute(
+            """
+            UPDATE prediction_runs
+            SET run_status = %s,
+                actual_window_status = %s,
+                terminal_predicted_direction = %s,
+                terminal_actual_direction = %s,
+                terminal_direction_status = %s,
+                validation_finalized_at = CASE WHEN %s THEN now() ELSE validation_finalized_at END,
+                updated_at = now()
+            WHERE run_id = %s
+            """,
+            (
+                run_status,
+                actual_window_status,
+                terminal_outcome.get("terminal_predicted_direction"),
+                terminal_outcome.get("terminal_actual_direction"),
+                terminal_outcome.get("terminal_direction_status"),
+                full_window_available,
+                run_id,
+            ),
+        )
         signal_row = conn.execute(
             """
              SELECT signal, confidence, expected_move_pct, cost_threshold_pct,
@@ -1455,8 +1761,8 @@ def update_predictions_with_actuals(
         ).fetchone()
         signal_quality = None
         trade_outcome = None
-        signal_status = _signal_status_for_primary_window(score["rows"])
-        if signal_row:
+        signal_status = _signal_status_for_primary_window(score["rows"]) if full_window_available else "PENDING"
+        if signal_row and full_window_available:
             trade_signal, validation_final_signal = _validation_gated_trade_signal(signal_row)
             candidate_signal = str(signal_row["signal"] or "HOLD").upper()
             entry_price = float(signal_row["entry_price"] or run["last_input_close"])
@@ -1546,6 +1852,11 @@ def update_predictions_with_actuals(
                 ),
             )
         movement_after_cost = None if signal_quality is None else signal_quality.get("movement_after_cost_pct")
+        if trade_outcome is not None:
+            conn.execute(
+                "UPDATE prediction_runs SET path_outcome_status = %s, updated_at = now() WHERE run_id = %s",
+                (trade_outcome.get("status"), run_id),
+            )
         conn.execute(
             "UPDATE signals SET status = %s, outcome_updated_at = now(), updated_at = now() WHERE run_id = %s",
             (signal_status, run_id),
@@ -1619,6 +1930,28 @@ def update_predictions_with_actuals(
                 _upsert_shadow_evaluation(conn, active_run_id=run_id, shadow_summary=shadow_summary)
             except Exception:  # noqa: BLE001
                 pass
+        baseline_comparisons = 0
+        if full_window_available:
+            try:
+                baseline_comparisons = _upsert_baseline_comparison_metrics(
+                    conn,
+                    run_id=run_id,
+                    scoring_version=scoring_version,
+                    input_csv_path=run.get("input_csv_path"),
+                    forecast_df=forecast_for_score,
+                    actual_df=actual,
+                    last_input_close=float(run["last_input_close"]),
+                    flat_threshold_pct=flat_threshold_pct,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log_event(
+                    LOGGER,
+                    logging.WARNING,
+                    "prediction_store.baseline_comparison_failed",
+                    run_id=run_id,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
     total = wins + losses
     return {
         "dsn": masked_postgres_dsn(dsn),
@@ -1629,6 +1962,8 @@ def update_predictions_with_actuals(
         "losses": losses,
         "win_rate_pct": None if total == 0 else (wins / total) * 100.0,
         "run_status": run_status,
+        "actual_window_status": actual_window_status,
+        "baseline_comparisons": baseline_comparisons,
     }
 
 
@@ -1640,8 +1975,16 @@ def prediction_summary(dsn: str | None = None, limit: int = 20, db_path: str | P
             """
             SELECT
                 COUNT(*)::int AS total_records,
-                COALESCE(SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
-                COALESCE(SUM(CASE WHEN status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
+                COALESCE(SUM(CASE
+                    WHEN status = 'WIN'
+                     AND validation_state = 'FINAL'
+                     AND actual_window_complete = true THEN 1 ELSE 0
+                END), 0)::int AS wins,
+                COALESCE(SUM(CASE
+                    WHEN status = 'LOSS'
+                     AND validation_state = 'FINAL'
+                     AND actual_window_complete = true THEN 1 ELSE 0
+                END), 0)::int AS losses,
                 COALESCE(SUM(CASE WHEN status = 'PENDING' THEN 1 ELSE 0 END), 0)::int AS pending
             FROM prediction_outcomes
             """
@@ -1654,8 +1997,16 @@ def prediction_summary(dsn: str | None = None, limit: int = 20, db_path: str | P
                 s.signal_id, s.signal, s.direction, s.status AS signal_status,
                 s.confidence, s.expected_move_pct, s.entry_price, s.tp_price, s.sl_price,
                 COUNT(o.id)::int AS records,
-                COALESCE(SUM(CASE WHEN o.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
-                COALESCE(SUM(CASE WHEN o.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
+                COALESCE(SUM(CASE
+                    WHEN o.status = 'WIN'
+                     AND o.validation_state = 'FINAL'
+                     AND o.actual_window_complete = true THEN 1 ELSE 0
+                END), 0)::int AS wins,
+                COALESCE(SUM(CASE
+                    WHEN o.status = 'LOSS'
+                     AND o.validation_state = 'FINAL'
+                     AND o.actual_window_complete = true THEN 1 ELSE 0
+                END), 0)::int AS losses,
                 COALESCE(SUM(CASE WHEN o.status = 'PENDING' THEN 1 ELSE 0 END), 0)::int AS pending
             FROM prediction_runs r
             LEFT JOIN prediction_outcomes o ON o.run_id = r.run_id
@@ -1666,9 +2017,88 @@ def prediction_summary(dsn: str | None = None, limit: int = 20, db_path: str | P
             """,
             (limit,),
         ).fetchall()
+        signal_quality = conn.execute(
+            """
+            SELECT
+                COALESCE(signal, 'UNKNOWN') AS signal,
+                COALESCE(status, 'PENDING') AS status,
+                COALESCE(validation_status, 'UNVALIDATED') AS validation_status,
+                COUNT(*)::int AS count,
+                AVG(validation_score)::double precision AS average_validation_score,
+                COALESCE(SUM(CASE
+                    WHEN signal IN ('LONG', 'SHORT')
+                     AND validation_status IN ('LONG', 'SHORT', 'STRONG_LONG', 'STRONG_SHORT', 'WEAK_LONG', 'WEAK_SHORT')
+                     AND (
+                        (signal = 'LONG' AND validation_status IN ('SHORT', 'STRONG_SHORT', 'WEAK_SHORT'))
+                        OR (signal = 'SHORT' AND validation_status IN ('LONG', 'STRONG_LONG', 'WEAK_LONG'))
+                     )
+                    THEN 1
+                    WHEN signal IN ('LONG', 'SHORT')
+                     AND validation_status IN ('BLOCKED', 'HOLD', 'WATCH', 'VALIDATION_UNAVAILABLE')
+                    THEN 1
+                    ELSE 0
+                END), 0)::int AS mismatch_count
+            FROM signals
+            GROUP BY COALESCE(signal, 'UNKNOWN'), COALESCE(status, 'PENDING'), COALESCE(validation_status, 'UNVALIDATED')
+            ORDER BY count DESC
+            """
+        ).fetchall()
+        executed_performance = conn.execute(
+            """
+            WITH closed AS (
+                SELECT *
+                FROM executed_trades
+                WHERE status = 'CLOSED'
+            ),
+            finalized AS (
+                SELECT *
+                FROM closed
+                WHERE outcome_finalized_at IS NOT NULL
+                  AND final_outcome IN ('WIN', 'LOSS', 'BREAKEVEN')
+            )
+            SELECT
+                COUNT(*) FILTER (WHERE final_outcome = 'WIN')::int AS wins,
+                COUNT(*) FILTER (WHERE final_outcome = 'LOSS')::int AS losses,
+                COUNT(*) FILTER (WHERE final_outcome = 'BREAKEVEN')::int AS breakevens,
+                (SELECT COUNT(*)::int FROM closed)::int AS closed_trade_count,
+                COUNT(*)::int AS finalized_trade_count,
+                (SELECT COUNT(*)::int FROM closed WHERE outcome_finalized_at IS NULL OR COALESCE(final_outcome, 'UNKNOWN') = 'UNKNOWN')::int AS unknown_outcome_count,
+                AVG(net_pnl) FILTER (WHERE final_outcome = 'WIN')::double precision AS average_win,
+                AVG(net_pnl) FILTER (WHERE final_outcome = 'LOSS')::double precision AS average_loss,
+                AVG(net_pnl)::double precision AS expectancy,
+                SUM(net_pnl)::double precision AS total_net_pnl,
+                AVG(spread_cost)::double precision AS average_spread_cost,
+                AVG(slippage_estimate)::double precision AS average_slippage_estimate
+            FROM finalized
+            """
+        ).fetchone()
+        baselines = conn.execute(
+            """
+            SELECT baseline_name, metric_name, model_metric, baseline_metric, delta, sample_count, enough_samples, updated_at
+            FROM baseline_comparison_metrics
+            ORDER BY updated_at DESC
+            LIMIT 25
+            """
+        ).fetchall()
+        latest_input_rejection = conn.execute(
+            """
+            SELECT prediction_request_id, symbol, epic, resolution, price_side,
+                   requested_lookback, actual_lookback, reason, rejection_reasons,
+                   quality_snapshot, input_csv_path, created_at
+            FROM prediction_input_rejections
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
     wins = int(totals["wins"])
     losses = int(totals["losses"])
     evaluated = wins + losses
+    executed_perf = dict(executed_performance or {})
+    executed_wins = int(executed_perf.get("wins") or 0)
+    executed_losses = int(executed_perf.get("losses") or 0)
+    executed_perf["executed_trade_win_rate_pct"] = (
+        None if executed_wins + executed_losses == 0 else (executed_wins / (executed_wins + executed_losses)) * 100.0
+    )
     return {
         "dsn": masked_postgres_dsn(dsn),
         "total_records": int(totals["total_records"]),
@@ -1676,5 +2106,33 @@ def prediction_summary(dsn: str | None = None, limit: int = 20, db_path: str | P
         "losses": losses,
         "pending": int(totals["pending"]),
         "win_rate_pct": None if evaluated == 0 else (wins / evaluated) * 100.0,
+        "metric_categories": {
+            "forecast_quality": {
+                "source": "prediction_outcomes",
+                "metric_definition": "Aggregate per-candle directional hit rate from final complete forecast outcomes only.",
+                "sample_scope": "status IN ('WIN','LOSS') AND validation_state='FINAL' AND actual_window_complete=true",
+                "directional_forecast_hit_rate_pct": None if evaluated == 0 else (wins / evaluated) * 100.0,
+                "aggregate_per_candle_hit_rate_pct": None if evaluated == 0 else (wins / evaluated) * 100.0,
+                "wins": wins,
+                "losses": losses,
+                "pending": int(totals["pending"]),
+                "sample_count": evaluated,
+                "enough_samples": evaluated >= 30,
+            },
+            "signal_quality": {
+                "source": "signals",
+                "distributions": [dict(row) for row in signal_quality],
+                "raw_signal_validation_mismatch_count": sum(int(row["mismatch_count"]) for row in signal_quality),
+            },
+            "executed_trade_performance": {
+                "source": "executed_trades",
+                **executed_perf,
+            },
+            "baseline_comparisons": {
+                "source": "baseline_comparison_metrics",
+                "rows": [dict(row) for row in baselines],
+            },
+            "latest_input_rejection": dict(latest_input_rejection) if latest_input_rejection else None,
+        },
         "recent_runs": [dict(row) for row in runs],
     }

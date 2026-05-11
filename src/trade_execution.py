@@ -28,6 +28,19 @@ ACTIONABLE_SIGNAL_TO_DIRECTION = {
     "SELL": "SELL",
 }
 EXECUTABLE_SIGNAL_DECISIONS = {"LONG", "SHORT"}
+ALLOWED_LONG_VALIDATION_STATUSES = {"LONG", "STRONG_LONG"}
+ALLOWED_SHORT_VALIDATION_STATUSES = {"SHORT", "STRONG_SHORT"}
+ALLOWED_EXECUTION_VALIDATION_STATUSES = ALLOWED_LONG_VALIDATION_STATUSES | ALLOWED_SHORT_VALIDATION_STATUSES
+BLOCKED_EXECUTION_VALIDATION_STATUSES = {
+    "BLOCKED",
+    "HOLD",
+    "WATCH",
+    "VALIDATION_UNAVAILABLE",
+    "WEAK_LONG",
+    "WEAK_SHORT",
+    "NEEDS_MORE_SAMPLES",
+    "UNKNOWN",
+}
 DIRECTION_TO_ORDER_DIRECTION = {
     "UP": "BUY",
     "BULLISH": "BUY",
@@ -113,6 +126,35 @@ def _parse_utc(value: Any) -> datetime:
     return datetime.fromisoformat(text.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def _parse_utc_optional(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    try:
+        return _parse_utc(value)
+    except Exception:
+        return None
+
+
+def _raw_execution_signal(candidate: "ExecutionCandidate") -> str:
+    raw_signal = str(candidate.metadata.get("raw_signal") or "").strip().upper()
+    if raw_signal:
+        return raw_signal
+    if candidate.direction == "BUY":
+        return "LONG"
+    if candidate.direction == "SELL":
+        return "SHORT"
+    return str(candidate.direction or "").strip().upper()
+
+
+def _direction_from_validation_status(status: str) -> str | None:
+    normalized = str(status or "").strip().upper()
+    if normalized in {"LONG", "STRONG_LONG", "WEAK_LONG"}:
+        return "LONG"
+    if normalized in {"SHORT", "STRONG_SHORT", "WEAK_SHORT"}:
+        return "SHORT"
+    return None
+
+
 @dataclass(frozen=True)
 class ExecutionCandidate:
     signal_id: str
@@ -179,6 +221,25 @@ class ExecutionPlan:
     stop_level: Decimal
     profit_level: Decimal
     validation_note: str
+
+
+@dataclass(frozen=True)
+class ExecutionDecision:
+    signal_id: str
+    raw_signal: str
+    validation_status: str | None
+    validation_score: Decimal | None
+    validation_age_seconds: Decimal | None
+    expected_move_pct: Decimal | None
+    spread_pct: Decimal | None
+    estimated_fee_pct: Decimal
+    estimated_slippage_pct: Decimal
+    safety_margin_pct: Decimal
+    net_expected_edge_pct: Decimal | None
+    execution_decision: str
+    block_reason: str | None
+    evaluated_at: datetime
+    details: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -484,11 +545,20 @@ class TradeExecutionRepository:
                 """
                 SELECT
                     s.signal_id, s.run_id, s.symbol, s.epic, s.resolution, s.timestamp_utc,
-                    s.signal, s.direction, s.confidence, s.entry_price, s.tp_price, s.sl_price,
+                    s.signal, s.direction, s.confidence, s.expected_move_pct, s.cost_threshold_pct,
+                    s.entry_price, s.tp_price, s.sl_price,
                     s.reason, s.validation_status, s.validation_score, s.validation_summary,
+                    s.updated_at AS signal_updated_at,
+                    svr.updated_at AS validation_updated_at,
+                    svr.final_signal AS validation_final_signal,
+                    svr.blocked AS validation_blocked,
+                    svr.block_reason AS validation_block_reason,
+                    svr.reason_codes AS validation_reason_codes,
+                    svr.net_edge_pct AS validation_net_edge_pct,
                     r.model_name, r.model_path, r.tokenizer_path, r.generated_at_utc, r.metadata_path
                 FROM signals s
                 JOIN prediction_runs r ON r.run_id = s.run_id
+                LEFT JOIN signal_validation_runs svr ON svr.run_id = s.run_id
                 WHERE s.signal_id = %s OR s.run_id = %s
                 ORDER BY s.timestamp_utc DESC
                 LIMIT 1
@@ -508,11 +578,20 @@ class TradeExecutionRepository:
                 f"""
                 SELECT
                     s.signal_id, s.run_id, s.symbol, s.epic, s.resolution, s.timestamp_utc,
-                    s.signal, s.direction, s.confidence, s.entry_price, s.tp_price, s.sl_price,
+                    s.signal, s.direction, s.confidence, s.expected_move_pct, s.cost_threshold_pct,
+                    s.entry_price, s.tp_price, s.sl_price,
                     s.reason, s.validation_status, s.validation_score, s.validation_summary,
+                    s.updated_at AS signal_updated_at,
+                    svr.updated_at AS validation_updated_at,
+                    svr.final_signal AS validation_final_signal,
+                    svr.blocked AS validation_blocked,
+                    svr.block_reason AS validation_block_reason,
+                    svr.reason_codes AS validation_reason_codes,
+                    svr.net_edge_pct AS validation_net_edge_pct,
                     r.model_name, r.model_path, r.tokenizer_path, r.generated_at_utc, r.metadata_path
                 FROM signals s
                 JOIN prediction_runs r ON r.run_id = s.run_id
+                LEFT JOIN signal_validation_runs svr ON svr.run_id = s.run_id
                 WHERE {" AND ".join(where)}
                 ORDER BY s.timestamp_utc DESC
                 LIMIT 1
@@ -575,6 +654,13 @@ class TradeExecutionRepository:
         return dict(row) if row else None
 
     def insert_or_get_pending_trade(self, candidate: ExecutionCandidate, candidate_id: int, plan: ExecutionPlan) -> int:
+        spread = abs(plan.market.offer - plan.market.bid)
+        mid = (plan.market.offer + plan.market.bid) / Decimal("2") if (plan.market.offer + plan.market.bid) > 0 else Decimal("0")
+        entry_spread_pct = (spread / mid * Decimal("100")) if mid > 0 else None
+        spread_cost = spread * plan.size if spread > 0 else None
+        slippage_estimate = abs((plan.market_entry or Decimal("0")) - (candidate.recommended_entry or Decimal("0"))) * plan.size
+        validation_score = None if candidate.metadata.get("validation_score") in (None, "") else _to_decimal(candidate.metadata.get("validation_score"))
+        expected_move_pct = None if candidate.metadata.get("expected_move_pct") in (None, "") else _to_decimal(candidate.metadata.get("expected_move_pct"))
         with connect(self.dsn) as conn:
             try:
                 row = conn.execute(
@@ -582,10 +668,12 @@ class TradeExecutionRepository:
                     INSERT INTO executed_trades(
                         signal_id, candidate_id, run_id, source_model, symbol, epic, timeframe, direction,
                         requested_size, recommended_entry, stop_loss, take_profit, status,
-                        account_id, account_name, is_demo, created_at, updated_at
+                        account_id, account_name, is_demo, entry_price, spread_cost, slippage_estimate,
+                        validation_status_at_execution, validation_score_at_execution,
+                        expected_move_pct_at_execution, entry_spread_pct, created_at, updated_at
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'PENDING',
-                            %s, %s, %s, now(), now())
+                            %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(), now())
                     RETURNING id
                     """,
                     (
@@ -604,6 +692,13 @@ class TradeExecutionRepository:
                         plan.account.account_id,
                         plan.account.account_name,
                         plan.account.is_demo,
+                        plan.market_entry,
+                        spread_cost,
+                        slippage_estimate,
+                        candidate.metadata.get("validation_status"),
+                        validation_score,
+                        expected_move_pct,
+                        entry_spread_pct,
                     ),
                 ).fetchone()
                 return int(row["id"])
@@ -653,6 +748,89 @@ class TradeExecutionRepository:
                 """,
                 (trade_id, signal_id, event_type, message, _json_dumps(payload)),
             )
+
+    def record_execution_decision(self, decision: ExecutionDecision) -> None:
+        details = dict(decision.details or {})
+        with connect(self.dsn) as conn:
+            conn.execute(
+                """
+                INSERT INTO trade_execution_decisions(
+                    signal_id, raw_signal, validation_status, validation_score, validation_age_seconds,
+                    expected_move_pct, spread_pct, estimated_fee_pct, estimated_slippage_pct, safety_margin_pct,
+                    net_expected_edge_pct, execution_decision, block_reason, evaluated_at, details
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    decision.signal_id,
+                    decision.raw_signal,
+                    decision.validation_status,
+                    decision.validation_score,
+                    decision.validation_age_seconds,
+                    decision.expected_move_pct,
+                    decision.spread_pct,
+                    decision.estimated_fee_pct,
+                    decision.estimated_slippage_pct,
+                    decision.safety_margin_pct,
+                    decision.net_expected_edge_pct,
+                    decision.execution_decision,
+                    decision.block_reason,
+                    decision.evaluated_at,
+                    _json_dumps(details),
+                ),
+            )
+            conn.execute(
+                """
+                UPDATE trade_execution_candidates
+                SET last_execution_decision = %s,
+                    last_block_reason = %s,
+                    last_decision_at = %s,
+                    execution_decision_details = %s::jsonb,
+                    updated_at = now()
+                WHERE signal_id = %s
+                """,
+                (
+                    decision.execution_decision,
+                    decision.block_reason,
+                    decision.evaluated_at,
+                    _json_dumps(
+                        {
+                            **details,
+                            "raw_signal": decision.raw_signal,
+                            "validation_status": decision.validation_status,
+                            "validation_score": decision.validation_score,
+                            "validation_age_seconds": decision.validation_age_seconds,
+                            "expected_move_pct": decision.expected_move_pct,
+                            "spread_pct": decision.spread_pct,
+                            "estimated_fee_pct": decision.estimated_fee_pct,
+                            "estimated_slippage_pct": decision.estimated_slippage_pct,
+                            "safety_margin_pct": decision.safety_margin_pct,
+                            "net_expected_edge_pct": decision.net_expected_edge_pct,
+                            "execution_decision": decision.execution_decision,
+                            "block_reason": decision.block_reason,
+                            "evaluated_at": decision.evaluated_at,
+                        }
+                    ),
+                    decision.signal_id,
+                ),
+            )
+        log_event(
+            LOGGER,
+            logging.INFO if decision.execution_decision == "ALLOW" else logging.WARNING,
+            "trade.execution.decision",
+            signal_id=decision.signal_id,
+            raw_signal=decision.raw_signal,
+            validation_status=decision.validation_status,
+            validation_score=float(decision.validation_score) if decision.validation_score is not None else None,
+            validation_age_seconds=float(decision.validation_age_seconds)
+            if decision.validation_age_seconds is not None
+            else None,
+            expected_move_pct=float(decision.expected_move_pct) if decision.expected_move_pct is not None else None,
+            spread_pct=float(decision.spread_pct) if decision.spread_pct is not None else None,
+            net_expected_edge_pct=float(decision.net_expected_edge_pct) if decision.net_expected_edge_pct is not None else None,
+            execution_decision=decision.execution_decision,
+            block_reason=decision.block_reason,
+        )
 
     def enqueue(
         self,
@@ -832,10 +1010,23 @@ class TradeExecutionRepository:
                     c.take_profit,
                     s.status AS signal_status,
                     s.signal AS signal_label,
-                    s.validation_status
+                    s.validation_status,
+                    d.execution_decision,
+                    d.block_reason AS execution_block_reason,
+                    d.evaluated_at AS execution_decision_at,
+                    d.details AS execution_decision_details,
+                    d.net_expected_edge_pct AS execution_net_expected_edge_pct,
+                    d.spread_pct AS execution_spread_pct
                 FROM trade_execution_queue q
                 LEFT JOIN trade_execution_candidates c ON c.id = q.candidate_id
                 LEFT JOIN signals s ON s.signal_id = q.signal_id
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM trade_execution_decisions ted
+                    WHERE ted.signal_id = q.signal_id
+                    ORDER BY ted.evaluated_at DESC, ted.id DESC
+                    LIMIT 1
+                ) d ON true
                 ORDER BY q.updated_at DESC
                 LIMIT %s
                 """,
@@ -854,10 +1045,49 @@ class TradeExecutionRepository:
                     e.*,
                     s.status AS signal_status,
                     s.signal AS signal_label,
-                    s.validation_status
+                    s.validation_status,
+                    d.execution_decision,
+                    d.block_reason AS execution_block_reason,
+                    d.evaluated_at AS execution_decision_at,
+                    d.details AS execution_decision_details,
+                    d.net_expected_edge_pct AS execution_net_expected_edge_pct,
+                    d.spread_pct AS execution_spread_pct
                 FROM executed_trades e
                 LEFT JOIN signals s ON s.signal_id = e.signal_id
+                LEFT JOIN LATERAL (
+                    SELECT *
+                    FROM trade_execution_decisions ted
+                    WHERE ted.signal_id = e.signal_id
+                    ORDER BY ted.evaluated_at DESC, ted.id DESC
+                    LIMIT 1
+                ) d ON true
                 ORDER BY e.updated_at DESC
+                LIMIT %s
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def execution_decisions(self, limit: int = 100) -> list[dict[str, Any]]:
+        with connect(self.dsn) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    d.*,
+                    c.symbol,
+                    c.epic,
+                    c.direction,
+                    c.confidence,
+                    c.recommended_entry,
+                    c.stop_loss,
+                    c.take_profit,
+                    s.status AS signal_status,
+                    s.signal AS signal_label,
+                    s.validation_status AS signal_validation_status
+                FROM trade_execution_decisions d
+                LEFT JOIN trade_execution_candidates c ON c.signal_id = d.signal_id
+                LEFT JOIN signals s ON s.signal_id = d.signal_id
+                ORDER BY d.evaluated_at DESC, d.id DESC
                 LIMIT %s
                 """,
                 (limit,),
@@ -932,11 +1162,20 @@ class TradeExecutionRepository:
                 DIRECTION_TO_ORDER_DIRECTION.get(raw_direction, "NO_TRADE"),
             )
         configured_epic = row.get("epic")
+        validation_summary = row.get("validation_summary") or {}
+        validation_status = row.get("validation_status") or row.get("validation_final_signal")
+        validation_updated_at = row.get("validation_updated_at") or (validation_summary or {}).get("updated_at")
         metadata = {
             "reason": row.get("reason"),
-            "validation_status": row.get("validation_status"),
+            "validation_status": validation_status,
             "validation_score": row.get("validation_score"),
-            "validation_summary": row.get("validation_summary"),
+            "validation_summary": validation_summary,
+            "validation_updated_at": validation_updated_at,
+            "signal_updated_at": row.get("signal_updated_at"),
+            "validation_blocked": row.get("validation_blocked"),
+            "validation_block_reason": row.get("validation_block_reason"),
+            "validation_reason_codes": row.get("validation_reason_codes"),
+            "validation_net_edge_pct": row.get("validation_net_edge_pct"),
             "expected_move_pct": row.get("expected_move_pct"),
             "cost_threshold_pct": row.get("cost_threshold_pct"),
             "original_direction": raw_direction,
@@ -984,6 +1223,195 @@ class TradeExecutionPolicy:
         self.repository = repository or TradeExecutionRepository()
         self.mapper = SymbolEpicMapper(self.settings)
 
+    @staticmethod
+    def _validation_timestamp(candidate: ExecutionCandidate) -> datetime | None:
+        metadata = candidate.metadata or {}
+        for key in ("validation_updated_at", "validation_evaluated_at", "validation_created_at"):
+            parsed = _parse_utc_optional(metadata.get(key))
+            if parsed is not None:
+                return parsed
+        summary = metadata.get("validation_summary") if isinstance(metadata.get("validation_summary"), dict) else {}
+        for key in ("updated_at", "created_at", "evaluated_at"):
+            parsed = _parse_utc_optional(summary.get(key))
+            if parsed is not None:
+                return parsed
+        return None
+
+    @classmethod
+    def _validation_age_seconds(cls, candidate: ExecutionCandidate, now: datetime) -> Decimal | None:
+        timestamp = cls._validation_timestamp(candidate)
+        if timestamp is None:
+            return None
+        return Decimal(str(max(0.0, (now - timestamp).total_seconds())))
+
+    @staticmethod
+    def _metadata_quality_status(candidate: ExecutionCandidate) -> str:
+        metadata = candidate.metadata or {}
+        summary = metadata.get("validation_summary") if isinstance(metadata.get("validation_summary"), dict) else {}
+        for key in ("forecast_quality_status", "quality_status", "actual_window_status", "validation_quality_status"):
+            value = metadata.get(key) or summary.get(key)
+            if value:
+                return str(value).strip().upper()
+        return ""
+
+    @staticmethod
+    def _market_regime_is_blocked(candidate: ExecutionCandidate) -> bool:
+        metadata = candidate.metadata or {}
+        summary = metadata.get("validation_summary") if isinstance(metadata.get("validation_summary"), dict) else {}
+        if bool(metadata.get("market_regime_blocked") or metadata.get("regime_blocked") or summary.get("market_regime_blocked")):
+            return True
+        regime = str(metadata.get("market_regime_status") or metadata.get("market_regime") or summary.get("market_regime_status") or "").upper()
+        return regime in {"BLOCKED", "INVALID", "EXTREME_VOLATILITY", "NO_TRADE"}
+
+    @staticmethod
+    def _volume_regime_is_invalid(candidate: ExecutionCandidate) -> bool:
+        metadata = candidate.metadata or {}
+        summary = metadata.get("validation_summary") if isinstance(metadata.get("validation_summary"), dict) else {}
+        if bool(metadata.get("volume_regime_blocked") or summary.get("volume_regime_blocked")):
+            return True
+        regime = str(metadata.get("volume_regime_status") or metadata.get("volume_regime") or summary.get("volume_regime_status") or "").upper()
+        return regime in {"", "MISSING", "UNKNOWN", "INVALID", "VERY_LOW_VOLUME", "BLOCKED", "NO_TRADE"}
+
+    @classmethod
+    def metadata_execution_block_reason(
+        cls,
+        candidate: ExecutionCandidate,
+        settings: TradeExecutionSettings,
+        *,
+        now: datetime | None = None,
+    ) -> tuple[str | None, dict[str, Any]]:
+        now = now or _utc_now()
+        raw_signal = _raw_execution_signal(candidate)
+        validation_status = str(candidate.metadata.get("validation_status") or "").strip().upper()
+        validation_score_raw = candidate.metadata.get("validation_score")
+        expected_move_raw = candidate.metadata.get("expected_move_pct")
+        details: dict[str, Any] = {
+            "raw_signal": raw_signal,
+            "direction": candidate.direction,
+            "validation_status": validation_status or None,
+            "min_validation_score": settings.min_validation_score,
+            "min_confidence": settings.min_confidence,
+            "min_expected_move_pct": settings.min_expected_move_pct,
+            "max_validation_age_seconds": settings.max_validation_age_seconds,
+            "heuristic_confidence_note": (
+                "Signal confidence remains a heuristic display score. "
+                "TODO: replace/augment execution confidence with calibrated rolling live-outcome probability."
+            ),
+        }
+
+        if raw_signal not in EXECUTABLE_SIGNAL_DECISIONS:
+            return "NON_ACTIONABLE_SIGNAL", details
+        expected_direction = ACTIONABLE_SIGNAL_TO_DIRECTION[raw_signal]
+        if candidate.direction != expected_direction:
+            details["expected_direction"] = expected_direction
+            return "RAW_SIGNAL_DIRECTION_MISMATCH", details
+
+        validation_direction = _direction_from_validation_status(validation_status)
+        if validation_direction and validation_direction != raw_signal:
+            details["validation_direction"] = validation_direction
+            return "RAW_SIGNAL_VALIDATION_DIRECTION_MISMATCH", details
+
+        if validation_score_raw not in (None, ""):
+            details["validation_score"] = _to_decimal(validation_score_raw)
+
+        validation_age = cls._validation_age_seconds(candidate, now)
+        details["validation_age_seconds"] = validation_age
+        if validation_age is not None and validation_age > Decimal(str(settings.max_validation_age_seconds)):
+            return "STALE_VALIDATION", details
+
+        quality_status = cls._metadata_quality_status(candidate)
+        if quality_status:
+            details["forecast_quality_status"] = quality_status
+        if quality_status in {"NEEDS_MORE_SAMPLES", "PARTIAL_PROGRESS"}:
+            return "FORECAST_QUALITY_NEEDS_MORE_SAMPLES", details
+
+        if expected_move_raw in (None, ""):
+            return "EXPECTED_MOVE_MISSING", details
+        expected_move_pct = abs(_to_decimal(expected_move_raw))
+        details["expected_move_pct"] = expected_move_pct
+        if expected_move_pct <= Decimal(str(settings.min_expected_move_pct)):
+            return "NEAR_ZERO_PREDICTED_MOVE", details
+
+        if cls._market_regime_is_blocked(candidate):
+            return "MARKET_REGIME_BLOCKED", details
+        if settings.require_valid_volume_regime and cls._volume_regime_is_invalid(candidate):
+            return "VOLUME_REGIME_INVALID", details
+
+        return None, details
+
+    @staticmethod
+    def _spread_pct(market: CapitalMarketInfo) -> Decimal | None:
+        if market.bid <= 0 or market.offer <= 0 or market.offer < market.bid:
+            return None
+        mid = (market.bid + market.offer) / Decimal("2")
+        if mid <= 0:
+            return None
+        return (abs(market.offer - market.bid) / mid) * Decimal("100")
+
+    def _record_decision(
+        self,
+        candidate: ExecutionCandidate,
+        *,
+        execution_decision: str,
+        block_reason: str | None,
+        raw_signal: str | None = None,
+        validation_status: str | None = None,
+        validation_age_seconds: Decimal | None = None,
+        expected_move_pct: Decimal | None = None,
+        spread_pct: Decimal | None = None,
+        net_expected_edge_pct: Decimal | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> ExecutionDecision:
+        raw_signal = raw_signal or _raw_execution_signal(candidate)
+        validation_status = validation_status if validation_status is not None else str(candidate.metadata.get("validation_status") or "").strip().upper() or None
+        validation_score = None
+        if candidate.metadata.get("validation_score") not in (None, ""):
+            validation_score = _to_decimal(candidate.metadata.get("validation_score"))
+        if validation_age_seconds is None:
+            validation_age_seconds = self._validation_age_seconds(candidate, _utc_now())
+        if expected_move_pct is None and candidate.metadata.get("expected_move_pct") not in (None, ""):
+            expected_move_pct = abs(_to_decimal(candidate.metadata.get("expected_move_pct")))
+        decision = ExecutionDecision(
+            signal_id=candidate.signal_id,
+            raw_signal=raw_signal,
+            validation_status=validation_status,
+            validation_score=validation_score,
+            validation_age_seconds=validation_age_seconds,
+            expected_move_pct=expected_move_pct,
+            spread_pct=spread_pct,
+            estimated_fee_pct=Decimal(str(self.settings.estimated_fee_pct)),
+            estimated_slippage_pct=Decimal(str(self.settings.estimated_slippage_pct)),
+            safety_margin_pct=Decimal(str(self.settings.execution_safety_margin_pct)),
+            net_expected_edge_pct=net_expected_edge_pct,
+            execution_decision=execution_decision,
+            block_reason=block_reason,
+            evaluated_at=_utc_now(),
+            details=details or {},
+        )
+        recorder = getattr(self.repository, "record_execution_decision", None)
+        if callable(recorder):
+            recorder(decision)
+        return decision
+
+    def _block(
+        self,
+        candidate: ExecutionCandidate,
+        reason: str,
+        *,
+        details: dict[str, Any] | None = None,
+        spread_pct: Decimal | None = None,
+        net_expected_edge_pct: Decimal | None = None,
+    ) -> None:
+        self._record_decision(
+            candidate,
+            execution_decision="BLOCK",
+            block_reason=reason,
+            spread_pct=spread_pct,
+            net_expected_edge_pct=net_expected_edge_pct,
+            details=details,
+        )
+        raise TradeValidationError(reason)
+
     def evaluate(
         self,
         candidate: ExecutionCandidate,
@@ -991,17 +1419,29 @@ class TradeExecutionPolicy:
         requested_size: Decimal | None = None,
         force_market_execution: bool = False,
     ) -> ExecutionPlan:
+        now = _utc_now()
         if not candidate.is_actionable:
-            raise TradeValidationError("Only BUY and SELL signals are executable.")
+            self._block(candidate, "NON_ACTIONABLE_SIGNAL", details={"direction": candidate.direction})
         validation_status = str(candidate.metadata.get("validation_status") or "").strip().upper()
-        age = _utc_now() - candidate.generated_at_utc
+        metadata_block, metadata_details = self.metadata_execution_block_reason(candidate, self.settings, now=now)
+        if metadata_block:
+            self._block(candidate, metadata_block, details=metadata_details)
+        age = now - candidate.generated_at_utc
         if age > timedelta(minutes=self.settings.stale_signal_minutes):
-            raise TradeValidationError(f"Signal is stale ({age.total_seconds() / 60:.1f}m).")
+            self._block(
+                candidate,
+                "STALE_SIGNAL",
+                details={**metadata_details, "signal_age_seconds": age.total_seconds()},
+            )
         if candidate.recommended_entry <= 0 or candidate.stop_loss <= 0 or candidate.take_profit <= 0:
-            raise TradeValidationError("Signal entry, stop loss, and take profit must all be positive.")
+            self._block(candidate, "INVALID_SIGNAL_LEVELS", details=metadata_details)
         existing_trade = self.repository.get_trade_by_signal(candidate.signal_id)
         if existing_trade and str(existing_trade.get("status") or "").upper() not in {"FAILED", "REJECTED", "VALIDATION_FAILED"}:
-            raise TradeValidationError(f"Duplicate execution blocked for signal {candidate.signal_id}.")
+            self._block(
+                candidate,
+                "DUPLICATE_EXECUTION",
+                details={**metadata_details, "existing_trade_id": existing_trade.get("id"), "existing_trade_status": existing_trade.get("status")},
+            )
 
         account = self.client.ensure_demo_ready()
         if account.is_demo is not True:
@@ -1011,10 +1451,55 @@ class TradeExecutionPolicy:
         market = self.client.get_market_info(epic)
         if not market.tradeable:
             status_note = f" status {market.market_status}" if market.market_status else ""
+            self._record_decision(
+                mapped,
+                execution_decision="BLOCK",
+                block_reason="MARKET_NOT_TRADEABLE",
+                details={**metadata_details, "epic": epic, "market_status": market.market_status},
+            )
             raise MarketNotTradeableError(f"Market {epic} is not TRADEABLE{status_note}.")
+        spread_pct = self._spread_pct(market)
+        expected_move_pct = abs(_to_decimal(mapped.metadata.get("expected_move_pct")))
+        fee_pct = Decimal(str(self.settings.estimated_fee_pct))
+        slippage_pct = Decimal(str(self.settings.estimated_slippage_pct))
+        safety_margin_pct = Decimal(str(self.settings.execution_safety_margin_pct))
+        if spread_pct is None:
+            if self.settings.allow_missing_spread_demo_fallback:
+                spread_pct = Decimal("0")
+                metadata_details["missing_spread_demo_fallback"] = True
+            else:
+                self._block(mapped, "MISSING_SPREAD", details={**metadata_details, "epic": epic})
+        if spread_pct > Decimal(str(self.settings.max_spread_pct)):
+            self._block(
+                mapped,
+                "SPREAD_TOO_WIDE",
+                details={**metadata_details, "max_spread_pct": self.settings.max_spread_pct},
+                spread_pct=spread_pct,
+            )
+        required_edge_pct = spread_pct + fee_pct + slippage_pct + safety_margin_pct
+        net_expected_edge_pct = expected_move_pct - required_edge_pct
+        edge_details = {
+            **metadata_details,
+            "epic": epic,
+            "expected_move_pct": expected_move_pct,
+            "spread_pct": spread_pct,
+            "estimated_fee_pct": fee_pct,
+            "estimated_slippage_pct": slippage_pct,
+            "safety_margin_pct": safety_margin_pct,
+            "required_edge_pct": required_edge_pct,
+            "net_expected_edge_pct": net_expected_edge_pct,
+        }
+        if not expected_move_pct > required_edge_pct:
+            self._block(
+                mapped,
+                "INSUFFICIENT_NET_EDGE",
+                details=edge_details,
+                spread_pct=spread_pct,
+                net_expected_edge_pct=net_expected_edge_pct,
+            )
         market_entry = market.offer if mapped.direction == "BUY" else market.bid
         if market_entry <= 0:
-            raise TradeValidationError(f"Market {epic} does not have a valid executable price.")
+            self._block(mapped, "INVALID_MARKET_ENTRY", details=edge_details, spread_pct=spread_pct, net_expected_edge_pct=net_expected_edge_pct)
         if not self._levels_are_directional(mapped.direction, market_entry, mapped.take_profit, mapped.stop_loss):
             if self._levels_are_directional(mapped.direction, mapped.recommended_entry, mapped.take_profit, mapped.stop_loss):
                 mapped = self._reanchor_levels_for_market(mapped, market_entry)
@@ -1026,13 +1511,30 @@ class TradeExecutionPolicy:
 
         size = self._normalize_size(requested_size or Decimal(str(self.settings.default_trade_size)), market)
         if size < market.min_deal_size:
-            raise TradeValidationError(f"Requested size {size} is below minDealSize {market.min_deal_size}.")
+            self._block(mapped, "SIZE_BELOW_MIN_DEAL_SIZE", details={**edge_details, "requested_size": size, "min_deal_size": market.min_deal_size}, spread_pct=spread_pct, net_expected_edge_pct=net_expected_edge_pct)
         if self.repository.open_trade_count(account) >= self.settings.max_concurrent_open_trades:
-            raise TradeValidationError("Max concurrent open trades limit reached.")
+            self._block(mapped, "MAX_CONCURRENT_OPEN_TRADES", details=edge_details, spread_pct=spread_pct, net_expected_edge_pct=net_expected_edge_pct)
         if self.settings.max_daily_trades and self.repository.daily_trade_count(account) >= self.settings.max_daily_trades:
-            raise TradeValidationError("Max daily trades limit reached.")
+            self._block(mapped, "MAX_DAILY_TRADES", details=edge_details, spread_pct=spread_pct, net_expected_edge_pct=net_expected_edge_pct)
         if self.settings.max_daily_loss and self.repository.daily_loss(account) >= Decimal(str(self.settings.max_daily_loss)):
-            raise TradeValidationError("Max daily loss limit reached.")
+            self._block(mapped, "MAX_DAILY_LOSS", details=edge_details, spread_pct=spread_pct, net_expected_edge_pct=net_expected_edge_pct)
+
+        decision = self._record_decision(
+            mapped,
+            execution_decision="ALLOW",
+            block_reason=None,
+            spread_pct=spread_pct,
+            net_expected_edge_pct=net_expected_edge_pct,
+            details=edge_details,
+        )
+        mapped = replace(
+            mapped,
+            metadata={
+                **mapped.metadata,
+                "execution_decision": decision.execution_decision,
+                "execution_decision_details": edge_details,
+            },
+        )
 
         return ExecutionPlan(
             candidate=mapped,
@@ -1043,9 +1545,9 @@ class TradeExecutionPolicy:
             stop_level=self._round_price(mapped.stop_loss, market.decimal_places),
             profit_level=self._round_price(mapped.take_profit, market.decimal_places),
             validation_note=(
-                "Execution candidate passed demo-only policy checks. "
-                f"Validation status {validation_status or 'UNSPECIFIED'} and confidence {candidate.confidence} "
-                "did not block demo execution."
+                "Execution candidate passed demo policy, broker, risk, and cost-aware edge checks. "
+                f"Validation status {validation_status or 'UNSPECIFIED'} did not block by label alone; "
+                f"net expected edge {net_expected_edge_pct:.6f}%."
             ),
         )
 
@@ -1395,7 +1897,14 @@ class TradeExecutionService:
         confirm = self.client.confirm_deal(str(close_result["dealReference"]))
         accepted = str(confirm.get("dealStatus") or confirm.get("status") or "").upper() == "ACCEPTED"
         if accepted:
-            self.repository.update_trade(executed_trade_id, status="CLOSED", closed_at=_utc_now())
+            self.repository.update_trade(
+                executed_trade_id,
+                status="CLOSED",
+                closed_at=_utc_now(),
+                close_reason="MANUAL_FORCE_CLOSE",
+                final_outcome="UNKNOWN",
+                outcome_finalized_at=_utc_now(),
+            )
             self.repository.insert_event(
                 trade_id=executed_trade_id,
                 signal_id=str(trade["signal_id"]),
@@ -1661,6 +2170,9 @@ class TradeExecutionService:
         details = activity.get("details") or {}
         source = str(activity.get("source") or "").upper()
         level = _to_decimal(details.get("level"))
+        entry = _to_decimal(trade.get("entry_price"), _to_decimal(trade.get("actual_entry"), _to_decimal(trade.get("recommended_entry"))))
+        size = _to_decimal(trade.get("executed_size"), _to_decimal(trade.get("requested_size"), Decimal("1")))
+        fee_amount = _to_decimal(trade.get("fee_amount"))
         stop_level = _to_decimal(details.get("stopLevel"), _to_decimal(trade.get("stop_loss")))
         profit_level = _to_decimal(details.get("profitLevel"), _to_decimal(trade.get("take_profit")))
         tolerance = cls._outcome_price_tolerance(level, stop_level, profit_level)
@@ -1685,6 +2197,17 @@ class TradeExecutionService:
             "trade_outcome_reason": reason,
             "trade_close_source": source,
             "trade_close_level": level if level > 0 else None,
+            "gross_pnl": cls._gross_pnl(
+                direction=str(trade.get("direction") or ""),
+                entry_price=entry,
+                exit_price=level,
+                size=size,
+            ) if level > 0 and entry > 0 else None,
+            "net_pnl": (
+                cls._gross_pnl(direction=str(trade.get("direction") or ""), entry_price=entry, exit_price=level, size=size) - fee_amount
+                if level > 0 and entry > 0
+                else None
+            ),
         }
 
     @staticmethod
@@ -1693,6 +2216,13 @@ class TradeExecutionService:
         if not positive:
             return Decimal("0.00000001")
         return max(Decimal("0.00000001"), max(positive) * Decimal("0.000001"))
+
+    @staticmethod
+    def _gross_pnl(*, direction: str, entry_price: Decimal, exit_price: Decimal, size: Decimal) -> Decimal:
+        side = str(direction or "").upper()
+        if side == "SELL":
+            return (entry_price - exit_price) * size
+        return (exit_price - entry_price) * size
 
     def _apply_confirmation(
         self,
@@ -1727,7 +2257,9 @@ class TradeExecutionService:
                 status="OPEN",
                 deal_id=str(deal_id),
                 actual_entry=actual_entry,
+                entry_price=actual_entry,
                 executed_size=_to_decimal(confirm.get("size"), plan.size),
+                slippage_estimate=abs(actual_entry - plan.market_entry) * _to_decimal(confirm.get("size"), plan.size),
                 opened_at=_utc_now(),
                 failure_reason=tolerance_note,
                 broker_payload=_json_dumps(confirm),
@@ -1872,6 +2404,46 @@ class TradeExecutionQueueService:
                 "failure_reason": "NonActionableSignal",
                 "message": f"Signal {candidate.signal_id} direction {candidate.direction} is not actionable.",
             }
+        block_reason, details = TradeExecutionPolicy.metadata_execution_block_reason(candidate, self.settings)
+        if block_reason:
+            upsert = getattr(self.repository, "upsert_candidate", None)
+            if callable(upsert):
+                upsert(candidate)
+            recorder = getattr(self.repository, "record_execution_decision", None)
+            if callable(recorder):
+                recorder(
+                    ExecutionDecision(
+                        signal_id=candidate.signal_id,
+                        raw_signal=_raw_execution_signal(candidate),
+                        validation_status=str(candidate.metadata.get("validation_status") or "").strip().upper() or None,
+                        validation_score=(
+                            _to_decimal(candidate.metadata.get("validation_score"))
+                            if candidate.metadata.get("validation_score") not in (None, "")
+                            else None
+                        ),
+                        validation_age_seconds=TradeExecutionPolicy._validation_age_seconds(candidate, _utc_now()),
+                        expected_move_pct=(
+                            abs(_to_decimal(candidate.metadata.get("expected_move_pct")))
+                            if candidate.metadata.get("expected_move_pct") not in (None, "")
+                            else None
+                        ),
+                        spread_pct=None,
+                        estimated_fee_pct=Decimal(str(self.settings.estimated_fee_pct)),
+                        estimated_slippage_pct=Decimal(str(self.settings.estimated_slippage_pct)),
+                        safety_margin_pct=Decimal(str(self.settings.execution_safety_margin_pct)),
+                        net_expected_edge_pct=None,
+                        execution_decision="BLOCK",
+                        block_reason=block_reason,
+                        evaluated_at=_utc_now(),
+                        details=details,
+                    )
+                )
+            return {
+                "accepted": False,
+                "status": "BLOCKED",
+                "failure_reason": block_reason,
+                "message": f"Signal {candidate.signal_id} blocked by execution gate: {block_reason}.",
+            }
         return self.repository.enqueue(
             candidate,
             requested_by=requested_by,
@@ -2014,7 +2586,18 @@ class TradeLifecycleReconciliationService:
                 activities = self.client.get_activity_history(deal_id=str(deal_id))
                 close = next((a for a in activities if str(a.get("dealId") or "") == str(deal_id)), None)
                 if close and str(close.get("status") or "").upper() in {"ACCEPTED", "EXECUTED", "PROCESSED"}:
-                    self.repository.update_trade(trade_id, status="CLOSED", closed_at=_utc_now())
+                    outcome = TradeExecutionService._trade_outcome_from_activity(trade, close)
+                    self.repository.update_trade(
+                        trade_id,
+                        status="CLOSED",
+                        closed_at=_utc_now(),
+                        exit_price=outcome.get("trade_close_level"),
+                        gross_pnl=outcome.get("gross_pnl"),
+                        net_pnl=outcome.get("net_pnl"),
+                        close_reason=outcome.get("trade_close_source") or outcome.get("trade_outcome_reason"),
+                        final_outcome=outcome.get("trade_outcome") or "UNKNOWN",
+                        outcome_finalized_at=_utc_now(),
+                    )
                     updated += 1
         return updated
 

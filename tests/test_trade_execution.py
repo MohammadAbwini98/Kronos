@@ -66,6 +66,8 @@ class _Repo:
         self.open_count = 0
         self.daily_count = 0
         self.loss = Decimal("0")
+        self.decisions = []
+        self.enqueued = []
 
     def get_trade_by_signal(self, signal_id):
         return self.existing
@@ -78,6 +80,13 @@ class _Repo:
 
     def daily_loss(self, account):
         return self.loss
+
+    def record_execution_decision(self, decision):
+        self.decisions.append(decision)
+
+    def enqueue(self, candidate, **kwargs):
+        self.enqueued.append((candidate, kwargs))
+        return {"accepted": True, "status": "QUEUED", "queue_entry_id": 1}
 
 
 class _ExecutionRepo(_Repo):
@@ -214,6 +223,20 @@ def _settings(**overrides):
 
 
 def _candidate(**overrides):
+    metadata_override = dict(overrides.pop("metadata", {}) or {})
+    raw_signal = str(metadata_override.get("raw_signal") or ("SHORT" if overrides.get("direction") == "SELL" else "LONG")).upper()
+    validation_status = metadata_override.get("validation_status")
+    if validation_status is None:
+        validation_status = "SHORT" if raw_signal == "SHORT" else "LONG"
+    metadata = {
+        "raw_signal": raw_signal,
+        "validation_status": validation_status,
+        "validation_score": Decimal("80"),
+        "validation_updated_at": datetime.now(timezone.utc).isoformat(),
+        "expected_move_pct": Decimal("0.5"),
+        "cost_threshold_pct": Decimal("0.05"),
+    }
+    metadata.update(metadata_override)
     payload = dict(
         signal_id="sig-1",
         run_id="run-1",
@@ -227,7 +250,7 @@ def _candidate(**overrides):
         take_profit=Decimal("3020"),
         confidence=Decimal("0.75"),
         generated_at_utc=datetime.now(timezone.utc),
-        metadata={"raw_signal": "LONG"},
+        metadata=metadata,
     )
     payload.update(overrides)
     return ExecutionCandidate(**payload)
@@ -362,7 +385,7 @@ class TradeExecutionPolicyTests(unittest.TestCase):
         plan = policy.evaluate(_candidate(metadata={"raw_signal": "LONG", "validation_status": "HOLD"}))
 
         self.assertEqual("BUY", plan.candidate.direction)
-        self.assertIn("did not block demo execution", plan.validation_note)
+        self.assertIn("did not block by label alone", plan.validation_note)
 
     def test_rejects_stale_signal(self):
         policy = TradeExecutionPolicy(_settings(), _Client(), _Repo())
@@ -376,7 +399,7 @@ class TradeExecutionPolicyTests(unittest.TestCase):
         plan = policy.evaluate(_candidate(confidence=Decimal("0.2")))
 
         self.assertEqual("BUY", plan.candidate.direction)
-        self.assertIn("confidence 0.2 did not block", plan.validation_note)
+        self.assertIn("did not block by label alone", plan.validation_note)
 
     def test_derives_levels_when_stored_sl_tp_do_not_match_execution_side(self):
         policy = TradeExecutionPolicy(_settings(), _Client(), _Repo())
@@ -502,6 +525,120 @@ class TradeExecutionPolicyTests(unittest.TestCase):
 
         with self.assertRaises(MarketNotTradeableError):
             policy.evaluate(_candidate())
+
+    def test_non_directional_validation_statuses_do_not_prevent_demo_execution(self):
+        statuses = ["BLOCKED", "HOLD", "WATCH", "VALIDATION_UNAVAILABLE"]
+        for status in statuses:
+            with self.subTest(status=status):
+                repo = _Repo()
+                policy = TradeExecutionPolicy(_settings(), _Client(), repo)
+                plan = policy.evaluate(_candidate(metadata={"raw_signal": "LONG", "validation_status": status}))
+                self.assertEqual("BUY", plan.candidate.direction)
+                self.assertEqual("ALLOW", repo.decisions[-1].execution_decision)
+                self.assertIsNone(repo.decisions[-1].block_reason)
+
+    def test_long_validation_allows_only_buy_direction(self):
+        policy = TradeExecutionPolicy(_settings(), _Client(), _Repo())
+
+        allowed = policy.evaluate(_candidate(direction="BUY", metadata={"raw_signal": "LONG", "validation_status": "LONG"}))
+        self.assertEqual("BUY", allowed.candidate.direction)
+
+        with self.assertRaises(TradeValidationError) as ctx:
+            policy.evaluate(_candidate(direction="SELL", metadata={"raw_signal": "LONG", "validation_status": "LONG"}))
+        self.assertIn("RAW_SIGNAL_DIRECTION_MISMATCH", str(ctx.exception))
+
+    def test_short_validation_allows_only_sell_direction(self):
+        policy = TradeExecutionPolicy(_settings(), _Client(), _Repo())
+
+        allowed = policy.evaluate(
+            _candidate(
+                direction="SELL",
+                stop_loss=Decimal("3010"),
+                take_profit=Decimal("2980"),
+                metadata={"raw_signal": "SHORT", "validation_status": "SHORT"},
+            )
+        )
+        self.assertEqual("SELL", allowed.candidate.direction)
+
+        with self.assertRaises(TradeValidationError) as ctx:
+            policy.evaluate(_candidate(direction="BUY", metadata={"raw_signal": "SHORT", "validation_status": "SHORT"}))
+        self.assertIn("RAW_SIGNAL_DIRECTION_MISMATCH", str(ctx.exception))
+
+    def test_validation_direction_mismatch_blocks_execution(self):
+        policy = TradeExecutionPolicy(_settings(), _Client(), _Repo())
+
+        with self.assertRaises(TradeValidationError) as ctx:
+            policy.evaluate(_candidate(metadata={"raw_signal": "LONG", "validation_status": "SHORT"}))
+
+        self.assertIn("RAW_SIGNAL_VALIDATION_DIRECTION_MISMATCH", str(ctx.exception))
+
+    def test_stale_validation_blocks_execution(self):
+        policy = TradeExecutionPolicy(_settings(max_validation_age_seconds=60), _Client(), _Repo())
+
+        with self.assertRaises(TradeValidationError) as ctx:
+            policy.evaluate(
+                _candidate(
+                    metadata={
+                        "raw_signal": "LONG",
+                        "validation_status": "LONG",
+                        "validation_updated_at": (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat(),
+                    }
+                )
+            )
+
+        self.assertIn("STALE_VALIDATION", str(ctx.exception))
+
+    def test_missing_spread_blocks_execution(self):
+        client = _Client()
+        client.market = CapitalMarketInfo(
+            epic="ETHUSD",
+            symbol="ETHUSD",
+            instrument_name="Ethereum",
+            currency="USD",
+            tradeable=True,
+            bid=Decimal("0"),
+            offer=Decimal("0"),
+            decimal_places=2,
+            min_deal_size=Decimal("0.01"),
+            min_size_increment=Decimal("0.01"),
+            min_stop_or_profit_distance=Decimal("0"),
+            min_stop_or_profit_distance_unit="",
+        )
+        policy = TradeExecutionPolicy(_settings(), client, _Repo())
+
+        with self.assertRaises(TradeValidationError) as ctx:
+            policy.evaluate(_candidate())
+
+        self.assertIn("MISSING_SPREAD", str(ctx.exception))
+
+    def test_insufficient_net_edge_blocks_execution(self):
+        policy = TradeExecutionPolicy(_settings(), _Client(), _Repo())
+
+        with self.assertRaises(TradeValidationError) as ctx:
+            policy.evaluate(_candidate(metadata={"raw_signal": "LONG", "validation_status": "LONG", "expected_move_pct": Decimal("0.03")}))
+
+        self.assertIn("INSUFFICIENT_NET_EDGE", str(ctx.exception))
+
+    def test_valid_strong_signal_with_sufficient_net_edge_passes(self):
+        repo = _Repo()
+        policy = TradeExecutionPolicy(_settings(), _Client(), repo)
+
+        plan = policy.evaluate(_candidate(metadata={"raw_signal": "LONG", "validation_status": "STRONG_LONG", "expected_move_pct": Decimal("0.5")}))
+
+        self.assertEqual("BUY", plan.candidate.direction)
+        self.assertEqual("ALLOW", repo.decisions[-1].execution_decision)
+        self.assertIsNone(repo.decisions[-1].block_reason)
+        self.assertGreater(repo.decisions[-1].net_expected_edge_pct, Decimal("0"))
+
+    def test_queue_allows_watch_validation_status_to_reach_repository(self):
+        repo = _Repo()
+        queue = TradeExecutionQueueService(settings=_settings(), repository=repo, service=object())
+
+        result = queue.enqueue(_candidate(metadata={"raw_signal": "LONG", "validation_status": "WATCH"}))
+
+        self.assertTrue(result["accepted"])
+        self.assertEqual("QUEUED", result["status"])
+        self.assertEqual(1, len(repo.enqueued))
 
 
 class TradeExecutionServiceTests(unittest.TestCase):

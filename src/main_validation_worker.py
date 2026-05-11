@@ -23,19 +23,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate completed prediction runs against actual Capital.com candles.")
     parser.add_argument("--env", default=os.getenv("CAPITAL_ENV", "demo"), choices=["demo", "live"])
     parser.add_argument("--postgres-dsn", default=None)
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--all-symbols", action="store_true", help="Validate pending runs for all symbols instead of the configured symbol.")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("VALIDATION_BATCH_SIZE", "5")))
     parser.add_argument("--once", action="store_true")
     return parser.parse_args()
 
 
-def _due_runs(dsn: str | None, limit: int = 5) -> list[dict]:
+def _due_runs(dsn: str | None, limit: int = 5, symbol: str | None = None, all_symbols: bool = False) -> list[dict]:
+    symbol_filter = None if all_symbols else str(symbol or "").strip() or None
     with connect(dsn) as conn:
         return conn.execute(
             """
             SELECT run_id, metadata_path, forecast_csv_path, epic, resolution, price_side, forecast_end_timestamp_utc
             FROM prediction_runs
             WHERE run_status IN ('PENDING', 'PARTIAL')
+              AND (%s::text IS NULL OR symbol = %s::text OR epic = %s::text)
               AND EXISTS (
                   SELECT 1
                   FROM prediction_outcomes o
@@ -56,7 +60,7 @@ def _due_runs(dsn: str | None, limit: int = 5) -> list[dict]:
             ORDER BY updated_at ASC, forecast_end_timestamp_utc ASC
             LIMIT %s
             """,
-            (max(1, int(limit)),),
+            (symbol_filter, symbol_filter, symbol_filter, max(1, int(limit))),
         ).fetchall()
 
 
@@ -144,6 +148,8 @@ def _validate_run(run: dict, args: argparse.Namespace, validation_cycle_id: str)
         run["epic"],
         "--run-id",
         run["run_id"],
+        "--output",
+        str(Path("output") / f"forecast_quality_report_{run_id}.json"),
     ]
     if args.postgres_dsn:
         fetch_cmd.extend(["--postgres-dsn", args.postgres_dsn])
@@ -223,7 +229,12 @@ def _run_validation_cycle(args: argparse.Namespace, validation_cycle_id: str) ->
     errors = 0
     last_error = None
     rate_limited = False
-    due = _due_runs(args.postgres_dsn, limit=args.batch_size)
+    due = _due_runs(
+        args.postgres_dsn,
+        limit=args.batch_size,
+        symbol=getattr(args, "symbol", None),
+        all_symbols=bool(getattr(args, "all_symbols", False)),
+    )
     log_event(
         LOGGER,
         logging.INFO,
@@ -300,6 +311,8 @@ def main() -> None:
         poll_seconds=int(args.poll_seconds),
         batch_size=max(1, int(args.batch_size)),
         env=args.env,
+        symbol=getattr(args, "symbol", None),
+        all_symbols=bool(getattr(args, "all_symbols", False)),
     )
     while True:
         validation_cycle_id = new_correlation_id("val")

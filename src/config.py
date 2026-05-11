@@ -91,6 +91,15 @@ class TradeExecutionSettings(BaseModel):
     max_daily_trades: int = 10
     max_daily_loss: float = 0.0
     min_confidence: float = 0.55
+    min_validation_score: float = 55.0
+    max_validation_age_seconds: int = 1800
+    min_expected_move_pct: float = 0.02
+    max_spread_pct: float = 0.08
+    estimated_fee_pct: float = 0.0
+    estimated_slippage_pct: float = 0.02
+    execution_safety_margin_pct: float = 0.02
+    allow_missing_spread_demo_fallback: bool = False
+    require_valid_volume_regime: bool = False
     price_tolerance: float = 0.1
     stale_signal_minutes: int = 30
     capital_eth_epic: str = "ETHUSD"
@@ -321,6 +330,15 @@ def load_trade_execution_settings() -> TradeExecutionSettings:
         max_daily_trades=max(0, _env_int("MAX_DAILY_TRADES", 10)),
         max_daily_loss=max(0.0, _env_float("MAX_DAILY_LOSS", 0.0)),
         min_confidence=_env_float("MIN_TRADE_CONFIDENCE", _env_float("SIGNAL_MIN_CONFIDENCE", 0.55)),
+        min_validation_score=_env_float("MIN_TRADE_VALIDATION_SCORE", _env_float("SIGNAL_SCORE_ACTIONABLE_THRESHOLD", 55.0)),
+        max_validation_age_seconds=max(1, _env_int("TRADE_VALIDATION_MAX_AGE_SECONDS", 1800)),
+        min_expected_move_pct=max(0.0, _env_float("TRADE_MIN_EXPECTED_MOVE_PCT", _env_float("SIGNAL_FLAT_THRESHOLD_PCT", 0.02))),
+        max_spread_pct=max(0.0, _env_float("TRADE_MAX_SPREAD_PCT", _env_float("SIGNAL_MAX_SPREAD_PCT", 0.08))),
+        estimated_fee_pct=max(0.0, _env_float("TRADE_ESTIMATED_FEE_PCT", 0.0)),
+        estimated_slippage_pct=max(0.0, _env_float("TRADE_ESTIMATED_SLIPPAGE_PCT", 0.02)),
+        execution_safety_margin_pct=max(0.0, _env_float("TRADE_SAFETY_MARGIN_PCT", 0.02)),
+        allow_missing_spread_demo_fallback=_env_flag("TRADE_ALLOW_MISSING_SPREAD_DEMO_FALLBACK", False),
+        require_valid_volume_regime=_env_flag("TRADE_REQUIRE_VALID_VOLUME_REGIME", False),
         price_tolerance=max(0.0, _env_float("TRADE_PRICE_TOLERANCE", 0.1)),
         stale_signal_minutes=max(1, _env_int("TRADE_SIGNAL_STALE_MINUTES", 30)),
         capital_eth_epic=os.getenv("CAPITAL_ETH_EPIC", os.getenv("CAPITAL_DEFAULT_EPIC", "ETHUSD")).strip() or "ETHUSD",
@@ -335,7 +353,9 @@ def log_trade_execution_startup(settings: TradeExecutionSettings, logger: loggin
     target.info(
         "Capital demo execution config: base_url=%s demo_account=%s auto_execute=%s "
         "default_size=%s max_open=%s max_daily_trades=%s max_daily_loss=%s "
-        "min_confidence=%s price_tolerance=%s stale_minutes=%s",
+        "min_confidence=%s min_validation_score=%s max_validation_age_seconds=%s "
+        "max_spread_pct=%s estimated_fee_pct=%s estimated_slippage_pct=%s safety_margin_pct=%s "
+        "price_tolerance=%s stale_minutes=%s",
         settings.normalized_base_url,
         settings.demo_account_name,
         settings.auto_execute_signals,
@@ -344,6 +364,12 @@ def log_trade_execution_startup(settings: TradeExecutionSettings, logger: loggin
         settings.max_daily_trades,
         settings.max_daily_loss,
         settings.min_confidence,
+        settings.min_validation_score,
+        settings.max_validation_age_seconds,
+        settings.max_spread_pct,
+        settings.estimated_fee_pct,
+        settings.estimated_slippage_pct,
+        settings.execution_safety_margin_pct,
         settings.price_tolerance,
         settings.stale_signal_minutes,
     )

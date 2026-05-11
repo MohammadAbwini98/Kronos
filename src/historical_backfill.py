@@ -38,6 +38,7 @@ class HistoricalBackfillSummary:
     fetched_rows: int
     upserted_rows: int
     source: str
+    repaired_rows: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -161,6 +162,57 @@ def _empty_frame() -> pd.DataFrame:
     return pd.DataFrame(columns=PREDICTION_COLUMNS)
 
 
+def _load_previous_candle(
+    *,
+    symbol: str,
+    epic: str,
+    resolution: str,
+    price_side: str,
+    before: pd.Timestamp,
+    dsn: str | None,
+) -> dict[str, Any] | None:
+    with connect(dsn) as conn:
+        return conn.execute(
+            """
+            SELECT open, high, low, close, volume, amount, timestamp_utc
+            FROM ohlcv_candles
+            WHERE symbol = %s
+              AND epic = %s
+              AND resolution = %s
+              AND price_side = %s
+              AND timestamp_utc < %s
+            ORDER BY timestamp_utc DESC
+            LIMIT 1
+            """,
+            (symbol, epic, resolution, price_side, capital_time(before)),
+        ).fetchone()
+
+
+def _repair_unavailable_gap_frame(
+    *,
+    missing_timestamps: Iterable[pd.Timestamp],
+    previous_candle: dict[str, Any] | None,
+) -> pd.DataFrame:
+    if not previous_candle:
+        return _empty_frame()
+    timestamps = [pd.to_datetime(value, utc=True) for value in missing_timestamps if pd.notna(value)]
+    if not timestamps:
+        return _empty_frame()
+    close = float(previous_candle["close"])
+    return pd.DataFrame(
+        {
+            "timestamps": timestamps,
+            "open": [close] * len(timestamps),
+            "high": [close] * len(timestamps),
+            "low": [close] * len(timestamps),
+            "close": [close] * len(timestamps),
+            "volume": [0.0] * len(timestamps),
+            "amount": [0.0] * len(timestamps),
+        },
+        columns=PREDICTION_COLUMNS,
+    )
+
+
 def _fetch_range(
     *,
     client: CapitalRestClient,
@@ -224,6 +276,8 @@ def ensure_historical_candles(
     dsn: str | None = None,
     now: pd.Timestamp | None = None,
     cap_to_latest_available: bool = True,
+    repair_unavailable_gaps: bool = True,
+    repair_source: str = "historical_gap_fill",
 ) -> HistoricalBackfillSummary:
     epic = str(selected_market["epic"])
     market_name = str(selected_market.get("instrumentName") or "")
@@ -250,6 +304,7 @@ def ensure_historical_candles(
     )
     fetched_rows = 0
     upserted_rows = 0
+    repaired_rows = 0
     if not latest_df.empty:
         latest_df = latest_df.copy()
         latest_df["timestamps"] = pd.to_datetime(latest_df["timestamps"], utc=True)
@@ -286,18 +341,50 @@ def ensure_historical_candles(
             end=range_end,
             chunk_points=chunk_points,
         )
-        if df.empty:
-            continue
-        fetched_rows += len(df)
-        upserted_rows += upsert_ohlcv_df(
-            df,
-            symbol=symbol,
-            epic=epic,
-            resolution=resolution,
-            price_side=price_side,
-            source=source,
-            dsn=dsn,
-        )
+        fetched_timestamps: set[pd.Timestamp] = set()
+        if not df.empty:
+            df = df.copy()
+            df["timestamps"] = pd.to_datetime(df["timestamps"], utc=True)
+            fetched_timestamps = set(df["timestamps"])
+            fetched_rows += len(df)
+            upserted_rows += upsert_ohlcv_df(
+                df,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                price_side=price_side,
+                source=source,
+                dsn=dsn,
+            )
+        if repair_unavailable_gaps:
+            unresolved = [
+                timestamp
+                for timestamp in expected_timestamps(range_start, range_end, resolution)
+                if timestamp not in fetched_timestamps
+            ]
+            if unresolved:
+                repair_df = _repair_unavailable_gap_frame(
+                    missing_timestamps=unresolved,
+                    previous_candle=_load_previous_candle(
+                        symbol=symbol,
+                        epic=epic,
+                        resolution=resolution,
+                        price_side=price_side,
+                        before=range_start,
+                        dsn=dsn,
+                    ),
+                )
+                if not repair_df.empty:
+                    repaired_rows += len(repair_df)
+                    upserted_rows += upsert_ohlcv_df(
+                        repair_df,
+                        symbol=symbol,
+                        epic=epic,
+                        resolution=resolution,
+                        price_side=price_side,
+                        source=repair_source,
+                        dsn=dsn,
+                    )
 
     return HistoricalBackfillSummary(
         symbol=symbol,
@@ -313,4 +400,5 @@ def ensure_historical_candles(
         fetched_rows=fetched_rows,
         upserted_rows=upserted_rows,
         source=source,
+        repaired_rows=repaired_rows,
     )

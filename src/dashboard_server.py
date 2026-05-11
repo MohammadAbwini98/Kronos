@@ -157,6 +157,199 @@ def _merge_validation(primary: dict, fallback: dict) -> dict:
     return result
 
 
+def _num(value: object, default: float | None = None) -> float | None:
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _int(value: object, default: int = 0) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return default
+
+
+def _status_distribution(rows: list[dict], key: str) -> dict[str, int]:
+    output: dict[str, int] = {}
+    for row in rows:
+        status = str(row.get(key) or "UNKNOWN").upper()
+        output[status] = output.get(status, 0) + _int(row.get("count"), 1)
+    return output
+
+
+def _max_drawdown_from_trades(trades: list[dict]) -> float | None:
+    closed = [
+        row
+        for row in trades
+        if str(row.get("status") or "").upper() == "CLOSED"
+        and row.get("outcome_finalized_at") is not None
+        and _num(row.get("net_pnl")) is not None
+    ]
+    closed.sort(key=lambda row: str(row.get("closed_at") or row.get("updated_at") or row.get("created_at") or ""))
+    if not closed:
+        return None
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for row in closed:
+        equity += float(_num(row.get("net_pnl"), 0.0) or 0.0)
+        peak = max(peak, equity)
+        max_drawdown = min(max_drawdown, equity - peak)
+    return max_drawdown
+
+
+def _dashboard_trust_payload(
+    *,
+    metadata: dict,
+    validation_body: dict,
+    postgres_snapshot: dict,
+    trade_execution: dict,
+    baseline_summary: dict,
+) -> dict:
+    prediction_db = postgres_snapshot.get("prediction_db") or {}
+    metric_categories = prediction_db.get("metric_categories") or {}
+    forecast_metrics = metric_categories.get("forecast_quality") or {}
+    signal_metrics = metric_categories.get("signal_quality") or {}
+    executed_metrics = dict(metric_categories.get("executed_trade_performance") or {})
+    input_quality = metadata.get("input_quality_snapshot") or metadata.get("data_quality") or {}
+    horizon_rows = postgres_snapshot.get("horizon_metrics") or []
+    baseline_rows = (metric_categories.get("baseline_comparisons") or {}).get("rows") or []
+    validation_state = str(
+        validation_body.get("validation_state")
+        or validation_body.get("actual_window_status")
+        or validation_body.get("quality_status")
+        or "UNKNOWN"
+    ).upper()
+    matched_candles = _int(validation_body.get("matched_candles"))
+    forecast_rows = _int(metadata.get("forecast_rows"))
+    actual_future_horizon_complete = bool(
+        validation_body.get("actual_window_complete")
+        or validation_state in {"FINAL", "WIN", "LOSS", "VALIDATED", "COMPLETE", "COMPLETED"}
+        or (forecast_rows > 0 and matched_candles >= forecast_rows)
+    )
+    signal_distribution_rows = signal_metrics.get("distributions") or []
+    raw_signal_distribution = _status_distribution(signal_distribution_rows, "signal")
+    signal_status_distribution = _status_distribution(signal_distribution_rows, "status")
+    validation_status_distribution = _status_distribution(signal_distribution_rows, "validation_status")
+    validation_scores = [_num(row.get("average_validation_score")) for row in signal_distribution_rows]
+    validation_scores = [value for value in validation_scores if value is not None]
+    finalized_count = _int(executed_metrics.get("finalized_trade_count"))
+    closed_count = _int(executed_metrics.get("closed_trade_count"))
+    executed_metrics["max_drawdown"] = _max_drawdown_from_trades(trade_execution.get("trades") or [])
+    executed_metrics["execution_metrics_finalized"] = closed_count == finalized_count and _int(executed_metrics.get("unknown_outcome_count")) == 0
+    requested_lookback = _int(input_quality.get("requested_lookback") or metadata.get("lookback") or metadata.get("input_rows_used"))
+    actual_lookback = _int(input_quality.get("actual_lookback") or metadata.get("input_rows_used"))
+    max_supported_lookback = 512
+    execution_decisions = []
+    for row in trade_execution.get("execution_decisions") or []:
+        execution_decisions.append(
+            {
+                "signal_id": row.get("signal_id"),
+                "raw_signal": row.get("raw_signal") or row.get("signal_label"),
+                "execution_decision": row.get("execution_decision"),
+                "block_reason": row.get("block_reason") or row.get("execution_block_reason"),
+                "validation_status": row.get("validation_status") or row.get("signal_validation_status"),
+                "validation_score": row.get("validation_score"),
+                "validation_age_seconds": row.get("validation_age_seconds"),
+                "expected_move_pct": row.get("expected_move_pct"),
+                "spread_pct": row.get("spread_pct") or row.get("execution_spread_pct"),
+                "estimated_fee_pct": row.get("estimated_fee_pct"),
+                "estimated_slippage_pct": row.get("estimated_slippage_pct"),
+                "net_expected_edge_pct": row.get("net_expected_edge_pct") or row.get("execution_net_expected_edge_pct"),
+                "evaluated_at": row.get("evaluated_at") or row.get("execution_decision_at"),
+            }
+        )
+    return {
+        "forecast_quality": {
+            "section_label": "Forecast Quality",
+            "metric_definition": "Directional forecast hit rate from forecast outcomes; not executed-trade win rate.",
+            "directional_forecast_hit_rate_pct": forecast_metrics.get("directional_forecast_hit_rate_pct"),
+            "aggregate_per_candle_hit_rate_pct": forecast_metrics.get("aggregate_per_candle_hit_rate_pct") or forecast_metrics.get("directional_forecast_hit_rate_pct"),
+            "sample_scope": forecast_metrics.get("sample_scope") or "final complete forecast outcomes only",
+            "legacy_direction_accuracy_pct": validation_body.get("direction_accuracy_pct"),
+            "per_horizon": [
+                {
+                    **dict(row),
+                    "directional_forecast_hit_rate_pct": row.get("direction_accuracy_pct"),
+                    "enough_samples": _int(row.get("samples")) >= 30,
+                }
+                for row in horizon_rows
+            ],
+            "mae": validation_body.get("mae"),
+            "rmse": validation_body.get("rmse"),
+            "mape_pct": validation_body.get("mape_pct"),
+            "baseline_comparison": {
+                "rows": baseline_rows,
+                "file_summary": baseline_summary,
+            },
+            "sample_count": _int(forecast_metrics.get("wins")) + _int(forecast_metrics.get("losses")),
+            "pending_count": forecast_metrics.get("pending"),
+            "enough_samples": (_int(forecast_metrics.get("wins")) + _int(forecast_metrics.get("losses"))) >= 30,
+            "validation_state": validation_state,
+            "partial_or_final": "FINAL" if actual_future_horizon_complete else "PARTIAL",
+            "actual_future_horizon_complete": actual_future_horizon_complete,
+        },
+        "signal_quality": {
+            "section_label": "Signal Quality",
+            "metric_definition": "Signal and validation distributions; not profitability.",
+            "raw_signal_distribution": raw_signal_distribution,
+            "signal_status_distribution": signal_status_distribution,
+            "validation_status_distribution": validation_status_distribution,
+            "average_validation_score": None if not validation_scores else sum(validation_scores) / len(validation_scores),
+            "blocked_watch_hold_counts": {
+                key: validation_status_distribution.get(key, 0)
+                for key in ("BLOCKED", "WATCH", "HOLD", "VALIDATION_UNAVAILABLE", "WEAK_LONG", "WEAK_SHORT")
+            },
+            "raw_signal_validation_mismatch_count": signal_metrics.get("raw_signal_validation_mismatch_count"),
+        },
+        "executed_trade_performance": {
+            "section_label": "Executed Trade Performance",
+            "metric_definition": "Closed executed trades with finalized outcomes only.",
+            **executed_metrics,
+        },
+        "data_input_health": {
+            "section_label": "Data/Input Health",
+            "missing_candle_count": input_quality.get("missing_candle_count"),
+            "largest_gap_minutes": input_quality.get("largest_gap_minutes"),
+            "gap_list": input_quality.get("gap_list") or metadata.get("input_gap_list") or [],
+            "source_counts": input_quality.get("source_counts") or {},
+            "input_source_counts": metadata.get("input_source_counts") or input_quality.get("source_counts") or {},
+            "input_feature_columns": metadata.get("input_feature_columns") or input_quality.get("selected_feature_columns") or [],
+            "amount_mode": metadata.get("amount_mode"),
+            "amount_available": metadata.get("amount_available", input_quality.get("amount_available")),
+            "feature_mode": metadata.get("feature_mode") or input_quality.get("feature_mode"),
+            "terminal_close": input_quality.get("terminal_close"),
+            "latest_input_candle_time": input_quality.get("last_timestamp_utc") or metadata.get("input_end_timestamp_utc"),
+            "input_closed_candle_verified": bool(metadata.get("input_closed_candle_verified", input_quality.get("strict_policy_passed", True))),
+            "forecast_timestamp_verified": bool(metadata.get("forecast_timestamp_verified", metadata.get("forecast_timestamp_check_status") == "PASS")),
+            "input_complete": bool(input_quality.get("strict_policy_passed", True)) and _int(input_quality.get("missing_candle_count")) == 0,
+            "stale_or_unclosed_warning": input_quality.get("strict_policy_rejection_reason"),
+            "requested_lookback": requested_lookback,
+            "actual_lookback": actual_lookback,
+            "actual_rows_used": _int(metadata.get("input_rows_used") or actual_lookback),
+            "max_supported_lookback": max_supported_lookback,
+            "lookback_capped": requested_lookback > max_supported_lookback,
+            "lookback_honored": requested_lookback == actual_lookback and requested_lookback <= max_supported_lookback,
+        },
+        "execution_decision_reasons": {
+            "section_label": "Execution Decision Reasons",
+            "rows": execution_decisions,
+        },
+        "latest_state": {
+            "latest_prediction_time": metadata.get("generated_at_utc"),
+            "latest_input_candle_time": input_quality.get("last_timestamp_utc") or metadata.get("input_end_timestamp_utc"),
+            "latest_input_complete": bool(input_quality.get("strict_policy_passed", True)) and _int(input_quality.get("missing_candle_count")) == 0,
+            "validation_partial_or_final": "FINAL" if actual_future_horizon_complete else "PARTIAL",
+            "actual_future_horizon_complete": actual_future_horizon_complete,
+            "execution_metrics_finalized": executed_metrics.get("execution_metrics_finalized"),
+        },
+    }
+
+
 def _json_response(handler: BaseHTTPRequestHandler, status: int, payload: dict) -> None:
     body = json.dumps(payload, indent=2, default=str).encode("utf-8")
     setattr(handler, "_response_status", status)
@@ -368,6 +561,7 @@ def _trade_execution_status() -> dict:
     try:
         queue = TradeExecutionQueueService()
         trades = queue.repository.executed_trades(limit=100)
+        decisions = queue.repository.execution_decisions(limit=100)
         transaction_lookup_error = None
         outcome_lookup_error = None
         if any(str(row.get("deal_id") or "").strip() for row in trades):
@@ -390,6 +584,7 @@ def _trade_execution_status() -> dict:
             "ok": True,
             "queue": queue.snapshot(),
             "trades": trades,
+            "execution_decisions": decisions,
             "transaction_lookup_error": transaction_lookup_error,
             "trade_outcome_lookup_error": outcome_lookup_error,
             "active_trades": [row for row in trades if str(row.get("status") or "").upper() in active_statuses],
@@ -470,8 +665,15 @@ def _validated_payload(handler: BaseHTTPRequestHandler) -> dict | None:
 def _auto_finetune_status() -> dict:
     payload = _safe_json(OUTPUT_DIR / "auto_finetune_status.json")
     if not payload:
-        return {}
-    enabled = str(os.getenv("ENABLE_AUTO_FINETUNE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+        return {
+            "enabled": False,
+            "action": "skip",
+            "reason": "auto_finetune_disabled",
+            "current_model_label": "Kronos-base",
+            "current_model_version": "Kronos-base",
+            "auto_model_running": False,
+        }
+    enabled = str(os.getenv("ENABLE_AUTO_FINETUNE", "false")).strip().lower() in {"1", "true", "yes", "on"}
     rows = int(payload.get("dataset_rows") or 0)
     required = int(payload.get("required_dataset_rows") or payload.get("min_rows") or 0)
     progress = payload.get("promotion_progress_pct")
@@ -495,7 +697,35 @@ def _auto_finetune_status() -> dict:
             "auto_model_running": auto_model_running,
         }
     )
+    if not enabled:
+        enriched.update(
+            {
+                "action": "skip",
+                "reason": "auto_finetune_disabled",
+                "current_model_label": "Kronos-base",
+                "current_model_version": "Kronos-base",
+                "auto_model_running": False,
+            }
+        )
     return enriched
+
+
+def _apply_disabled_auto_finetune_worker_status(postgres_snapshot: dict, auto_finetune: dict) -> None:
+    if bool(auto_finetune.get("enabled", True)):
+        return
+    worker_statuses = postgres_snapshot.setdefault("worker_statuses", {})
+    worker_statuses["auto_finetune_worker"] = {
+        "status": "PAUSED",
+        "details": {
+            "enabled": False,
+            "action": "skip",
+            "reason": auto_finetune.get("reason") or "auto_finetune_disabled",
+            "current_model_label": auto_finetune.get("current_model_label") or "Kronos-base",
+        },
+        "updated_at": auto_finetune.get("last_checked_utc"),
+        "stale_seconds": None,
+        "stale_alert": False,
+    }
 
 
 def _human_summary(metadata: dict, validation_body: dict, postgres_snapshot: dict) -> dict:
@@ -536,7 +766,7 @@ def _human_summary(metadata: dict, validation_body: dict, postgres_snapshot: dic
 def _status_warnings(postgres_snapshot: dict) -> list[str]:
     warnings: list[str] = []
     required_workers = {"prediction_scheduler", "validation_worker", "websocket_stream"}
-    if str(os.getenv("ENABLE_AUTO_FINETUNE", "true")).strip().lower() in {"1", "true", "yes", "on"}:
+    if str(os.getenv("ENABLE_AUTO_FINETUNE", "false")).strip().lower() in {"1", "true", "yes", "on"}:
         required_workers.add("auto_finetune_worker")
     trade_worker_enabled = str(
         os.getenv("ENABLE_TRADE_EXECUTION_WORKER", os.getenv("AUTO_EXECUTE_SIGNALS", "false"))
@@ -704,6 +934,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 baseline_summary = {p.stem: _safe_json(p).get("forecast_quality_validation", {}) for p in baseline_reports[:6]}
                 postgres_snapshot = _postgres_snapshot(selected_symbol, selected_resolution)
                 auto_finetune = _auto_finetune_status()
+                _apply_disabled_auto_finetune_worker_status(postgres_snapshot, auto_finetune)
                 validation_from_db = postgres_snapshot.get("latest_validation") or {}
                 signal_validation = postgres_snapshot.get("signal_validation") or {}
                 timeframe_validations = postgres_snapshot.get("timeframe_validations") or []
@@ -718,6 +949,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     for row in postgres_candles[-100:]
                 ]
                 validation_source = "quality_report" if quality_path else ("prediction_outcomes" if validation_from_db else "none")
+                trade_execution_status = _trade_execution_status()
+                dashboard_trust = _dashboard_trust_payload(
+                    metadata=metadata,
+                    validation_body=validation_body,
+                    postgres_snapshot=postgres_snapshot,
+                    trade_execution=trade_execution_status,
+                    baseline_summary=baseline_summary,
+                )
                 _json_response(
                     self,
                     200,
@@ -742,7 +981,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         "supervisor_lease": postgres_snapshot.get("supervisor_lease"),
                         "horizon_metrics": postgres_snapshot.get("horizon_metrics"),
                         "auto_finetune": auto_finetune,
-                        "trade_execution": _trade_execution_status(),
+                        "trade_execution": trade_execution_status,
+                        "dashboard_trust": dashboard_trust,
                         "human_summary": _human_summary(metadata, validation_body, postgres_snapshot),
                         "baseline_summary": baseline_summary,
                         "validation_source": validation_source,
@@ -973,10 +1213,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if resolution not in SUPPORTED_RESOLUTIONS:
             _error_response(self, 400, "VALIDATION_ERROR", "Unsupported resolution", {"field": "resolution"})
             return
-        if not (1 <= pred_len_int <= 96) or not (50 <= lookback_int <= 2048):
-            _error_response(self, 400, "VALIDATION_ERROR", "pred_len or lookback out of range")
+        if not (1 <= pred_len_int <= 96) or not (50 <= lookback_int <= 512):
+            _error_response(
+                self,
+                400,
+                "VALIDATION_ERROR",
+                "pred_len must be 1-96 and lookback must be 50-512 for the current Kronos context.",
+            )
             return
-        if feature_set not in {"auto", "ohlc", "ohlcv", "ohlcva"}:
+        if feature_set not in {
+            "auto",
+            "ohlc",
+            "ohlcv",
+            "ohlcva",
+            "ohlcv_only",
+            "ohlcva_derived_amount",
+            "ohlcv_with_regime_context",
+            "multi_timeframe_validation_only",
+        }:
             _error_response(self, 400, "VALIDATION_ERROR", "Unsupported feature_set", {"field": "feature_set"})
             return
         log_event(
@@ -1003,7 +1257,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "--resolution",
             resolution,
             "--max",
-            "512",
+            lookback,
             "--lookback",
             lookback,
             "--pred-len",

@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--postgres-dsn", default=None)
     parser.add_argument("--status-file", default="output/historical_5m_backfill_status.json")
     parser.add_argument("--now", default=None, help="UTC timestamp override for tests/manual replays.")
+    parser.add_argument(
+        "--no-repair-unavailable-gaps",
+        action="store_true",
+        help="Do not insert source-labeled flat candles for provider-empty historical gaps.",
+    )
     return parser.parse_args()
 
 
@@ -77,6 +82,7 @@ def main() -> None:
             source=args.source,
             dsn=args.postgres_dsn,
             now=pd.to_datetime(args.now, utc=True) if args.now else None,
+            repair_unavailable_gaps=not args.no_repair_unavailable_gaps,
         )
         status = {
             "enabled": True,
@@ -101,6 +107,7 @@ def main() -> None:
             missing_rows=summary.missing_rows,
             fetched_rows=summary.fetched_rows,
             upserted_rows=summary.upserted_rows,
+            repaired_rows=summary.repaired_rows,
             status_file=str(target),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
@@ -114,6 +121,7 @@ def main() -> None:
         print(f"Missing rows before fetch: {summary.missing_rows}")
         print(f"Missing ranges fetched: {summary.missing_ranges}")
         print(f"Fetched rows: {summary.fetched_rows}")
+        print(f"Repaired unavailable rows: {summary.repaired_rows}")
         print(f"PostgreSQL upserted rows: {summary.upserted_rows}")
         print(f"Status: {target}")
     except Exception as exc:  # noqa: BLE001

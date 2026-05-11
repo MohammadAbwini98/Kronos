@@ -79,6 +79,10 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _auto_finetune_enabled() -> bool:
+    return str(os.getenv("ENABLE_AUTO_FINETUNE", "false")).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _heartbeat(status: str, details: dict[str, Any], dsn: str | None) -> None:
     try:
         write_heartbeat("auto_finetune_worker", status, details, dsn)
@@ -597,6 +601,20 @@ def main() -> None:
     output_dir = Path(settings.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     status_path = Path(args.status_file)
+    if not _auto_finetune_enabled():
+        payload = {
+            "enabled": False,
+            "action": "skip",
+            "reason": "auto_finetune_disabled",
+            "symbol": args.symbol,
+            "resolution": args.resolution,
+            "price_side": args.price_side,
+            "last_checked_utc": pd.Timestamp.now(tz="UTC").isoformat(),
+        }
+        _write_status(status_path, payload)
+        _heartbeat("PAUSED", payload, args.postgres_dsn)
+        LOGGER.info("Auto-finetune worker disabled by ENABLE_AUTO_FINETUNE=false")
+        return
 
     while True:
         heartbeat_status = "OK"

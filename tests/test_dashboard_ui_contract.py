@@ -152,6 +152,8 @@ class DashboardUiContractTests(unittest.TestCase):
 
         for hook in (
             "tradeLifecycleFilter",
+            "tradeDateFromFilter",
+            "tradeDateToFilter",
             "tradeStatusFilter",
             "tradeOutcomeFilter",
             "tradeSideFilter",
@@ -179,22 +181,33 @@ class DashboardUiContractTests(unittest.TestCase):
         self.assertIn("<th>Broker / Queue Ref</th>", html)
         self.assertIn("<th>Transaction ID</th>", html)
         self.assertIn("<th>Outcome</th>", html)
-        self.assertIn("Outcome Wins", html)
-        self.assertIn("Outcome Losses", html)
-        self.assertIn("Outcome PNL", html)
-        self.assertIn("filteredOutcomePnl", html)
-        self.assertIn("allOutcomePnl", html)
-        self.assertIn("(filteredOutcomeCounts.WIN || 0) - (filteredOutcomeCounts.LOSS || 0)", html)
-        self.assertIn("Unknown Outcomes", html)
-        self.assertIn("Open Outcomes", html)
+        self.assertIn("Executed Win Rate", html)
+        self.assertIn("Closed finalized executed trades only", html)
+        self.assertIn("Total Net P/L", html)
+        self.assertIn("Expectancy", html)
+        self.assertIn("Average Win", html)
+        self.assertIn("Average Loss", html)
+        self.assertIn("Drawdown", html)
+        self.assertIn("Spread Impact", html)
+        self.assertIn("Slippage Impact", html)
+        self.assertIn("Finalization Pending", html)
+        self.assertIn("Execution Decision Reasons", html)
+        self.assertIn("<th>Date / Time</th>", html)
+        self.assertIn("Dates are interpreted in Asia/Amman timezone.", html)
+        self.assertIn("net_expected_edge_pct", html)
         self.assertIn("TRADE_EXECUTION_PAGE_SIZE = 10", html)
         self.assertIn("row.trade_outcome", html)
         self.assertIn("tradeExecutionFilters.outcome", html)
+        self.assertIn("tradeExecutionFilters.dateFrom", html)
+        self.assertIn("tradeExecutionFilters.dateTo", html)
         self.assertIn("All outcomes", html)
         self.assertIn("row.transaction_id", html)
         self.assertIn("tradeExecutionFilters.transactionId", html)
         self.assertIn("transaction_lookup_error", html)
-        self.assertIn("row.signal_status || 'n/a'", html)
+        self.assertIn("row.signal_status || 'UNKNOWN'", html)
+        self.assertIn("Broker lookup blocked", html)
+        self.assertIn("Awaiting broker outcome", html)
+        self.assertIn("not evaluated", html)
         self.assertIn("not filled", html)
         self.assertIn("MarketNotTradeableError", html)
         self.assertIn("Retry scheduled", html)
