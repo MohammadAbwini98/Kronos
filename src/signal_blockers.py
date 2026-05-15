@@ -13,6 +13,7 @@ BLOCK_REASONS = {
     "INVALID_5M_INPUT",
     "MISSING_HIGHER_TIMEFRAME_CONTEXT",
     "HIGHER_TIMEFRAME_CONFLICT",
+    "DIRECTION_REGIME_TIMEFRAME_CONFLICT",
     "PROVISIONAL_HIGHER_TIMEFRAME_CONTEXT",
     "WIDE_SPREAD_OR_COST_UNKNOWN",
     "VERY_LOW_VOLUME",
@@ -44,6 +45,69 @@ def _hour_confirmation_conflict(candidate_signal: str, timeframe_results: list[d
     if candidate_signal == "SHORT" and trend != "BEARISH":
         return True
     return False
+
+
+def _trend_opposes_candidate(candidate_signal: str, trend: str) -> bool:
+    candidate = str(candidate_signal).upper()
+    trend_value = str(trend).upper()
+    if candidate == "LONG":
+        return trend_value == "BEARISH"
+    if candidate == "SHORT":
+        return trend_value == "BULLISH"
+    return False
+
+
+def _trend_strength(row: dict[str, Any]) -> float | None:
+    snapshot = row.get("indicator_snapshot") or {}
+    try:
+        value = snapshot.get("trend_strength")
+    except AttributeError:
+        value = None
+    if value is None:
+        value = row.get("trend_strength")
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _strongly_opposes_candidate(candidate_signal: str, row: dict[str, Any], min_strength: float) -> bool:
+    if not row:
+        return False
+    trend = str(row.get("trend") or "NEUTRAL").upper()
+    if not _trend_opposes_candidate(candidate_signal, trend):
+        return False
+    state = str(row.get("alignment_state") or "").upper()
+    if state and state != "CONFLICTS":
+        return False
+    strength = _trend_strength(row)
+    return strength is None or strength >= float(min_strength)
+
+
+def _direction_regime_conflict(
+    candidate_signal: str,
+    timeframe_results: list[dict[str, Any]],
+    *,
+    min_strength: float,
+) -> tuple[bool, list[str]]:
+    candidate = str(candidate_signal).upper()
+    if candidate not in {"LONG", "SHORT"}:
+        return False, []
+
+    by_timeframe = {str(row.get("timeframe") or "").upper(): row for row in timeframe_results}
+    direction_row = by_timeframe.get("MINUTE_15") or {}
+    regime_row = by_timeframe.get("MINUTE_30") or {}
+
+    direction_conflict = _strongly_opposes_candidate(candidate, direction_row, min_strength)
+    regime_conflict = _strongly_opposes_candidate(candidate, regime_row, min_strength)
+    if not (direction_conflict and regime_conflict):
+        return False, []
+
+    details = [
+        f"15m direction confirmation is {direction_row.get('trend', 'UNKNOWN')} against the 5m {candidate} candidate.",
+        f"30m regime confirmation is {regime_row.get('trend', 'UNKNOWN')} against the 5m {candidate} candidate.",
+    ]
+    return True, details
 
 
 def evaluate_hard_blockers(
@@ -119,6 +183,16 @@ def evaluate_hard_blockers(
     if config.signal_require_hour_confirmation and _hour_confirmation_conflict(candidate_signal, timeframe_results):
         reason_codes.append("HIGHER_TIMEFRAME_CONFLICT")
         reason_details.append("HOUR trend confirmation is required and does not confirm the candidate signal.")
+
+    if config.signal_block_on_direction_regime_conflict:
+        conflicts, conflict_details = _direction_regime_conflict(
+            candidate_signal,
+            timeframe_results,
+            min_strength=config.signal_strong_disagreement_trend_strength,
+        )
+        if conflicts:
+            reason_codes.append("DIRECTION_REGIME_TIMEFRAME_CONFLICT")
+            reason_details.extend(conflict_details)
 
     spread_pct = market.get("spread_pct")
     if config.signal_block_on_wide_spread:

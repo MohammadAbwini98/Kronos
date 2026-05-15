@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from config import configure_logging
+from config import configure_logging, load_instrument_settings
 from logging_utils import log_event, new_correlation_id
 from prediction_store import save_prediction_run
 from prediction_input_quality import input_window_audit, resolve_feature_experiment, select_feature_columns
@@ -83,14 +83,16 @@ def _env_int(names: tuple[str, ...], default: int, *, minimum: int = 1) -> int:
 
 
 def parse_args() -> argparse.Namespace:
+    instrument = load_instrument_settings()
     parser = argparse.ArgumentParser(description="Run local Kronos forecast on a Kronos-ready CSV.")
     parser.add_argument("--input", required=True, help="Kronos-ready CSV with timestamps, OHLC, volume, amount.")
     parser.add_argument("--output", default=None, help="Forecast CSV output path. Defaults to timestamped output file.")
-    parser.add_argument("--resolution", default="MINUTE_5", choices=sorted(SUPPORTED_RESOLUTIONS))
+    parser.add_argument("--resolution", default=instrument.candle_interval, choices=sorted(SUPPORTED_RESOLUTIONS))
     parser.add_argument("--lookback", type=int, default=512, help="Historical rows to pass to Kronos.")
     parser.add_argument("--pred-len", type=int, default=12, help="Number of future candles to forecast.")
     parser.add_argument("--min-input-rows", type=int, default=50, help="Minimum historical rows required to run.")
     parser.add_argument("--preferred-input-rows", type=int, default=512, help="Preferred Kronos-base context length.")
+    parser.add_argument("--symbol", default=None, help="Configured dashboard/signal symbol for DB metadata. Defaults to epic.")
     parser.add_argument("--epic", default=None, help="Capital.com epic for metadata and timestamped filenames.")
     parser.add_argument("--market-name", default="", help="Human-readable market name for metadata.")
     parser.add_argument("--price-side", default="mid", choices=["bid", "ask", "mid"], help="Price side used to build the input.")
@@ -138,8 +140,8 @@ def parse_args() -> argparse.Namespace:
         help="Post-process forecast high/low so high >= open/close/low and low <= open/close/high.",
     )
     parser.add_argument("--validation-report", default=None, help="Optional JSON validation report path.")
-    parser.add_argument("--max-close-move-pct", type=float, default=20.0, help="Warn if forecast close moves more than this percent from last close.")
-    parser.add_argument("--flat-threshold-pct", type=float, default=0.02, help="Close movement below this percent is FLAT.")
+    parser.add_argument("--max-close-move-pct", type=float, default=instrument.max_candle_move_pct, help="Warn if forecast close moves more than this percent from last close.")
+    parser.add_argument("--flat-threshold-pct", type=float, default=instrument.min_expected_move_pct, help="Close movement below this percent is FLAT.")
     parser.add_argument(
         "--movement-cost-threshold-pct",
         type=float,
@@ -332,6 +334,7 @@ def _validate_forecast(
 def _write_metadata(
     path: Path,
     *,
+    symbol: str | None = None,
     epic: str,
     market_name: str,
     resolution: str,
@@ -354,6 +357,7 @@ def _write_metadata(
     forecast_timestamp_check_status: str = "PASS",
     forecast_timestamp_mismatches: list[dict[str, object]] | None = None,
 ) -> None:
+    instrument = load_instrument_settings()
     input_quality = input_quality_snapshot or {}
     amount_mode = (
         "DERIVED"
@@ -362,6 +366,7 @@ def _write_metadata(
     )
     forecast_timestamp_verified = forecast_timestamp_check_status == "PASS" and not (forecast_timestamp_mismatches or [])
     metadata = {
+        "symbol": symbol or epic,
         "epic": epic,
         "market_name": market_name,
         "resolution": resolution,
@@ -373,6 +378,14 @@ def _write_metadata(
         "model_path": str(model_dir),
         "tokenizer_path": str(tokenizer_dir),
         "source_provider": source,
+        "instrument_name": instrument.name,
+        "display_symbol": instrument.display_symbol,
+        "provider_symbol": instrument.provider_symbol,
+        "database_schema": instrument.database_schema,
+        "price_precision": instrument.price_precision,
+        "volume_precision": instrument.volume_precision,
+        "tick_size": instrument.tick_size,
+        "pip_size": instrument.pip_size,
         "generated_at_utc": generated_at_utc,
         "generated_at_local": format_local_timestamp(generated_at_utc),
         "display_timezone": display_timezone_name(),
@@ -552,6 +565,7 @@ def run_prediction(
     pred_len: int,
     min_input_rows: int,
     preferred_input_rows: int,
+    symbol: str | None,
     epic: str,
     market_name: str,
     price_side: str,
@@ -588,6 +602,7 @@ def run_prediction(
         metadata_path=str(metadata_output) if metadata_output else None,
         validation_report_path=str(validation_report) if validation_report else None,
         epic=epic,
+        symbol=symbol or epic,
         market_name=market_name,
         resolution=resolution,
         price_side=price_side,
@@ -667,7 +682,7 @@ def run_prediction(
             requested_lookback=lookback,
             selected_feature_columns=feature_columns,
             source_label=source,
-            symbol=epic,
+            symbol=symbol or epic,
             price_side=price_side,
         )
         input_quality_snapshot["feature_mode"] = feature_mode
@@ -848,6 +863,7 @@ def run_prediction(
         if metadata_output is not None:
             _write_metadata(
                 metadata_output,
+                symbol=symbol or epic,
                 epic=epic,
                 market_name=market_name,
                 resolution=resolution,
@@ -975,6 +991,7 @@ def run_prediction(
             metadata_path=str(metadata_output) if metadata_output else None,
             validation_report_path=str(validation_report) if validation_report else None,
             epic=epic,
+            symbol=symbol or epic,
             market_name=market_name,
             resolution=resolution,
             price_side=price_side,
@@ -1006,6 +1023,7 @@ def run_prediction(
             metadata_path=str(metadata_output) if metadata_output else None,
             validation_report_path=str(validation_report) if validation_report else None,
             epic=epic,
+            symbol=symbol or epic,
             market_name=market_name,
             resolution=resolution,
             price_side=price_side,
@@ -1027,14 +1045,15 @@ def main() -> None:
     _load_dotenv_if_present()
     args = parse_args()
     prediction_request_id = new_correlation_id("pred")
-    repo_dir = Path(args.repo_dir or _env("KRONOS_REPO_DIR", r"C:\AI\Kronos"))
-    tokenizer_dir = Path(args.tokenizer_dir or _env("KRONOS_TOKENIZER_DIR", r"C:\AI\Models\Kronos\Kronos-Tokenizer-base"))
+    repo_dir = Path(args.repo_dir or _env("KRONOS_REPO_DIR", r".\KRONOS-MODEL"))
+    tokenizer_dir = Path(args.tokenizer_dir or _env("KRONOS_TOKENIZER_DIR", r".\KRONOS-MODEL\model\Kronos-Tokenizer-base"))
     device = args.device or _env("KRONOS_DEVICE", "auto")
     run_timestamp = args.run_stamp if args.run_stamp else _utc_file_timestamp()
     epic = args.epic or _infer_epic(Path(args.input), args.resolution)
+    symbol = args.symbol or epic
     safe_epic = _safe_name(epic)
     output_dir = Path(args.output_dir)
-    configured_model_dir = Path(args.model_dir or _env("KRONOS_MODEL_DIR", r"C:\AI\Models\Kronos\Kronos-base"))
+    configured_model_dir = Path(args.model_dir or _env("KRONOS_MODEL_DIR", r".\KRONOS-MODEL\model\Kronos-base"))
     auto_model_dir = None
     if args.model_dir is None:
         auto_model_dir = _auto_finetuned_model_dir(output_dir)
@@ -1069,6 +1088,7 @@ def main() -> None:
         pred_len=args.pred_len,
         min_input_rows=args.min_input_rows,
         preferred_input_rows=args.preferred_input_rows,
+        symbol=symbol,
         epic=epic,
         market_name=args.market_name,
         price_side=args.price_side,

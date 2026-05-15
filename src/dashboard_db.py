@@ -7,6 +7,8 @@ import re
 import time
 from typing import Any
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
+
 from db import connect, healthcheck
 from logging_utils import log_event, new_correlation_id
 from rate_limit_state import list_rate_limit_states
@@ -515,7 +517,7 @@ def horizon_metric_summary(*, symbol: str, resolution: str, dsn: str | None = No
         return []
 
 
-def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MINUTE_5", dsn: str | None = None) -> dict[str, Any]:
+def postgres_dashboard_snapshot(*, symbol: str = DEFAULT_INSTRUMENT_SYMBOL, resolution: str = "MINUTE_5", dsn: str | None = None) -> dict[str, Any]:
     request_id = new_correlation_id("req")
     started = time.perf_counter()
     log_event(

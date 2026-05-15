@@ -16,6 +16,7 @@ from config import (
     BridgeSettings,
     RateLimiter,
     assert_data_only_path,
+    load_instrument_settings,
     safe_epic_for_filename,
     validate_price_side,
     validate_resolution,
@@ -256,8 +257,16 @@ class CapitalRestClient:
             return {"epic": self.settings.default_epic, "instrumentName": instrument.get("name", ""), "details": details}
 
         requested = market or self.settings.default_market_search
+        instrument = load_instrument_settings()
         search_terms = []
-        for term in (requested, "ETHUSD", "ETH/USD", "Ethereum", "ETH"):
+        for term in (
+            requested,
+            self.settings.default_market_search,
+            instrument.provider_symbol,
+            instrument.display_symbol,
+            instrument.name,
+            instrument.base_asset,
+        ):
             if term and term not in search_terms:
                 search_terms.append(term)
 
@@ -288,7 +297,17 @@ class CapitalRestClient:
 
     @staticmethod
     def _select_best_market(candidates: list[dict[str, Any]], streaming: bool, requested: str | None = None) -> dict[str, Any]:
-        keywords = ("eth/usd", "ethusd", "ethereum", "ether", "eth")
+        instrument = load_instrument_settings()
+        keywords = tuple(
+            token.lower()
+            for token in (
+                instrument.display_symbol,
+                instrument.provider_symbol,
+                instrument.name,
+                instrument.base_asset,
+            )
+            if token
+        )
         requested_norm = CapitalRestClient._normalize_market_token(requested)
 
         def score(market: dict[str, Any]) -> tuple[int, int, int, int, int, str]:

@@ -5,12 +5,13 @@ from pathlib import Path
 
 import pandas as pd
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
 from prediction_store import load_recent_ohlcv
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Export PostgreSQL OHLCV candles for Kronos fine-tuning experiments.")
-    parser.add_argument("--symbol", default="ETHUSD")
+    parser.add_argument("--symbol", default=DEFAULT_INSTRUMENT_SYMBOL)
     parser.add_argument("--resolution", default="MINUTE_5")
     parser.add_argument("--price-side", default="mid")
     parser.add_argument("--limit", type=int, default=50000)

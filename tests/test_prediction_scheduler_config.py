@@ -77,8 +77,15 @@ class SchedulerConfigTests(unittest.TestCase):
                 "postgres_dsn": None,
             },
         )()
+        fixed_now = main_prediction_scheduler.pd.Timestamp("2026-01-01T00:04:58Z")
+
+        class _FixedTimestamp:
+            @staticmethod
+            def now(tz=None):
+                return fixed_now
 
         with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch.object(main_prediction_scheduler.pd, "Timestamp", _FixedTimestamp))
             _stack.enter_context(patch.object(main_prediction_scheduler.time, "sleep", return_value=None))
             heartbeat = _stack.enter_context(patch.object(main_prediction_scheduler, "_heartbeat"))
             main_prediction_scheduler._sleep_to_next_boundary(

@@ -115,9 +115,9 @@ def ensure_higher_timeframe_candles(
     """
     started_at = pd.Timestamp.now(tz="UTC")
     current_time = now_utc or started_at
-    timeframes = [tf.strip().upper() for tf in (required_timeframes or DEFAULT_HIGHER_TIMEFRAMES)]
-    timeframes = [tf for tf in timeframes if tf in DEFAULT_HIGHER_TIMEFRAMES]
-    if not timeframes:
+    raw_timeframes = [tf.strip().upper() for tf in (required_timeframes or DEFAULT_HIGHER_TIMEFRAMES)]
+    timeframes = [tf for tf in raw_timeframes if tf in DEFAULT_HIGHER_TIMEFRAMES]
+    if required_timeframes is None and not timeframes:
         timeframes = list(DEFAULT_HIGHER_TIMEFRAMES)
 
     result: dict[str, Any] = {

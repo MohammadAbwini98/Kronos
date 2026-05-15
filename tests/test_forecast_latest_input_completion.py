@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import patch
 
 import pandas as pd
+import tempfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 import main_forecast_latest
+from gold_analyzer.models.base import ForecastModel, ForecastPoint, ForecastRequest, ForecastResult
 
 
 class _FakeConnection:
@@ -86,6 +88,47 @@ class ForecastLatestInputCompletionTests(unittest.TestCase):
             list(completed["timestamps"]),
         )
         self.assertEqual([100.5, 102.5, 103.5], list(completed["close"]))
+
+    def test_persisted_kronos_adapter_converts_forecast_csv_to_model_result(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            forecast_csv = Path(temp_dir) / "forecast.csv"
+            pd.DataFrame(
+                {
+                    "timestamps": pd.to_datetime(["2026-05-01T00:05:00Z", "2026-05-01T00:10:00Z"], utc=True),
+                    "close": [101.0, 99.0],
+                }
+            ).to_csv(forecast_csv, index=False)
+            adapter = main_forecast_latest._PersistedKronosForecastAdapter(
+                forecast_csv=forecast_csv,
+                model_version="Kronos-base",
+                forecast_model_cls=ForecastModel,
+                forecast_point_cls=ForecastPoint,
+                forecast_request_cls=ForecastRequest,
+                forecast_result_cls=ForecastResult,
+            )
+            request = ForecastRequest(
+                epic="GOLD",
+                timeframe="MINUTE_5",
+                horizon_bars=2,
+                context_bars=2,
+                candles=pd.DataFrame(
+                    {
+                        "timestamps": pd.to_datetime(["2026-05-01T00:00:00Z"], utc=True),
+                        "open": [100.0],
+                        "high": [100.0],
+                        "low": [100.0],
+                        "close": [100.0],
+                        "volume": [1.0],
+                    }
+                ),
+            )
+
+            result = adapter.predict(request)
+
+        self.assertEqual("OK", result.status)
+        self.assertEqual("kronos", result.model_key)
+        self.assertEqual(["UP", "DOWN"], [point.predicted_direction for point in result.points])
+        self.assertEqual([0.01, -0.01], [round(point.predicted_return, 2) for point in result.points])
 
 
 if __name__ == "__main__":

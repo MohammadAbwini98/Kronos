@@ -7,6 +7,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
+
 from psycopg.types.json import Jsonb
 
 from dataset_snapshots import dataset_windows_overlap, load_dataset_snapshot
@@ -143,7 +145,7 @@ def register_model_version(
     model_name: str,
     model_path: str,
     tokenizer_path: str | None = None,
-    symbol: str = "ETHUSD",
+    symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
     resolution: str = "MINUTE_5",
     lookback: int = 512,
     pred_len: int = 12,
@@ -319,7 +321,7 @@ def _aggregate_shadow_horizon_accuracy(rows: list[dict[str, Any]]) -> dict[int, 
 
 def model_performance(
     *,
-    symbol: str = "ETHUSD",
+    symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
     resolution: str = "MINUTE_5",
     model_version_id: str | None = None,
     dsn: str | None = None,

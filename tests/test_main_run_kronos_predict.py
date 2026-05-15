@@ -90,5 +90,61 @@ class PostgresDsnArgumentTests(unittest.TestCase):
             self.assertEqual(dsn, run_prediction.call_args.kwargs["prediction_db"])
 
 
+class MetadataSymbolTests(unittest.TestCase):
+    def test_metadata_keeps_configured_symbol_separate_from_provider_epic(self):
+        input_df = pd.DataFrame(
+            {
+                "timestamps": pd.date_range("2026-05-01T10:00:00Z", periods=2, freq="5min", tz="UTC"),
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.5, 101.5],
+                "volume": [1.0, 1.0],
+                "amount": [0.0, 0.0],
+            }
+        )
+        pred_df = pd.DataFrame(
+            {
+                "timestamps": pd.date_range("2026-05-01T10:10:00Z", periods=2, freq="5min", tz="UTC"),
+                "open": [102.0, 103.0],
+                "high": [103.0, 104.0],
+                "low": [101.0, 102.0],
+                "close": [102.5, 103.5],
+                "volume": [1.0, 1.0],
+                "amount": [0.0, 0.0],
+            }
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "metadata.json"
+            main_run_kronos_predict._write_metadata(
+                path,
+                symbol="XAUUSD",
+                epic="GOLD",
+                market_name="Gold",
+                resolution="MINUTE_5",
+                price_side="mid",
+                input_rows_used=2,
+                forecast_rows=2,
+                model_name="Kronos-base",
+                model_dir=Path("model"),
+                tokenizer_dir=Path("tokenizer"),
+                source="Capital.com",
+                generated_at_utc="2026-05-01T10:00:00+00:00",
+                input_df=input_df,
+                pred_df=pred_df,
+                forecast_csv=Path("forecast.csv"),
+                input_copy_csv=Path("input.csv"),
+                validation_report=Path("validation.json"),
+                selected_feature_columns=["open", "high", "low", "close", "volume"],
+                feature_mode="OHLCV_ONLY",
+            )
+
+            metadata = json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual("XAUUSD", metadata["symbol"])
+        self.assertEqual("GOLD", metadata["epic"])
+
+
 if __name__ == "__main__":
     unittest.main()

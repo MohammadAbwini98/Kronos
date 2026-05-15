@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-from config import configure_logging
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging
 from db import connect
 from logging_utils import log_event, new_correlation_id, output_tail as sanitize_output_tail, safe_command_for_log
 from service_runtime import write_heartbeat
@@ -108,8 +108,8 @@ def _resolve_kronos_python(value: str | None) -> tuple[str, str | None]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the data-only Kronos signal scheduler every N minutes.")
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
-    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=os.getenv("SIGNAL_RESOLUTION", os.getenv("CAPITAL_DEFAULT_RESOLUTION", "MINUTE_5")))
     parser.add_argument(
         "--interval-minutes",
@@ -176,6 +176,7 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
         "last_processed_websocket_candle_timestamp_utc": _iso(last_processed),
     }
     try:
+        market_identifier = str(getattr(args, "market", "") or symbol).strip()
         with connect(args.postgres_dsn) as conn:
             latest_quote = conn.execute(
                 """
@@ -197,6 +198,18 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
                 """,
                 (symbol, resolution),
             ).fetchone()
+            latest_websocket_event = conn.execute(
+                """
+                SELECT event_timestamp_utc, created_at, event_type
+                FROM raw_market_events
+                WHERE (symbol IN (%s, %s) OR epic IN (%s, %s))
+                  AND event_timestamp_utc IS NOT NULL
+                  AND lower(event_type) LIKE '%%ohlc%%'
+                ORDER BY event_timestamp_utc DESC, created_at DESC
+                LIMIT 1
+                """,
+                (symbol, market_identifier, symbol, market_identifier),
+            ).fetchone()
             websocket_state = conn.execute(
                 """
                 SELECT status, updated_at
@@ -217,7 +230,21 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
     quote_ref = quote_updated_at or quote_timestamp_utc
     websocket_candle_timestamp = _to_utc_timestamp((latest_websocket_candle or {}).get("timestamp_utc"))
     websocket_candle_updated_at = _to_utc_timestamp((latest_websocket_candle or {}).get("updated_at"))
-    websocket_candidates = [v for v in [quote_ref, websocket_candle_updated_at, websocket_candle_timestamp] if v is not None]
+    websocket_event_timestamp = _to_utc_timestamp((latest_websocket_event or {}).get("event_timestamp_utc"))
+    websocket_event_created_at = _to_utc_timestamp((latest_websocket_event or {}).get("created_at"))
+    websocket_candle_markers = [v for v in [websocket_candle_timestamp, websocket_event_timestamp] if v is not None]
+    websocket_effective_candle_timestamp = max(websocket_candle_markers) if websocket_candle_markers else None
+    websocket_candidates = [
+        v
+        for v in [
+            quote_ref,
+            websocket_candle_updated_at,
+            websocket_candle_timestamp,
+            websocket_event_created_at,
+            websocket_event_timestamp,
+        ]
+        if v is not None
+    ]
     websocket_ref = max(websocket_candidates) if websocket_candidates else None
     websocket_stale_seconds = _seconds_since(websocket_ref, now=now_utc)
 
@@ -232,6 +259,9 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
             "websocket_quote_timestamp_utc": _iso(quote_timestamp_utc),
             "latest_websocket_candle_timestamp_utc": _iso(websocket_candle_timestamp),
             "latest_websocket_candle_updated_at": _iso(websocket_candle_updated_at),
+            "latest_raw_websocket_event_timestamp_utc": _iso(websocket_event_timestamp),
+            "latest_raw_websocket_event_created_at_utc": _iso(websocket_event_created_at),
+            "latest_effective_websocket_candle_timestamp_utc": _iso(websocket_effective_candle_timestamp),
             "websocket_last_update_utc": _iso(websocket_ref),
             "websocket_stale_seconds": websocket_stale_seconds,
         }
@@ -243,9 +273,9 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
             allow=False,
             reason="websocket_stream_not_ready",
             details=details,
-            latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+            latest_candle_timestamp_utc=_iso(websocket_effective_candle_timestamp),
         )
-    if websocket_candle_timestamp is None:
+    if websocket_effective_candle_timestamp is None:
         details.update({"state": "paused_websocket_gate", "gate_reason": "websocket_candle_missing"})
         return WebSocketPredictionGate(
             allow=False,
@@ -258,15 +288,15 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
             allow=False,
             reason="websocket_stale",
             details=details,
-            latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+            latest_candle_timestamp_utc=_iso(websocket_effective_candle_timestamp),
         )
-    if last_processed is not None and websocket_candle_timestamp <= last_processed:
+    if last_processed is not None and websocket_effective_candle_timestamp <= last_processed:
         details.update({"state": "paused_websocket_gate", "gate_reason": "no_new_websocket_candle"})
         return WebSocketPredictionGate(
             allow=False,
             reason="no_new_websocket_candle",
             details=details,
-            latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+            latest_candle_timestamp_utc=_iso(websocket_effective_candle_timestamp),
         )
 
     details.update({"state": "websocket_gate_passed", "gate_reason": "ok"})
@@ -274,7 +304,7 @@ def _websocket_prediction_gate(args: argparse.Namespace) -> WebSocketPredictionG
         allow=True,
         reason="ok",
         details=details,
-        latest_candle_timestamp_utc=_iso(websocket_candle_timestamp),
+        latest_candle_timestamp_utc=_iso(websocket_effective_candle_timestamp),
     )
 
 

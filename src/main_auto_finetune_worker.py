@@ -11,6 +11,7 @@ from typing import Any
 
 import pandas as pd
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
 from config import configure_logging, load_settings
 from db import connect
 from dataset_snapshots import create_dataset_snapshot
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
     )
     default_poll_minutes = int(os.getenv("AUTO_FINETUNE_INTERVAL_MINUTES", str(_resolution_minutes(default_resolution))))
     parser = argparse.ArgumentParser(description="Automatically fine-tune Kronos using persisted 5-minute OHLC data from PostgreSQL.")
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=default_resolution)
     parser.add_argument("--price-side", default=os.getenv("CAPITAL_DEFAULT_PRICE_SIDE", "mid"))
     parser.add_argument("--env", default=os.getenv("CAPITAL_ENV", "demo"), choices=["demo", "live"])
@@ -53,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-new-rows", type=int, default=int(os.getenv("AUTO_FINETUNE_MIN_NEW_ROWS", "1000")))
     parser.add_argument("--poll-minutes", type=int, default=default_poll_minutes)
     parser.add_argument("--command", default=os.getenv("KRONOS_FINETUNE_COMMAND", ""))
-    parser.add_argument("--model-dir", default=os.getenv("KRONOS_AUTO_MODEL_DIR", r"C:\AI\Models\Kronos\Kronos-auto-finetuned"))
+    parser.add_argument("--model-dir", default=os.getenv("KRONOS_AUTO_MODEL_DIR", r".\KRONOS-MODEL\model\Kronos-auto-finetuned"))
     parser.add_argument("--status-file", default="output/auto_finetune_status.json")
     parser.add_argument(
         "--failure-cooldown-minutes",

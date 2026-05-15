@@ -157,7 +157,7 @@ def persist_prediction_input_rejection(
 
 
 def _safe_symbol(metadata: dict[str, Any]) -> str:
-    return str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD")
+    return str(metadata.get("symbol") or metadata.get("epic") or "XAUUSD")
 
 
 def _forecast_timestamp_mismatches_for_metadata(metadata: dict[str, Any], forecast: pd.DataFrame) -> list[dict[str, Any]]:
@@ -1049,7 +1049,7 @@ def save_shadow_prediction(
             model_name=model_name,
             model_path=model_path,
             tokenizer_path=metadata.get("tokenizer_path"),
-            symbol=str(metadata.get("symbol") or metadata.get("epic") or "ETHUSD"),
+            symbol=str(metadata.get("symbol") or metadata.get("epic") or "XAUUSD"),
             resolution=str(metadata.get("resolution") or "MINUTE_5"),
             lookback=int(metadata.get("input_rows_used") or 512),
             pred_len=int(metadata.get("forecast_rows") or 12),

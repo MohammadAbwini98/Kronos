@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from higher_timeframe_validator import TIMEFRAME_ALIGNMENT_WEIGHTS
-from signal_config import SignalConfig
+from signal_config import TIMEFRAME_ROLE_RULES, SignalConfig
 
 
 MAX_COMPONENT_SCORES = {
@@ -31,6 +31,14 @@ def _bucket_confidence(total_score: float) -> str:
     if total_score >= 50.0:
         return "LOW"
     return "NONE"
+
+
+def _timeframe_role(timeframe: str) -> str:
+    return str(TIMEFRAME_ROLE_RULES.get(str(timeframe).upper(), {}).get("role") or "").upper()
+
+
+def _timeframe_label(timeframe: str) -> str:
+    return str(TIMEFRAME_ROLE_RULES.get(str(timeframe).upper(), {}).get("label") or timeframe)
 
 
 def _final_signal(candidate_signal: str, total_score: float, config: SignalConfig) -> str:
@@ -64,6 +72,8 @@ def _aggregate_timeframe_scores(timeframe_validations: list[dict[str, Any]]) -> 
     volume_raw = 0.0
     volatility_raw = 0.0
     sr_raw = 0.0
+    entry_timing_raw = 0.0
+    entry_timing_cap = 0.0
 
     momentum_cap = 0.0
     volume_cap = 0.0
@@ -72,6 +82,12 @@ def _aggregate_timeframe_scores(timeframe_validations: list[dict[str, Any]]) -> 
 
     for row in timeframe_validations:
         timeframe = str(row.get("timeframe") or "").upper()
+        if _timeframe_role(timeframe) == "ENTRY_CONFIRMATION":
+            entry_timing_cap += 2.0
+            if bool(row.get("confirms_candidate")):
+                entry_timing_raw += _clamp(float(row.get("momentum_score") or 0.0), 0.0, 2.0)
+            continue
+
         alignment_cap = float(TIMEFRAME_ALIGNMENT_WEIGHTS.get(timeframe, 0.0))
         trend_score = float(row.get("trend_score") or 0.0)
         alignment_raw += _clamp(trend_score, 0.0, alignment_cap)
@@ -87,16 +103,18 @@ def _aggregate_timeframe_scores(timeframe_validations: list[dict[str, Any]]) -> 
         sr_cap += 1.0
 
     momentum_scaled = 0.0 if momentum_cap <= 0 else (momentum_raw / momentum_cap) * MAX_COMPONENT_SCORES["momentum"]
+    entry_timing_boost = 0.0 if entry_timing_cap <= 0 else (entry_timing_raw / entry_timing_cap) * 2.0
     volume_scaled = 0.0 if volume_cap <= 0 else (volume_raw / volume_cap) * MAX_COMPONENT_SCORES["volume"]
     volatility_scaled = 0.0 if volatility_cap <= 0 else (volatility_raw / volatility_cap) * MAX_COMPONENT_SCORES["volatility"]
     sr_scaled = 0.0 if sr_cap <= 0 else (sr_raw / sr_cap) * MAX_COMPONENT_SCORES["support_resistance"]
 
     return {
         "alignment": _clamp(alignment_raw, 0.0, MAX_COMPONENT_SCORES["higher_timeframe_alignment"]),
-        "momentum": _clamp(momentum_scaled, 0.0, MAX_COMPONENT_SCORES["momentum"]),
+        "momentum": _clamp(momentum_scaled + entry_timing_boost, 0.0, MAX_COMPONENT_SCORES["momentum"]),
         "volume": _clamp(volume_scaled, 0.0, MAX_COMPONENT_SCORES["volume"]),
         "volatility": _clamp(volatility_scaled, 0.0, MAX_COMPONENT_SCORES["volatility"]),
         "support_resistance": _clamp(sr_scaled, 0.0, MAX_COMPONENT_SCORES["support_resistance"]),
+        "entry_timing": _clamp(entry_timing_boost, 0.0, 2.0),
     }
 
 
@@ -109,6 +127,7 @@ def _higher_timeframe_conflict_penalty(
         return 0.0, []
 
     penalty_by_timeframe = {
+        "MINUTE": 0.0,
         "MINUTE_15": 2.0,
         "MINUTE_30": 4.0,
         "HOUR": 9.0,
@@ -123,8 +142,12 @@ def _higher_timeframe_conflict_penalty(
         if trend != opposing_trend:
             continue
         value = penalty_by_timeframe.get(timeframe, 0.0)
+        if value <= 0:
+            continue
         penalty += value
-        reasons.append(f"{timeframe} trend is {trend} against {candidate} candidate (-{value:.0f}).")
+        reasons.append(
+            f"{_timeframe_label(timeframe)} trend is {trend} against {candidate} candidate (-{value:.0f})."
+        )
     return _clamp(penalty, 0.0, 20.0), reasons
 
 
@@ -216,6 +239,8 @@ def score_signal(
     reasons.extend(penalty_reasons)
     if low_volume_reason:
         reasons.append(low_volume_reason)
+    if tf_scores.get("entry_timing", 0.0) > 0:
+        reasons.append(f"1m entry confirmation added {tf_scores['entry_timing']:.1f} momentum points.")
     if final_signal in {"WATCH", "HOLD"} and candidate_signal in {"LONG", "SHORT"}:
         reasons.append("Candidate signal did not clear final scoring thresholds.")
 

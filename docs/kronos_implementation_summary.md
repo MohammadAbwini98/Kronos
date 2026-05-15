@@ -93,11 +93,11 @@ Focused dashboard/security tests:
 - Result: 12 passed
 
 Full test suite:
-- Command: POSTGRES_DSN=postgresql://postgres:123@localhost:5432/capital_kronos .venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
+- Command: POSTGRES_DSN=<local-postgres-dsn> .venv\Scripts\python.exe -m unittest discover -s tests -p "test_*.py"
 - Result: 111 passed
 
 Migration runbook check:
-- Command: POSTGRES_DSN=postgresql://postgres:123@localhost:5432/capital_kronos .venv\Scripts\python.exe src/main_db_migrate.py
+- Command: POSTGRES_DSN=<local-postgres-dsn> .venv\Scripts\python.exe src/main_db_migrate.py
 - Result: success (Applied migrations: none; PostgreSQL health check OK)
 
 Notes:

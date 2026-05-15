@@ -42,8 +42,9 @@ function Get-ResolutionMinutes {
 Import-DotEnv
 
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-$symbol = if ($env:SIGNAL_SYMBOL) { $env:SIGNAL_SYMBOL } else { "ETHUSD" }
-$market = if ($env:CAPITAL_DEFAULT_MARKET_SEARCH) { $env:CAPITAL_DEFAULT_MARKET_SEARCH } else { "ETHUSD" }
+$defaultInstrumentSymbol = if ($env:TRADING_PROVIDER_SYMBOL) { $env:TRADING_PROVIDER_SYMBOL } else { "XAUUSD" }
+$symbol = if ($env:SIGNAL_SYMBOL) { $env:SIGNAL_SYMBOL } else { $defaultInstrumentSymbol }
+$market = if ($env:CAPITAL_DEFAULT_MARKET_SEARCH) { $env:CAPITAL_DEFAULT_MARKET_SEARCH } else { $defaultInstrumentSymbol }
 $resolution = if ($env:SIGNAL_RESOLUTION) { $env:SIGNAL_RESOLUTION } elseif ($env:CAPITAL_DEFAULT_RESOLUTION) { $env:CAPITAL_DEFAULT_RESOLUTION } else { "MINUTE_5" }
 $streamResolution = if ($env:LIVE_PRICE_RESOLUTION) { $env:LIVE_PRICE_RESOLUTION } else { $resolution }
 $autoFinetuneResolution = if ($env:AUTO_FINETUNE_RESOLUTION) { $env:AUTO_FINETUNE_RESOLUTION } else { "MINUTE_5" }
@@ -389,6 +390,16 @@ function Get-LocalHostNames {
     return @($hosts | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
 }
 
+function Test-DashboardApiHealthy {
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/api/status?symbol=XAUUSD&resolution=MINUTE_5" -TimeoutSec 3
+        return ($null -ne $response -and $response.StatusCode -eq 200)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Invoke-SupervisorLeaseAcquire {
     param(
         [string]$InstanceId,
@@ -419,7 +430,7 @@ function Invoke-SupervisorLeaseAcquire {
         Write-Host $leaseText
     }
     if ($leaseExitCode -eq 0) {
-        return
+        return $true
     }
 
     $leasePayload = $null
@@ -474,10 +485,17 @@ function Invoke-SupervisorLeaseAcquire {
                     Write-Host $retryText
                 }
                 if ($retryExitCode -eq 0) {
-                    return
+                    return $true
                 }
             }
             throw "Failed to reacquire supervisor lease after releasing stale local lease."
+        }
+
+        if ($isLocalLease -and $null -ne $existingProcess) {
+            $healthText = if (Test-DashboardApiHealthy) { "healthy dashboard API" } else { "active local supervisor process" }
+            Write-Host "Detected $healthText under an existing local lease. Skipping duplicate start."
+            $global:LASTEXITCODE = 0
+            return $false
         }
 
         $details = @()
@@ -722,7 +740,10 @@ try {
     Invoke-DatabaseMigrations
 
     Write-Host "Acquiring supervisor lease"
-    Invoke-SupervisorLeaseAcquire -InstanceId $supervisorInstanceId -ProcessId $PID -TtlSeconds $supervisorLeaseTtlSeconds -AllowDuplicate (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)
+    $leaseAcquired = Invoke-SupervisorLeaseAcquire -InstanceId $supervisorInstanceId -ProcessId $PID -TtlSeconds $supervisorLeaseTtlSeconds -AllowDuplicate (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)
+    if ($leaseAcquired -eq $false) {
+        return
+    }
 
     if (Test-FlagEnabled -Value $historicalBackfillEnabled -Default $true) {
         Write-Host "Backfilling and gap-filling $historicalBackfillDays day(s) of 5-minute Capital.com candles"

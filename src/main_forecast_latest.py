@@ -13,7 +13,7 @@ import pandas as pd
 
 from candle_context import resolution_to_timedelta
 from capital_rest_client import CapitalRestClient
-from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
+from config import configure_logging, load_instrument_settings, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
 from data_quality import analyze_ohlcv_quality, grade_meets_minimum, persist_prediction_run_quality
 from db import connect
 from logging_utils import log_event, new_correlation_id, output_tail, safe_command_for_log
@@ -40,10 +40,11 @@ SIGNAL_VALIDATION_LINE_RE = re.compile(
 
 
 def parse_args() -> argparse.Namespace:
+    instrument = load_instrument_settings()
     parser = argparse.ArgumentParser(description="Fetch latest Capital.com candles and generate a current/future Kronos forecast.")
-    parser.add_argument("--market", default="ETHUSD")
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", instrument.provider_symbol))
     parser.add_argument("--epic", default=None)
-    parser.add_argument("--resolution", default="MINUTE_5")
+    parser.add_argument("--resolution", default=os.getenv("SIGNAL_RESOLUTION", instrument.candle_interval))
     parser.add_argument("--max", type=int, default=512, dest="max_points")
     parser.add_argument("--lookback", type=int, default=512)
     parser.add_argument("--pred-len", type=int, default=12)
@@ -69,6 +70,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--symbol", default=None, help="Configured dashboard/signal symbol. Defaults to market.")
     parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN. Defaults to POSTGRES_DSN.")
     parser.add_argument("--disable-shadow-model", action="store_true", help="Skip candidate-model shadow prediction.")
+    parser.add_argument("--skip-ai-model-stack", action="store_true", help="Skip the optional multi-model AI forecast stack even when AI_MODELS_ENABLED=true.")
     return parser.parse_args()
 
 
@@ -215,6 +217,206 @@ def _run_shadow_prediction(
         active_run_id=active_run_id,
     )
     return True
+
+
+def _run_optional_ai_model_stack(
+    *,
+    dsn: str | None,
+    prediction_request_id: str,
+    epic: str,
+    symbol: str,
+    resolution: str,
+    context_bars: int,
+    horizon_bars: int,
+    kronos_forecast_csv: Path | None = None,
+    kronos_model_version: str | None = None,
+) -> dict[str, object]:
+    try:
+        from gold_analyzer.app import create_pipeline, load_default_models
+        from gold_analyzer.config import load_models_config
+        from gold_analyzer.models.base import ForecastModel, ForecastPoint, ForecastRequest, ForecastResult
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "forecast_latest.ai_model_stack.unavailable",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            error=str(exc),
+        )
+        return {"status": "unavailable", "error": str(exc)}
+
+    models_config = load_models_config()
+    if not models_config.enabled:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.ai_model_stack.skipped",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            reason="disabled",
+            config_path=str(models_config.path) if models_config.path else None,
+        )
+        return {"status": "skipped", "reason": "disabled"}
+
+    models = load_default_models(models_config)
+    if kronos_forecast_csv is not None:
+        models = [
+            _PersistedKronosForecastAdapter(
+                forecast_csv=kronos_forecast_csv,
+                model_version=kronos_model_version or "kronos-live",
+                forecast_model_cls=ForecastModel,
+                forecast_point_cls=ForecastPoint,
+                forecast_request_cls=ForecastRequest,
+                forecast_result_cls=ForecastResult,
+            )
+            if model.model_key == "kronos"
+            else model
+            for model in models
+        ]
+    if not models:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "forecast_latest.ai_model_stack.skipped",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            reason="no_enabled_models",
+            config_path=str(models_config.path) if models_config.path else None,
+        )
+        return {"status": "skipped", "reason": "no_enabled_models"}
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.ai_model_stack.start",
+        prediction_request_id=prediction_request_id,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        context_bars=context_bars,
+        horizon_bars=horizon_bars,
+        models=[model.model_key for model in models],
+    )
+    pipeline = create_pipeline(dsn=dsn, models=models, models_config=models_config, persist=True)
+    result = pipeline.run_cycle(epic=epic, timeframe=resolution, context_bars=context_bars, horizon_bars=horizon_bars)
+    model_statuses = [
+        {"model_key": row.model_key, "status": row.status, "error_message": row.error_message}
+        for row in result.model_results
+    ]
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.ai_model_stack.completed",
+        prediction_request_id=prediction_request_id,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        quality_ok=result.quality.ok,
+        model_statuses=model_statuses,
+        ensemble_points=len(result.ensemble),
+        decision=(result.decision or {}).get("decision") if result.decision else None,
+    )
+    return {
+        "status": "completed",
+        "quality_ok": result.quality.ok,
+        "model_statuses": model_statuses,
+        "ensemble_points": len(result.ensemble),
+    }
+
+
+def _direction_from_return(value: float | None, flat_threshold: float = 0.0) -> str:
+    if value is None:
+        return "UNKNOWN"
+    if value > flat_threshold:
+        return "UP"
+    if value < -flat_threshold:
+        return "DOWN"
+    return "FLAT"
+
+
+def _PersistedKronosForecastAdapter(
+    *,
+    forecast_csv: Path,
+    model_version: str,
+    forecast_model_cls,
+    forecast_point_cls,
+    forecast_request_cls,
+    forecast_result_cls,
+):
+    class PersistedKronosForecastAdapter(forecast_model_cls):
+        model_key = "kronos"
+
+        def __init__(self) -> None:
+            self.model_version = model_version
+
+        def predict(self, request) -> object:
+            started = time.perf_counter()
+            try:
+                forecast = pd.read_csv(forecast_csv)
+                if forecast.empty:
+                    return forecast_result_cls.skipped(
+                        model_key=self.model_key,
+                        model_version=self.model_version,
+                        epic=request.epic,
+                        timeframe=request.timeframe,
+                        reason=f"Persisted Kronos forecast CSV is empty: {forecast_csv}",
+                    )
+                forecast["timestamps"] = pd.to_datetime(forecast["timestamps"], utc=True)
+                forecast["close"] = pd.to_numeric(forecast["close"], errors="coerce")
+                forecast = forecast.dropna(subset=["timestamps", "close"]).head(int(request.horizon_bars))
+                if forecast.empty:
+                    return forecast_result_cls.skipped(
+                        model_key=self.model_key,
+                        model_version=self.model_version,
+                        epic=request.epic,
+                        timeframe=request.timeframe,
+                        reason=f"Persisted Kronos forecast CSV has no valid forecast rows: {forecast_csv}",
+                    )
+                last_close = float(pd.to_numeric(request.candles["close"], errors="coerce").dropna().iloc[-1])
+                points = []
+                for index, row in enumerate(forecast.itertuples(index=False), start=1):
+                    predicted_close = float(row.close)
+                    predicted_return = None if last_close == 0 else (predicted_close / last_close) - 1.0
+                    points.append(
+                        forecast_point_cls(
+                            forecast_for_ts=getattr(row, "timestamps"),
+                            horizon_bar=index,
+                            predicted_close=predicted_close,
+                            predicted_return=predicted_return,
+                            predicted_direction=_direction_from_return(predicted_return),
+                            confidence=None,
+                            raw={"source": "persisted_kronos_subprocess", "forecast_csv": str(forecast_csv)},
+                        )
+                    )
+                return forecast_result_cls(
+                    model_key=self.model_key,
+                    model_version=self.model_version,
+                    epic=request.epic,
+                    timeframe=request.timeframe,
+                    status="OK",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    points=points,
+                    raw={"source": "persisted_kronos_subprocess", "forecast_csv": str(forecast_csv)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                return forecast_result_cls.failed(
+                    model_key=self.model_key,
+                    model_version=self.model_version,
+                    epic=request.epic,
+                    timeframe=request.timeframe,
+                    error=str(exc),
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    raw={"source": "persisted_kronos_subprocess", "forecast_csv": str(forecast_csv)},
+                )
+
+    return PersistedKronosForecastAdapter()
 
 
 def _extract_signal_validation_summary(output_text: str) -> dict[str, object] | None:
@@ -641,6 +843,8 @@ def main() -> None:
             str(args.lookback),
             "--pred-len",
             str(args.pred_len),
+            "--symbol",
+            symbol,
             "--epic",
             epic,
             "--market-name",
@@ -823,6 +1027,47 @@ def main() -> None:
                 error=str(exc),
             )
 
+        ai_model_stack_summary: dict[str, object] | None = None
+        if args.skip_ai_model_stack:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.ai_model_stack.skipped",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                reason="cli_skip",
+            )
+            ai_model_stack_summary = {"status": "skipped", "reason": "cli_skip"}
+        else:
+            try:
+                ai_model_stack_summary = _run_optional_ai_model_stack(
+                    dsn=args.postgres_dsn,
+                    prediction_request_id=prediction_request_id,
+                    epic=epic,
+                    symbol=symbol,
+                    resolution=resolution,
+                    context_bars=args.lookback,
+                    horizon_bars=args.pred_len,
+                    kronos_forecast_csv=Path(str(metadata["forecast_csv_path"])),
+                    kronos_model_version=str(metadata.get("model_name") or "kronos-live"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                ai_model_stack_summary = {"status": "failed", "error": str(exc)}
+                print(f"WARNING: optional AI model stack could not be recorded: {exc}")
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "forecast_latest.ai_model_stack.failed",
+                    prediction_request_id=prediction_request_id,
+                    symbol=symbol,
+                    epic=epic,
+                    resolution=resolution,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
+
         shadow_model = None if args.disable_shadow_model else _shadow_candidate_model(settings.output_dir)
         if shadow_model is not None and _shadow_model_enabled():
             try:
@@ -885,6 +1130,7 @@ def main() -> None:
             validation_final_signal=(signal_validation_summary or {}).get("final_signal"),
             validation_total_score=(signal_validation_summary or {}).get("total_score"),
             validation_blocked=(signal_validation_summary or {}).get("blocked"),
+            ai_model_stack_status=(ai_model_stack_summary or {}).get("status"),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
 

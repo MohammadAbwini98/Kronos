@@ -14,7 +14,7 @@ from urllib.parse import quote, urlencode
 import requests
 from psycopg.errors import UniqueViolation
 
-from config import DEMO_BASE_URL, ConfigError, TradeExecutionSettings, load_trade_execution_settings
+from config import DEFAULT_INSTRUMENT_SYMBOL, DEMO_BASE_URL, ConfigError, TradeExecutionSettings, load_trade_execution_settings
 from db import connect
 from logging_utils import log_event, safe_log_dict
 
@@ -567,7 +567,7 @@ class TradeExecutionRepository:
             ).fetchone()
         return self._candidate_from_row(dict(row)) if row else None
 
-    def latest_candidate(self, *, symbol: str = "ETHUSD", resolution: str | None = None) -> ExecutionCandidate | None:
+    def latest_candidate(self, *, symbol: str = DEFAULT_INSTRUMENT_SYMBOL, resolution: str | None = None) -> ExecutionCandidate | None:
         params: list[Any] = [symbol]
         where = ["s.symbol = %s"]
         if resolution:
@@ -1188,8 +1188,8 @@ class TradeExecutionRepository:
             signal_id=str(row.get("signal_id") or row.get("run_id")),
             run_id=row.get("run_id"),
             source_model=str(row.get("model_name") or "Kronos"),
-            symbol=str(row.get("symbol") or "ETHUSD"),
-            epic=str(configured_epic or "ETHUSD"),
+            symbol=str(row.get("symbol") or DEFAULT_INSTRUMENT_SYMBOL),
+            epic=str(configured_epic or DEFAULT_INSTRUMENT_SYMBOL),
             timeframe=str(row.get("resolution") or ""),
             direction=str(direction or "NO_TRADE").upper(),
             recommended_entry=_to_decimal(row.get("entry_price")),
@@ -1206,8 +1206,9 @@ class SymbolEpicMapper:
         self.settings = settings
 
     def resolve(self, symbol: str, current_epic: str | None = None) -> str:
-        if symbol.strip().upper() in {"ETH", "ETHUSD", "ETH/USD"}:
-            return self.settings.capital_eth_epic
+        configured = self.settings.provider_epic
+        if symbol.strip().upper() in {configured.upper(), configured.replace("/", "").upper()}:
+            return configured
         return current_epic or symbol
 
 
@@ -2702,7 +2703,7 @@ def enqueue_signal_for_execution(
 
 def enqueue_latest_signal_for_execution(
     *,
-    symbol: str = "ETHUSD",
+    symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
     resolution: str | None = None,
     dsn: str | None = None,
     requested_by: str = "auto",

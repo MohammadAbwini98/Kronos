@@ -69,6 +69,7 @@ class WebSocketGateTests(unittest.TestCase):
         responses = [
             [{"updated_at": now - pd.Timedelta(seconds=200), "timestamp_utc": now - pd.Timedelta(seconds=199), "source": "websocket_quote"}],
             [{"timestamp_utc": now - pd.Timedelta(minutes=5), "updated_at": now - pd.Timedelta(seconds=200)}],
+            [{"event_timestamp_utc": now - pd.Timedelta(minutes=5), "created_at": now - pd.Timedelta(seconds=200), "event_type": "ohlc.event"}],
             [{"status": "OK", "updated_at": now - pd.Timedelta(seconds=5)}],
         ]
         with contextlib.ExitStack() as _stack:
@@ -89,6 +90,7 @@ class WebSocketGateTests(unittest.TestCase):
         responses = [
             [{"updated_at": now - pd.Timedelta(seconds=3), "timestamp_utc": now - pd.Timedelta(seconds=2), "source": "websocket_quote"}],
             [{"timestamp_utc": latest_candle, "updated_at": now - pd.Timedelta(seconds=3)}],
+            [{"event_timestamp_utc": latest_candle, "created_at": now - pd.Timedelta(seconds=3), "event_type": "ohlc.event"}],
             [{"status": "OK", "updated_at": now - pd.Timedelta(seconds=2)}],
         ]
         with contextlib.ExitStack() as _stack:
@@ -98,6 +100,25 @@ class WebSocketGateTests(unittest.TestCase):
 
         self.assertFalse(gate.allow)
         self.assertEqual("no_new_websocket_candle", gate.reason)
+
+    def test_gate_passes_with_raw_websocket_event_when_candle_source_was_overwritten(self):
+        args = _args()
+        now = pd.Timestamp("2026-05-02T12:00:00+00:00")
+        latest_candle = pd.Timestamp("2026-05-02T11:55:00+00:00")
+        responses = [
+            [{"updated_at": now - pd.Timedelta(seconds=3), "timestamp_utc": now - pd.Timedelta(seconds=2), "source": "websocket_quote"}],
+            [],
+            [{"event_timestamp_utc": latest_candle, "created_at": now - pd.Timedelta(seconds=3), "event_type": "ohlc.event"}],
+            [{"status": "OK", "updated_at": now - pd.Timedelta(seconds=2)}],
+        ]
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("main_prediction_scheduler.connect", return_value=_FakeConnection(responses)))
+            _stack.enter_context(patch("main_prediction_scheduler.pd.Timestamp.now", return_value=now))
+            gate = main_prediction_scheduler._websocket_prediction_gate(args)
+
+        self.assertTrue(gate.allow)
+        self.assertEqual("ok", gate.reason)
+        self.assertEqual(latest_candle.isoformat(), gate.latest_candle_timestamp_utc)
 
 
 class SchedulerCycleGateTests(unittest.TestCase):

@@ -140,6 +140,88 @@ class HardBlockerTests(unittest.TestCase):
         self.assertFalse(blockers["blocked"])
         self.assertNotIn("VERY_LOW_VOLUME", blockers["reason_codes"])
 
+    def test_blocks_when_15m_and_30m_strongly_oppose_5m_candidate(self):
+        blockers = evaluate_hard_blockers(
+            normalized_forecast={
+                "candidate_signal": "LONG",
+                "forecast_direction": "UP",
+                "net_edge_pct": 0.2,
+            },
+            primary_input_validation={"ok": True, "cadence_ok": True},
+            context_fetch_status={"ok": True, "missing_timeframes": []},
+            timeframe_validations=[
+                {
+                    "timeframe": "MINUTE_15",
+                    "trend": "BEARISH",
+                    "alignment_state": "CONFLICTS",
+                    "indicator_snapshot": {"trend_strength": 24.0},
+                },
+                {
+                    "timeframe": "MINUTE_30",
+                    "trend": "BEARISH",
+                    "alignment_state": "CONFLICTS",
+                    "indicator_snapshot": {"trend_strength": 27.0},
+                },
+                {
+                    "timeframe": "HOUR",
+                    "trend": "BULLISH",
+                    "alignment_state": "CONFIRMS",
+                    "indicator_snapshot": {"trend_strength": 22.0},
+                },
+            ],
+            config=self._cfg(),
+            market_context={"spread_pct": 0.01, "volume_zscore": 0.0, "atr_percentile": 50.0},
+            database_available=True,
+        )
+
+        self.assertTrue(blockers["blocked"])
+        self.assertIn("DIRECTION_REGIME_TIMEFRAME_CONFLICT", blockers["reason_codes"])
+        self.assertTrue(any("15m direction confirmation" in item for item in blockers["reason_details"]))
+
+    def test_does_not_block_when_only_15m_opposes_candidate(self):
+        blockers = evaluate_hard_blockers(
+            normalized_forecast={
+                "candidate_signal": "SHORT",
+                "forecast_direction": "DOWN",
+                "net_edge_pct": 0.2,
+            },
+            primary_input_validation={"ok": True, "cadence_ok": True},
+            context_fetch_status={"ok": True, "missing_timeframes": []},
+            timeframe_validations=[
+                {
+                    "timeframe": "MINUTE_15",
+                    "trend": "BULLISH",
+                    "alignment_state": "CONFLICTS",
+                    "indicator_snapshot": {"trend_strength": 30.0},
+                },
+                {
+                    "timeframe": "MINUTE_30",
+                    "trend": "NEUTRAL",
+                    "alignment_state": "NEUTRAL",
+                    "indicator_snapshot": {"trend_strength": 12.0},
+                },
+            ],
+            config=self._cfg(),
+            market_context={"spread_pct": 0.01, "volume_zscore": 0.0, "atr_percentile": 50.0},
+            database_available=True,
+        )
+
+        self.assertFalse(blockers["blocked"])
+        self.assertNotIn("DIRECTION_REGIME_TIMEFRAME_CONFLICT", blockers["reason_codes"])
+
+    def test_signal_config_parses_multi_timeframe_aliases(self):
+        cfg = load_signal_config(
+            environ={
+                "SIGNAL_VALIDATION_TIMEFRAMES": "1m,15m,30m,1h",
+                "SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT": "false",
+                "SIGNAL_STRONG_DISAGREEMENT_TREND_STRENGTH": "30",
+            }
+        )
+
+        self.assertEqual(("MINUTE", "MINUTE_15", "MINUTE_30", "HOUR"), cfg.signal_validation_timeframes)
+        self.assertFalse(cfg.signal_block_on_direction_regime_conflict)
+        self.assertEqual(30.0, cfg.signal_strong_disagreement_trend_strength)
+
 
 class CandleValidatorTests(unittest.TestCase):
     def test_rejects_duplicate_timestamps(self):
@@ -284,6 +366,31 @@ class HigherTimeframeTrendTests(unittest.TestCase):
             )
         self.assertEqual("NEUTRAL", result["trend"])
 
+    def test_minute_timeframe_is_entry_confirmation_only(self):
+        rows = 90
+        frame = pd.DataFrame(
+            {
+                "timestamps": pd.date_range("2026-01-01", periods=rows, freq="1min", tz="UTC"),
+                "open": [100 + (index * 0.02) for index in range(rows)],
+                "high": [100.4 + (index * 0.02) for index in range(rows)],
+                "low": [99.6 + (index * 0.02) for index in range(rows)],
+                "close": [100 + (index * 0.02) for index in range(rows)],
+                "volume": [120 + index for index in range(rows)],
+                "amount": [0.0] * rows,
+            }
+        )
+        with patch("higher_timeframe_validator.load_recent_candles", return_value=frame):
+            result = validate_single_timeframe(
+                symbol="ETHUSD",
+                timeframe="MINUTE",
+                candidate_signal="LONG",
+                now_utc=pd.Timestamp("2026-01-01T02:00:00Z"),
+            )
+
+        self.assertEqual("entry_confirmation", result["timeframe_role"])
+        self.assertFalse(result["direction_authority"])
+        self.assertEqual(0.0, result["trend_score"])
+
 
 class SignalScoringTests(unittest.TestCase):
     def _cfg(self) -> SignalConfig:
@@ -373,6 +480,38 @@ class SignalScoringTests(unittest.TestCase):
         )
         self.assertLess(result["component_scores"]["cost_liquidity"], 10.0)
         self.assertTrue(any("Very low volume context reduced" in item for item in result["reason_details"]))
+
+    def test_one_minute_confirmation_cannot_create_actionable_direction_alone(self):
+        cfg = self._cfg()
+        result = score_signal(
+            normalized_forecast={
+                "candidate_signal": "LONG",
+                "net_edge_pct": 1.0,
+                "forecast_path_consistency_score": 100.0,
+                "forecast_quality_score": 100.0,
+            },
+            timeframe_validations=[
+                {
+                    "timeframe": "MINUTE",
+                    "trend": "BULLISH",
+                    "alignment_state": "CONFIRMS",
+                    "confirms_candidate": True,
+                    "trend_score": 0,
+                    "momentum_score": 2,
+                    "volume_score": 2,
+                    "volatility_score": 1,
+                    "support_resistance_score": 1,
+                }
+            ],
+            blockers={"blocked": False},
+            config=cfg,
+            market_context={"spread_pct": 0.01},
+        )
+
+        self.assertEqual("HOLD", result["final_signal"])
+        self.assertEqual(0.0, result["component_scores"]["higher_timeframe_alignment"])
+        self.assertLessEqual(result["component_scores"]["momentum"], 2.0)
+        self.assertTrue(any("1m entry confirmation added" in item for item in result["reason_details"]))
 
 
 class MigrationIdempotenceTests(unittest.TestCase):

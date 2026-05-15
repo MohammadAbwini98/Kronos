@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
+
 from psycopg.types.json import Jsonb
 
 from db import connect
@@ -123,8 +125,8 @@ def save_signal_validation_run(validation: dict, dsn: str | None = None) -> dict
                 """,
                 {
                     "run_id": run_id,
-                    "symbol": str(payload.get("symbol") or "ETHUSD"),
-                    "epic": str(payload.get("epic") or payload.get("symbol") or "ETHUSD"),
+                    "symbol": str(payload.get("symbol") or DEFAULT_INSTRUMENT_SYMBOL),
+                    "epic": str(payload.get("epic") or payload.get("symbol") or DEFAULT_INSTRUMENT_SYMBOL),
                     "base_resolution": str(payload.get("base_resolution") or payload.get("resolution") or "MINUTE_5"),
                     "candidate_signal": str(payload.get("candidate_signal") or "HOLD"),
                     "final_signal": str(payload.get("final_signal") or "VALIDATION_UNAVAILABLE"),
@@ -231,7 +233,7 @@ def save_timeframe_validations(run_id: str, validations: list[dict], dsn: str | 
         return {"ok": False, "error": "save_failed", "reason": str(exc)}
 
 
-def load_latest_signal_validation(symbol: str = "ETHUSD", dsn: str | None = None) -> dict:
+def load_latest_signal_validation(symbol: str = DEFAULT_INSTRUMENT_SYMBOL, dsn: str | None = None) -> dict:
     try:
         with connect(dsn) as conn:
             row = conn.execute(
@@ -272,7 +274,7 @@ def load_latest_signal_validation(symbol: str = "ETHUSD", dsn: str | None = None
         return {"ok": False, "error": "query_failed", "reason": str(exc)}
 
 
-def load_signal_validation_history(symbol: str = "ETHUSD", limit: int = 50, dsn: str | None = None) -> list[dict]:
+def load_signal_validation_history(symbol: str = DEFAULT_INSTRUMENT_SYMBOL, limit: int = 50, dsn: str | None = None) -> list[dict]:
     try:
         with connect(dsn) as conn:
             rows = conn.execute(

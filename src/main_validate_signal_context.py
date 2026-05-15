@@ -10,7 +10,7 @@ from typing import Any
 import pandas as pd
 
 from candle_context import load_recent_candles, resolution_to_timedelta, validate_candle_frame
-from config import configure_logging
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging
 from db import connect
 from forecast_normalizer import normalize_forecast
 from higher_timeframe_fetcher import ensure_higher_timeframe_candles
@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate and score external higher-timeframe context for a prediction run.")
     parser.add_argument("--run-id", default=None, help="Prediction run id.")
     parser.add_argument("--latest", action="store_true", help="Use latest prediction run for symbol/resolution.")
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=os.getenv("SIGNAL_RESOLUTION", "MINUTE_5"))
     parser.add_argument("--price-side", default=os.getenv("CAPITAL_DEFAULT_PRICE_SIDE", "mid"))
     parser.add_argument("--postgres-dsn", default=None)
@@ -141,7 +141,7 @@ def _load_input_frame(run: dict[str, Any], dsn: str | None, lookback: int) -> pd
             return df.tail(max(1, int(lookback))).reset_index(drop=True)
 
     return load_recent_candles(
-        symbol=str(run.get("symbol") or "ETHUSD"),
+        symbol=str(run.get("symbol") or DEFAULT_INSTRUMENT_SYMBOL),
         resolution=str(run.get("resolution") or "MINUTE_5"),
         price_side=str(run.get("price_side") or "mid"),
         limit=max(1, int(lookback)),
@@ -267,7 +267,7 @@ def validate_signal_context_for_run(
     *,
     run_id: str | None = None,
     latest: bool = False,
-    symbol: str = "ETHUSD",
+    symbol: str = DEFAULT_INSTRUMENT_SYMBOL,
     resolution: str = "MINUTE_5",
     price_side: str = "mid",
     dsn: str | None = None,
@@ -440,6 +440,8 @@ def validate_signal_context_for_run(
         "estimated_cost_pct": normalized.get("estimated_cost_pct"),
         "timeframes": {
             item["timeframe"]: {
+                "role": item.get("timeframe_role"),
+                "role_label": item.get("timeframe_role_label"),
                 "trend": item.get("trend"),
                 "confirms_candidate": item.get("confirms_candidate"),
                 "total_timeframe_score": item.get("total_timeframe_score"),

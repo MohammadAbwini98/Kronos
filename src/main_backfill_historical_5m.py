@@ -10,7 +10,7 @@ import time
 import pandas as pd
 
 from capital_rest_client import CapitalRestClient
-from config import configure_logging, load_settings, validate_price_side, validate_resolution
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging, load_settings, validate_price_side, validate_resolution
 from historical_backfill import ensure_historical_candles
 from logging_utils import log_event, new_correlation_id
 
@@ -20,9 +20,9 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backfill and gap-fill Capital.com 5-minute candles into PostgreSQL.")
-    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", "ETHUSD"))
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--epic", default=os.getenv("CAPITAL_DEFAULT_EPIC") or None)
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=os.getenv("HISTORICAL_BACKFILL_RESOLUTION", "MINUTE_5"))
     parser.add_argument("--price-side", default=os.getenv("CAPITAL_DEFAULT_PRICE_SIDE", "mid"), choices=["bid", "ask", "mid"])
     parser.add_argument("--days", type=int, default=int(os.getenv("HISTORICAL_BACKFILL_DAYS", "35")))

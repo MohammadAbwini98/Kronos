@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import configure_logging
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging
 from db import connect
 from logging_utils import log_event, new_correlation_id, output_tail
 from prediction_store import refresh_shadow_prediction_statuses
@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Validate completed prediction runs against actual Capital.com candles.")
     parser.add_argument("--env", default=os.getenv("CAPITAL_ENV", "demo"), choices=["demo", "live"])
     parser.add_argument("--postgres-dsn", default=None)
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--all-symbols", action="store_true", help="Validate pending runs for all symbols instead of the configured symbol.")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--batch-size", type=int, default=int(os.getenv("VALIDATION_BATCH_SIZE", "5")))

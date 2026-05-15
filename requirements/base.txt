@@ -1,0 +1,16 @@
+# Lightweight app/runtime dependencies.
+# Keep heavy ML and foundation-model packages out of this file.
+pandas>=2.2.0
+numpy>=1.26.0
+PyYAML>=6.0
+SQLAlchemy>=2.0
+scipy>=1.10
+requests>=2.32.0
+python-dotenv>=1.0.0
+pydantic>=2.7.0
+tenacity>=8.2.0
+orjson>=3.10.0
+rich>=13.7.0
+websockets>=12.0
+psycopg[binary]>=3.2.0
+psycopg2-binary>=2.9

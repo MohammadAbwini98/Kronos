@@ -55,6 +55,7 @@ class DashboardUiContractTests(unittest.TestCase):
             "overview",
             "validation",
             "modelPerformance",
+            "aiStack",
             "risk",
             "trades",
             "baselines",
@@ -97,10 +98,41 @@ class DashboardUiContractTests(unittest.TestCase):
         self.assertIn("fetch(`/api/status?${currentStatusQuery()}`", html)
         self.assertIn("fetch(`/api/model-performance?${currentStatusQuery()}`", html)
         self.assertIn("fetch(`/api/signals?${getSignalQuery(page)}`", html)
+        self.assertIn("fetchAiEndpoint('/api/forecasts'", html)
+        self.assertIn("fetchAiEndpoint('/api/ensemble'", html)
+        self.assertIn("fetchAiEndpoint('/api/regime'", html)
+        self.assertIn("fetchAiEndpoint('/api/scorer'", html)
+        self.assertIn("fetchAiEndpoint('/api/forecast-validation'", html)
         self.assertIn("postJson('/api/predict'", html)
         self.assertIn("postJson('/api/fetch-actual'", html)
         self.assertIn("postJson('/api/validate-actual'", html)
         self.assertIn("postJson('/api/baselines'", html)
+
+    def test_ai_stack_tab_covers_forecast_plan_panels(self):
+        html = dashboard_ui.dashboard_html()
+
+        for expected in (
+            "AI Forecast Stack",
+            "Current Price + Spread",
+            "Active Regime",
+            "Ensemble Direction",
+            "Model Votes",
+            "Kronos Forecast",
+            "Chronos-2 Forecast",
+            "TimesFM Forecast",
+            "Moirai Uncertainty Band",
+            "PatchTST Local Forecast",
+            "iTransformer Local Forecast",
+            "GARCH Volatility Risk",
+            "Final LightGBM / CatBoost Probability",
+            "Final Decision",
+            "Model Performance Table",
+            "Recent Forecast Validation",
+            "Recent Trade Outcomes",
+            "currentAiQuery",
+            "tf",
+        ):
+            self.assertIn(expected, html)
 
     def test_baselines_button_id_is_unique_and_not_shared_with_panel(self):
         html = dashboard_ui.dashboard_html()
@@ -113,7 +145,7 @@ class DashboardUiContractTests(unittest.TestCase):
         html = dashboard_ui.dashboard_html()
 
         self.assertIn("function actionContextPayload(extra = {})", html)
-        self.assertIn("symbol: $('market').value || 'ETHUSD'", html)
+        self.assertIn("symbol: $('market').value || 'XAUUSD'", html)
         self.assertIn("resolution: $('resolution').value || 'MINUTE_5'", html)
         self.assertIn("postJson('/api/fetch-actual', actionContextPayload()", html)
         self.assertIn("postJson('/api/validate-actual', actionContextPayload({ scoring_version: 'v1' })", html)

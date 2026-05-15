@@ -17,7 +17,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 
-from config import configure_logging
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging, load_instrument_settings
 from dashboard_db import postgres_dashboard_snapshot, query_signals
 from dashboard_ui import dashboard_html
 from dataset_snapshots import create_dataset_snapshot
@@ -38,9 +38,13 @@ from walk_forward import create_walk_forward_experiment, get_walk_forward_experi
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 OUTPUT_DIR = ROOT / "output"
 SUPPORTED_RESOLUTIONS = {"MINUTE", "MINUTE_5", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4", "DAY", "WEEK"}
 LOGGER = logging.getLogger(__name__)
+INSTRUMENT = load_instrument_settings()
+DEFAULT_SYMBOL = os.getenv("SIGNAL_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL).strip() or DEFAULT_INSTRUMENT_SYMBOL
 _TRANSACTION_HISTORY_CACHE = {"expires_at": 0.0, "transactions": [], "error": None}
 _TRANSACTION_HISTORY_CACHE_LOCK = threading.Lock()
 _TRADE_ACTIVITY_CACHE = {"expires_at": 0.0, "activities": [], "error": None}
@@ -93,7 +97,7 @@ def _coerce_symbol_resolution(
     symbol: str | None,
     resolution: str | None,
     *,
-    default_symbol: str = "ETHUSD",
+    default_symbol: str = DEFAULT_SYMBOL,
     default_resolution: str = "MINUTE_5",
 ) -> tuple[str, str]:
     symbol_value = str(symbol or default_symbol).strip().upper()
@@ -109,7 +113,7 @@ def _action_context(payload: dict) -> tuple[str, str]:
     return _coerce_symbol_resolution(
         payload.get("symbol") or payload.get("market"),
         payload.get("resolution"),
-        default_symbol="ETHUSD",
+        default_symbol=DEFAULT_SYMBOL,
         default_resolution="MINUTE_5",
     )
 
@@ -125,18 +129,18 @@ def _metadata_matches_context(metadata: dict, symbol: str | None, resolution: st
 
 
 def _latest_metadata(symbol: str | None = None, resolution: str | None = None) -> tuple[Path | None, dict]:
-    symbol_part = _safe_file_fragment(symbol) if symbol else "ETHUSD"
+    symbol_part = _safe_file_fragment(symbol) if symbol else DEFAULT_SYMBOL
     resolution_part = _safe_file_fragment(resolution) if resolution else "*"
     preferred = f"forecast_metadata_{symbol_part}_{resolution_part}_*.json"
     fallback_symbol = f"forecast_metadata_{symbol_part}_*.json"
-    path = _latest_file(preferred) or _latest_file(fallback_symbol) or _latest_file("forecast_metadata_ETHUSD_*.json") or _latest_file("forecast_metadata_*.json")
+    path = _latest_file(preferred) or _latest_file(fallback_symbol) or _latest_file(f"forecast_metadata_{DEFAULT_SYMBOL}_*.json") or _latest_file("forecast_metadata_*.json")
     return path, _safe_json(path)
 
 
 def _quality_report_for_metadata(metadata_path: Path | None, metadata: dict) -> tuple[Path | None, dict]:
     if metadata_path is not None:
         stamp = _metadata_stamp(metadata_path)
-        epic = _safe_file_fragment(str(metadata.get("epic") or "ETHUSD"))
+        epic = _safe_file_fragment(str(metadata.get("epic") or DEFAULT_SYMBOL))
         resolution = _safe_file_fragment(str(metadata.get("resolution") or "MINUTE_5"))
         candidate = OUTPUT_DIR / f"forecast_quality_report_{epic}_{resolution}_{stamp}.json"
         if candidate.exists():
@@ -622,7 +626,7 @@ def _broker_account_snapshot() -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def _postgres_snapshot(symbol: str = "ETHUSD", resolution: str = "MINUTE_5") -> dict:
+def _postgres_snapshot(symbol: str = DEFAULT_SYMBOL, resolution: str = "MINUTE_5") -> dict:
     try:
         return postgres_dashboard_snapshot(symbol=symbol, resolution=resolution)
     except Exception as exc:  # noqa: BLE001
@@ -860,6 +864,706 @@ def _status_warnings(postgres_snapshot: dict) -> list[str]:
     return warnings
 
 
+def _ai_limit(query: dict) -> int:
+    try:
+        return max(1, min(500, int(query.get("limit", ["100"])[0] or 100)))
+    except (TypeError, ValueError):
+        return 100
+
+
+def _query_first(query: dict, *names: str) -> str:
+    for name in names:
+        value = query.get(name, [""])
+        if value and value[0]:
+            return str(value[0])
+    return ""
+
+
+def _normalize_ai_timeframe(value: str | None) -> str | None:
+    raw = str(value or "").strip().upper().replace("-", "_").replace(" ", "")
+    if not raw:
+        return None
+    aliases = {
+        "1M": "MINUTE",
+        "M1": "MINUTE",
+        "MINUTE_1": "MINUTE",
+        "5M": "MINUTE_5",
+        "M5": "MINUTE_5",
+        "5MIN": "MINUTE_5",
+        "5MINUTE": "MINUTE_5",
+        "15M": "MINUTE_15",
+        "M15": "MINUTE_15",
+        "15MIN": "MINUTE_15",
+        "15MINUTE": "MINUTE_15",
+        "30M": "MINUTE_30",
+        "M30": "MINUTE_30",
+        "30MIN": "MINUTE_30",
+        "30MINUTE": "MINUTE_30",
+        "1H": "HOUR",
+        "H1": "HOUR",
+        "60M": "HOUR",
+        "60MIN": "HOUR",
+    }
+    return aliases.get(raw, raw)
+
+
+def _ai_context(query: dict) -> tuple[str | None, str | None, int]:
+    epic = _query_first(query, "epic", "symbol").strip().upper() or None
+    timeframe = _normalize_ai_timeframe(_query_first(query, "timeframe", "resolution", "tf"))
+    return epic, timeframe, _ai_limit(query)
+
+
+def _ai_empty_payload(exc: Exception) -> dict:
+    return {
+        "rows": [],
+        "warning": "ai_tables_unavailable",
+        "reason": str(exc),
+    }
+
+
+def _strategy_brain_limit(query: dict) -> int:
+    try:
+        return max(1, min(500, int(query.get("limit", ["50"])[0] or 50)))
+    except (TypeError, ValueError):
+        return 50
+
+
+def _normalize_strategy_brain_timeframe(value: str | None) -> str | None:
+    text = str(value or "").strip()
+    raw = text.upper().replace("-", "").replace("_", "").replace(" ", "")
+    if not raw:
+        return None
+    aliases = {
+        "1M": "1m",
+        "M1": "1m",
+        "MINUTE": "1m",
+        "MINUTE1": "1m",
+        "5M": "5m",
+        "M5": "5m",
+        "MINUTE5": "5m",
+        "15M": "15m",
+        "M15": "15m",
+        "MINUTE15": "15m",
+        "30M": "30m",
+        "M30": "30m",
+        "MINUTE30": "30m",
+        "1H": "1h",
+        "H1": "1h",
+        "HOUR": "1h",
+        "60M": "1h",
+        "60MIN": "1h",
+        "4H": "4h",
+        "H4": "4h",
+        "HOUR4": "4h",
+        "D": "1d",
+        "1D": "1d",
+        "DAY": "1d",
+    }
+    return aliases.get(raw, text.strip().lower())
+
+
+def _strategy_brain_context(query: dict) -> tuple[str | None, str | None, int]:
+    symbol = _query_first(query, "symbol", "epic").strip().upper() or None
+    timeframe = _normalize_strategy_brain_timeframe(_query_first(query, "timeframe", "resolution", "tf"))
+    return symbol, timeframe, _strategy_brain_limit(query)
+
+
+def _strategy_brain_empty_payload(exc: Exception) -> dict:
+    return {
+        "rows": [],
+        "warning": "strategy_brain_tables_unavailable",
+        "reason": str(exc),
+    }
+
+
+def _strategy_brain_latest_payload(query: dict) -> dict:
+    symbol, timeframe, _limit = _strategy_brain_context(query)
+    try:
+        from gold_analyzer.repositories import StrategyDecisionRepository
+
+        payload = StrategyDecisionRepository().list_latest(symbol=symbol, timeframe=timeframe, limit=1)
+        rows = list(payload.get("rows") or [])
+        return {
+            "row": rows[0] if rows else None,
+            "rows": rows,
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            "source": "strategy_brain_tables",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "row": None,
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            **_strategy_brain_empty_payload(exc),
+        }
+
+
+def _strategy_brain_history_payload(query: dict) -> dict:
+    symbol, timeframe, limit = _strategy_brain_context(query)
+    try:
+        from gold_analyzer.repositories import StrategyDecisionRepository
+
+        payload = StrategyDecisionRepository().list_latest(symbol=symbol, timeframe=timeframe, limit=limit)
+        return {
+            "rows": list(payload.get("rows") or []),
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            "source": "strategy_brain_tables",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            **_strategy_brain_empty_payload(exc),
+        }
+
+
+def _strategy_brain_ai_support_payload(decision_id: int) -> dict:
+    try:
+        from gold_analyzer.repositories import AISupportRepository
+
+        payload = AISupportRepository().list_for_decision(int(decision_id))
+        return {
+            "decision_id": int(decision_id),
+            "rows": list(payload.get("rows") or []),
+            "source": "strategy_brain_tables",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "decision_id": int(decision_id),
+            **_strategy_brain_empty_payload(exc),
+        }
+
+
+def _strategy_brain_performance_payload(query: dict) -> dict:
+    symbol, timeframe, limit = _strategy_brain_context(query)
+    try:
+        from gold_analyzer.repositories import StrategyPerformanceRepository
+
+        payload = StrategyPerformanceRepository().list_latest(symbol=symbol, timeframe=timeframe, limit=limit)
+        return {
+            "rows": list(payload.get("rows") or []),
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            "source": "strategy_brain_tables",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            **_strategy_brain_empty_payload(exc),
+        }
+
+
+def _strategy_brain_regime_payload(query: dict) -> dict:
+    symbol, timeframe, _limit = _strategy_brain_context(query)
+    try:
+        from gold_analyzer.repositories import StrategyDecisionRepository
+
+        payload = StrategyDecisionRepository().list_latest(symbol=symbol, timeframe=timeframe, limit=1)
+        rows = list(payload.get("rows") or [])
+        row = rows[0] if rows else None
+        regime_row = None
+        if row is not None:
+            regime_row = {
+                "decision_id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "timeframe": row.get("timeframe"),
+                "computed_at": row.get("computed_at"),
+                "regime": row.get("regime"),
+                "strategy_type": row.get("strategy_type"),
+                "signal": row.get("signal"),
+                "decision_status": row.get("decision_status"),
+                "reason": row.get("reason"),
+                "blocked_by": row.get("blocked_by") or [],
+                "indicators": row.get("indicators_json") or {},
+            }
+        return {
+            "row": regime_row,
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            "source": "strategy_brain_tables",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "row": None,
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            **_strategy_brain_empty_payload(exc),
+        }
+
+
+def _strategy_brain_risk_state_payload(query: dict) -> dict:
+    symbol, timeframe, _limit = _strategy_brain_context(query)
+    try:
+        from gold_analyzer.repositories import StrategyDecisionRepository
+
+        payload = StrategyDecisionRepository().list_latest(symbol=symbol, timeframe=timeframe, limit=1)
+        rows = list(payload.get("rows") or [])
+        row = rows[0] if rows else None
+        risk_row = None
+        if row is not None:
+            risk_json = row.get("risk_json") or {}
+            details = risk_json.get("details") if isinstance(risk_json, dict) else {}
+            approved = risk_json.get("approved") if isinstance(risk_json, dict) else None
+            if approved is None:
+                approved = str(row.get("decision_status") or "").upper() == "APPROVED"
+            risk_row = {
+                "decision_id": row.get("id"),
+                "symbol": row.get("symbol"),
+                "timeframe": row.get("timeframe"),
+                "computed_at": row.get("computed_at"),
+                "risk_state": "APPROVED" if approved else "BLOCKED",
+                "approved": bool(approved),
+                "strategy_type": row.get("strategy_type"),
+                "signal": row.get("signal"),
+                "position_size": row.get("position_size"),
+                "risk_score": row.get("risk_score"),
+                "reason": row.get("reason"),
+                "blocked_by": row.get("blocked_by") or [],
+                "risk_per_trade": details.get("risk_per_trade") if isinstance(details, dict) else None,
+                "stop_distance": details.get("stop_distance") if isinstance(details, dict) else None,
+                "stop_distance_atr": details.get("stop_distance_atr") if isinstance(details, dict) else None,
+                "exit_plan": details.get("exit_plan") if isinstance(details, dict) else None,
+                "details": risk_json,
+            }
+        return {
+            "row": risk_row,
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            "source": "strategy_brain_tables",
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "row": None,
+            "selected_symbol": symbol,
+            "selected_timeframe": timeframe,
+            **_strategy_brain_empty_payload(exc),
+        }
+
+
+def _symbol_key(value: str | None) -> str:
+    return str(value or "").strip().upper().replace("/", "").replace("-", "").replace(" ", "")
+
+
+def _dedupe_text(values: list[str | None]) -> list[str]:
+    seen: set[str] = set()
+    output: list[str] = []
+    for value in values:
+        item = str(value or "").strip().upper()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        output.append(item)
+    return output
+
+
+def _ai_epic_candidates(epic: str | None) -> list[str]:
+    provider_symbol = getattr(INSTRUMENT, "provider_symbol", DEFAULT_SYMBOL)
+    display_symbol = getattr(INSTRUMENT, "display_symbol", DEFAULT_SYMBOL)
+    candidates = [epic]
+    requested_key = _symbol_key(epic)
+    if not requested_key or requested_key in {
+        _symbol_key(DEFAULT_SYMBOL),
+        _symbol_key(display_symbol),
+    }:
+        candidates.extend([DEFAULT_SYMBOL, display_symbol, provider_symbol])
+    if requested_key and requested_key == _symbol_key(provider_symbol):
+        candidates.extend([provider_symbol, DEFAULT_SYMBOL, display_symbol])
+    return _dedupe_text(candidates)
+
+
+def _ai_rows_present(payload: dict, *keys: str) -> bool:
+    return any(bool(payload.get(key)) for key in keys)
+
+
+def _ai_fetch_with_aliases(factory, method_name: str, *, epic: str | None, timeframe: str | None, limit: int) -> dict | None:
+    repository = factory()
+    method = getattr(repository, method_name)
+    for candidate in _ai_epic_candidates(epic) or [None]:
+        payload = method(epic=candidate, timeframe=timeframe, limit=limit)
+        if _ai_rows_present(payload, "rows", "runs", "forecasts"):
+            return payload
+    return None
+
+
+def _ai_candidate_param(epic: str | None) -> list[str] | None:
+    candidates = _ai_epic_candidates(epic)
+    return candidates or None
+
+
+def _fallback_ai_forecasts(*, epic: str | None, timeframe: str | None, limit: int) -> dict:
+    candidates = _ai_candidate_param(epic)
+    with connect(None) as conn:
+        runs = conn.execute(
+            """
+            SELECT
+                r.run_id AS id,
+                r.run_id,
+                'kronos' AS model_key,
+                COALESCE(r.model_version_id, r.model_name, 'kronos') AS model_version,
+                r.epic,
+                r.symbol,
+                r.resolution AS timeframe,
+                r.input_start_timestamp_utc AS input_start_ts,
+                r.input_end_timestamp_utc AS input_end_ts,
+                COALESCE(r.forecast_rows, r.horizon, 0) AS horizon_bars,
+                COALESCE(r.run_status, 'OK') AS status,
+                NULL::integer AS latency_ms,
+                NULL::text AS error_message,
+                jsonb_build_object(
+                    'source', 'prediction_runs',
+                    'direction', r.terminal_predicted_direction,
+                    'quality_grade', r.data_quality_grade,
+                    'forecast_csv_path', r.forecast_csv_path
+                ) AS raw_json,
+                r.generated_at_utc AS created_at,
+                r.updated_at
+            FROM prediction_runs r
+            WHERE (%s::text[] IS NULL OR r.symbol = ANY(%s::text[]) OR r.epic = ANY(%s::text[]))
+              AND (%s::text IS NULL OR r.resolution = %s)
+            ORDER BY r.generated_at_utc DESC
+            LIMIT %s
+            """,
+            (candidates, candidates, candidates, timeframe, timeframe, max(1, int(limit))),
+        ).fetchall()
+        forecasts = conn.execute(
+            """
+            WITH selected_runs AS (
+                SELECT r.*
+                FROM prediction_runs r
+                WHERE (%s::text[] IS NULL OR r.symbol = ANY(%s::text[]) OR r.epic = ANY(%s::text[]))
+                  AND (%s::text IS NULL OR r.resolution = %s)
+                ORDER BY r.generated_at_utc DESC
+                LIMIT %s
+            )
+            SELECT
+                fc.id,
+                fc.run_id,
+                'kronos' AS model_key,
+                sr.epic,
+                sr.symbol,
+                sr.resolution AS timeframe,
+                fc.timestamp_utc AS forecast_for_ts,
+                fc.horizon_index AS horizon_bar,
+                fc.close::double precision AS predicted_close,
+                CASE
+                    WHEN fc.anchor_close IS NOT NULL AND fc.anchor_close <> 0
+                        THEN ((fc.close - fc.anchor_close) / fc.anchor_close)::double precision
+                    WHEN sr.last_input_close IS NOT NULL AND sr.last_input_close <> 0
+                        THEN ((fc.close - sr.last_input_close) / sr.last_input_close)::double precision
+                    ELSE NULL
+                END AS predicted_return,
+                fc.predicted_direction,
+                NULL::double precision AS lower_bound,
+                NULL::double precision AS upper_bound,
+                s.confidence::double precision AS confidence,
+                jsonb_build_object(
+                    'source', 'forecast_candles',
+                    'signal_id', s.signal_id,
+                    'run_status', sr.run_status
+                ) AS raw_json,
+                fc.created_at
+            FROM forecast_candles fc
+            JOIN selected_runs sr ON sr.run_id = fc.run_id
+            LEFT JOIN signals s ON s.run_id = sr.run_id
+            ORDER BY fc.timestamp_utc DESC, fc.created_at DESC
+            LIMIT %s
+            """,
+            (candidates, candidates, candidates, timeframe, timeframe, max(1, int(limit)), max(1, int(limit))),
+        ).fetchall()
+    return {
+        "runs": [dict(row) for row in runs],
+        "forecasts": [dict(row) for row in forecasts],
+        "source": "prediction_tables_fallback",
+    }
+
+
+def _fallback_ai_ensemble(*, epic: str | None, timeframe: str | None, limit: int) -> dict:
+    candidates = _ai_candidate_param(epic)
+    with connect(None) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                s.id,
+                r.epic,
+                r.symbol,
+                r.resolution AS timeframe,
+                COALESCE(r.forecast_end_timestamp_utc, s.timestamp_utc, s.created_at) AS forecast_for_ts,
+                COALESCE(r.forecast_rows, r.horizon, 1) AS horizon_bar,
+                CASE
+                    WHEN s.expected_move_pct IS NULL THEN NULL
+                    ELSE (s.expected_move_pct / 100.0)::double precision
+                END AS ensemble_return,
+                CASE
+                    WHEN upper(COALESCE(s.direction, r.terminal_predicted_direction, '')) IN ('LONG', 'UP') THEN 'UP'
+                    WHEN upper(COALESCE(s.direction, r.terminal_predicted_direction, '')) IN ('SHORT', 'DOWN') THEN 'DOWN'
+                    ELSE 'FLAT'
+                END AS ensemble_direction,
+                COALESCE(s.confidence, 0)::double precision AS agreement_score,
+                0.0::double precision AS dispersion_score,
+                s.confidence::double precision AS confidence,
+                jsonb_build_object(
+                    'kronos', jsonb_build_object(
+                        'direction',
+                            CASE
+                                WHEN upper(COALESCE(s.direction, r.terminal_predicted_direction, '')) IN ('LONG', 'UP') THEN 'UP'
+                                WHEN upper(COALESCE(s.direction, r.terminal_predicted_direction, '')) IN ('SHORT', 'DOWN') THEN 'DOWN'
+                                ELSE 'FLAT'
+                            END,
+                        'predicted_return',
+                            CASE
+                                WHEN s.expected_move_pct IS NULL THEN NULL
+                                ELSE (s.expected_move_pct / 100.0)::double precision
+                            END,
+                        'predicted_close', NULL,
+                        'lower_bound', NULL,
+                        'upper_bound', NULL,
+                        'confidence', s.confidence::double precision,
+                        'raw', jsonb_build_object(
+                            'source', 'signals',
+                            'run_id', s.run_id,
+                            'signal', s.signal,
+                            'validation_status', s.validation_status
+                        )
+                    )
+                ) AS model_votes_json,
+                s.created_at
+            FROM signals s
+            JOIN prediction_runs r ON r.run_id = s.run_id
+            WHERE (%s::text[] IS NULL OR s.symbol = ANY(%s::text[]) OR s.epic = ANY(%s::text[]) OR r.symbol = ANY(%s::text[]) OR r.epic = ANY(%s::text[]))
+              AND (%s::text IS NULL OR s.resolution = %s)
+            ORDER BY s.created_at DESC
+            LIMIT %s
+            """,
+            (candidates, candidates, candidates, candidates, candidates, timeframe, timeframe, max(1, int(limit))),
+        ).fetchall()
+    return {"rows": [dict(row) for row in rows], "source": "prediction_tables_fallback"}
+
+
+def _fallback_ai_regime(*, epic: str | None, timeframe: str | None, limit: int) -> dict:
+    candidates = _ai_candidate_param(epic)
+    with connect(None) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                s.id,
+                r.epic,
+                r.symbol,
+                r.resolution AS timeframe,
+                COALESCE(s.updated_at, s.created_at, r.generated_at_utc) AS computed_at,
+                CASE
+                    WHEN upper(COALESCE(s.validation_summary->>'block_reason', '')) LIKE '%%VOLATILITY%%' THEN 'RISK_OFF'
+                    WHEN upper(COALESCE(s.direction, r.terminal_predicted_direction, '')) IN ('LONG', 'UP') THEN 'TRENDING_UP'
+                    WHEN upper(COALESCE(s.direction, r.terminal_predicted_direction, '')) IN ('SHORT', 'DOWN') THEN 'TRENDING_DOWN'
+                    ELSE 'RANGE'
+                END AS regime,
+                LEAST(1.0, ABS(COALESCE(s.expected_move_pct, 0)) / 0.10)::double precision AS trend_strength,
+                NULL::double precision AS realized_volatility,
+                NULL::double precision AS garch_volatility,
+                NULL::double precision AS spread,
+                CASE
+                    WHEN r.data_quality_grade = 'A' THEN 1.0
+                    WHEN r.data_quality_grade = 'B' THEN 0.8
+                    WHEN r.data_quality_grade = 'C' THEN 0.6
+                    ELSE 0.4
+                END::double precision AS liquidity_score,
+                CASE
+                    WHEN upper(COALESCE(s.validation_summary->>'block_reason', '')) LIKE '%%EXTREME%%' THEN 'EXTREME'
+                    WHEN upper(COALESCE(s.validation_summary->>'block_reason', '')) LIKE '%%VOLATILITY%%' THEN 'HIGH'
+                    ELSE 'NORMAL'
+                END AS risk_state,
+                jsonb_build_object(
+                    'source', 'signals',
+                    'run_id', s.run_id,
+                    'signal', s.signal,
+                    'validation_status', s.validation_status,
+                    'block_reason', s.validation_summary->>'block_reason',
+                    'quality_grade', r.data_quality_grade
+                ) AS features_json
+            FROM signals s
+            JOIN prediction_runs r ON r.run_id = s.run_id
+            WHERE (%s::text[] IS NULL OR s.symbol = ANY(%s::text[]) OR s.epic = ANY(%s::text[]) OR r.symbol = ANY(%s::text[]) OR r.epic = ANY(%s::text[]))
+              AND (%s::text IS NULL OR s.resolution = %s)
+            ORDER BY s.created_at DESC
+            LIMIT %s
+            """,
+            (candidates, candidates, candidates, candidates, candidates, timeframe, timeframe, max(1, int(limit))),
+        ).fetchall()
+    return {"rows": [dict(row) for row in rows], "source": "prediction_tables_fallback"}
+
+
+def _fallback_ai_scorer(*, epic: str | None, timeframe: str | None, limit: int) -> dict:
+    candidates = _ai_candidate_param(epic)
+    with connect(None) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                s.id,
+                r.epic,
+                r.symbol,
+                s.resolution AS timeframe,
+                s.created_at AS computed_at,
+                COALESCE(s.signal, 'HOLD') AS candidate_signal,
+                s.confidence::double precision AS probability_win,
+                CASE WHEN s.confidence IS NULL THEN NULL ELSE GREATEST(0.0, 1.0 - s.confidence::double precision) END AS probability_loss,
+                CASE WHEN s.expected_move_pct IS NULL THEN NULL ELSE (s.expected_move_pct / 100.0)::double precision END AS expected_return,
+                COALESCE(s.validation_score / 100.0, s.confidence, 0)::double precision AS model_agreement,
+                COALESCE((s.validation_summary->'component_scores'->>'volatility')::double precision / 100.0, 0.0) AS risk_score,
+                'kronos_validation_fallback' AS scorer_model,
+                jsonb_build_object(
+                    'source', 'signals',
+                    'run_id', s.run_id,
+                    'validation_summary', s.validation_summary,
+                    'final_decision', jsonb_build_object(
+                        'decision', COALESCE(s.validation_summary->>'final_signal', s.validation_status, s.signal, 'HOLD'),
+                        'reason', COALESCE(s.validation_summary->>'block_reason', s.reason, '')
+                    )
+                ) AS features_json,
+                COALESCE(s.validation_summary->>'final_signal', s.validation_status, s.signal, 'HOLD') AS decision
+            FROM signals s
+            JOIN prediction_runs r ON r.run_id = s.run_id
+            WHERE (%s::text[] IS NULL OR s.symbol = ANY(%s::text[]) OR s.epic = ANY(%s::text[]) OR r.symbol = ANY(%s::text[]) OR r.epic = ANY(%s::text[]))
+              AND (%s::text IS NULL OR s.resolution = %s)
+            ORDER BY s.created_at DESC
+            LIMIT %s
+            """,
+            (candidates, candidates, candidates, candidates, candidates, timeframe, timeframe, max(1, int(limit))),
+        ).fetchall()
+    return {"rows": [dict(row) for row in rows], "source": "prediction_tables_fallback"}
+
+
+def _fallback_ai_validation(*, epic: str | None, timeframe: str | None, limit: int) -> dict:
+    candidates = _ai_candidate_param(epic)
+    with connect(None) as conn:
+        rows = conn.execute(
+            """
+            WITH validated AS (
+                SELECT
+                    r.epic,
+                    r.symbol,
+                    r.resolution AS timeframe,
+                    COALESCE(fc.horizon_index, 0) AS horizon_bar,
+                    po.validated_at_utc,
+                    ABS(po.close_error)::double precision AS abs_error,
+                    po.close_error::double precision AS error_value,
+                    CASE WHEN upper(COALESCE(po.status, po.terminal_direction_status, '')) = 'WIN' THEN 1 ELSE 0 END AS win_value,
+                    CASE WHEN upper(COALESCE(po.status, po.terminal_direction_status, '')) = 'LOSS' THEN 1 ELSE 0 END AS loss_value
+                FROM prediction_outcomes po
+                JOIN prediction_runs r ON r.run_id = po.run_id
+                LEFT JOIN forecast_candles fc ON fc.id = po.forecast_candle_id
+                WHERE (%s::text[] IS NULL OR r.symbol = ANY(%s::text[]) OR r.epic = ANY(%s::text[]))
+                  AND (%s::text IS NULL OR r.resolution = %s)
+                  AND upper(COALESCE(po.status, po.terminal_direction_status, '')) IN ('WIN', 'LOSS')
+            )
+            SELECT
+                row_number() OVER (ORDER BY max(validated_at_utc) DESC, horizon_bar) AS id,
+                'kronos' AS model_key,
+                max(epic) AS epic,
+                max(symbol) AS symbol,
+                max(timeframe) AS timeframe,
+                horizon_bar,
+                max(validated_at_utc) AS evaluated_at,
+                count(*)::integer AS n_samples,
+                avg(win_value)::double precision AS direction_accuracy,
+                avg(abs_error)::double precision AS mae,
+                sqrt(avg(error_value * error_value))::double precision AS rmse,
+                avg(win_value)::double precision AS hit_rate_after_spread,
+                CASE WHEN sum(loss_value) = 0 THEN NULL ELSE (sum(win_value)::double precision / sum(loss_value)::double precision) END AS profit_factor,
+                NULL::double precision AS avg_return_after_cost,
+                NULL::double precision AS max_drawdown,
+                jsonb_build_object('source', 'prediction_outcomes') AS details_json
+            FROM validated
+            GROUP BY horizon_bar
+            ORDER BY evaluated_at DESC, horizon_bar
+            LIMIT %s
+            """,
+            (candidates, candidates, candidates, timeframe, timeframe, max(1, int(limit))),
+        ).fetchall()
+    return {"rows": [dict(row) for row in rows], "source": "prediction_tables_fallback"}
+
+
+def _ai_forecasts_payload(query: dict) -> dict:
+    epic, timeframe, limit = _ai_context(query)
+    try:
+        from gold_analyzer.db.repositories import ForecastRepository
+
+        payload = _ai_fetch_with_aliases(ForecastRepository, "list_forecasts", epic=epic, timeframe=timeframe, limit=limit)
+        if payload is not None:
+            return payload
+        return _fallback_ai_forecasts(epic=epic, timeframe=timeframe, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        fallback = _fallback_ai_forecasts(epic=epic, timeframe=timeframe, limit=limit)
+        if _ai_rows_present(fallback, "runs", "forecasts"):
+            return fallback
+        return {"runs": [], "forecasts": [], **_ai_empty_payload(exc)}
+
+
+def _ai_ensemble_payload(query: dict) -> dict:
+    epic, timeframe, limit = _ai_context(query)
+    try:
+        from gold_analyzer.db.repositories import ForecastRepository
+
+        payload = _ai_fetch_with_aliases(ForecastRepository, "list_ensemble", epic=epic, timeframe=timeframe, limit=limit)
+        if payload is not None:
+            return payload
+        return _fallback_ai_ensemble(epic=epic, timeframe=timeframe, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        fallback = _fallback_ai_ensemble(epic=epic, timeframe=timeframe, limit=limit)
+        if _ai_rows_present(fallback, "rows"):
+            return fallback
+        return _ai_empty_payload(exc)
+
+
+def _ai_regime_payload(query: dict) -> dict:
+    epic, timeframe, limit = _ai_context(query)
+    try:
+        from gold_analyzer.db.repositories import ValidationRepository
+
+        payload = _ai_fetch_with_aliases(ValidationRepository, "list_regime", epic=epic, timeframe=timeframe, limit=limit)
+        if payload is not None:
+            return payload
+        return _fallback_ai_regime(epic=epic, timeframe=timeframe, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        fallback = _fallback_ai_regime(epic=epic, timeframe=timeframe, limit=limit)
+        if _ai_rows_present(fallback, "rows"):
+            return fallback
+        return _ai_empty_payload(exc)
+
+
+def _ai_scorer_payload(query: dict) -> dict:
+    epic, timeframe, limit = _ai_context(query)
+    try:
+        from gold_analyzer.db.repositories import SignalScoreRepository
+
+        payload = _ai_fetch_with_aliases(SignalScoreRepository, "list_scores", epic=epic, timeframe=timeframe, limit=limit)
+        if payload is not None:
+            return payload
+        return _fallback_ai_scorer(epic=epic, timeframe=timeframe, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        fallback = _fallback_ai_scorer(epic=epic, timeframe=timeframe, limit=limit)
+        if _ai_rows_present(fallback, "rows"):
+            return fallback
+        return _ai_empty_payload(exc)
+
+
+def _ai_forecast_validation_payload(query: dict) -> dict:
+    epic, timeframe, limit = _ai_context(query)
+    try:
+        from gold_analyzer.db.repositories import ValidationRepository
+
+        payload = _ai_fetch_with_aliases(ValidationRepository, "list_validation", epic=epic, timeframe=timeframe, limit=limit)
+        if payload is not None:
+            return payload
+        return _fallback_ai_validation(epic=epic, timeframe=timeframe, limit=limit)
+    except Exception as exc:  # noqa: BLE001
+        fallback = _fallback_ai_validation(epic=epic, timeframe=timeframe, limit=limit)
+        if _ai_rows_present(fallback, "rows"):
+            return fallback
+        return _ai_empty_payload(exc)
+
+
 def _dashboard_html() -> str:
     return dashboard_html()
 
@@ -919,7 +1623,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/status":
                 if not _require_auth(self):
                     return
-                selected_symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
+                selected_symbol = (query.get("symbol", [DEFAULT_SYMBOL])[0] or DEFAULT_SYMBOL).strip()
                 selected_resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
                 if selected_resolution not in SUPPORTED_RESOLUTIONS:
                     _error_response(self, 400, "VALIDATION_ERROR", "Invalid resolution", {"field": "resolution"})
@@ -928,7 +1632,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 quality_path, quality_report = _quality_report_for_metadata(metadata_path, metadata)
                 forecast = _safe_csv(metadata.get("forecast_csv_path"))
                 input_tail = _safe_csv(metadata.get("input_csv_path"), limit=100)
-                latest_actual = _latest_file(f"actual_for_forecast_{metadata.get('epic', 'ETHUSD')}_{metadata.get('resolution', 'MINUTE_5')}_*.csv")
+                latest_actual = _latest_file(f"actual_for_forecast_{metadata.get('epic', DEFAULT_SYMBOL)}_{metadata.get('resolution', 'MINUTE_5')}_*.csv")
                 actual_tail = _safe_csv(latest_actual, limit=100) or input_tail
                 baseline_reports = sorted(OUTPUT_DIR.glob("forecast_quality_report_BASELINE_*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
                 baseline_summary = {p.stem: _safe_json(p).get("forecast_quality_validation", {}) for p in baseline_reports[:6]}
@@ -1002,7 +1706,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/signals":
                 if not _require_auth(self):
                     return
-                symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
+                symbol = (query.get("symbol", [DEFAULT_SYMBOL])[0] or DEFAULT_SYMBOL).strip()
                 resolution = (query.get("timeframe", [query.get("resolution", [""])[0]])[0] or "").strip().upper() or None
                 date_from = (query.get("date_from", [""])[0] or "").strip() or None
                 date_to = (query.get("date_to", [""])[0] or "").strip() or None
@@ -1033,10 +1737,74 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
+            if parsed.path == "/api/forecasts":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _ai_forecasts_payload(query))
+                return
+            if parsed.path == "/api/ensemble":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _ai_ensemble_payload(query))
+                return
+            if parsed.path == "/api/regime":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _ai_regime_payload(query))
+                return
+            if parsed.path == "/api/scorer":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _ai_scorer_payload(query))
+                return
+            if parsed.path == "/api/forecast-validation":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _ai_forecast_validation_payload(query))
+                return
+            if parsed.path == "/api/strategy-brain/latest":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _strategy_brain_latest_payload(query))
+                return
+            if parsed.path == "/api/strategy-brain/history":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _strategy_brain_history_payload(query))
+                return
+            if parsed.path == "/api/strategy-brain/ai-support":
+                if not _require_auth(self):
+                    return
+                decision_id_raw = _query_first(query, "decision_id").strip()
+                if not decision_id_raw:
+                    _error_response(self, 400, "VALIDATION_ERROR", "decision_id is required", {"field": "decision_id"})
+                    return
+                try:
+                    decision_id = int(decision_id_raw)
+                except (TypeError, ValueError):
+                    _error_response(self, 400, "VALIDATION_ERROR", "decision_id must be an integer", {"field": "decision_id"})
+                    return
+                _json_response(self, 200, _strategy_brain_ai_support_payload(decision_id))
+                return
+            if parsed.path == "/api/strategy-brain/performance":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _strategy_brain_performance_payload(query))
+                return
+            if parsed.path == "/api/strategy-brain/regime":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _strategy_brain_regime_payload(query))
+                return
+            if parsed.path == "/api/strategy-brain/risk-state":
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _strategy_brain_risk_state_payload(query))
+                return
             if parsed.path == "/api/model-performance":
                 if not _require_auth(self):
                     return
-                symbol = (query.get("symbol", ["ETHUSD"])[0] or "ETHUSD").strip()
+                symbol = (query.get("symbol", [DEFAULT_SYMBOL])[0] or DEFAULT_SYMBOL).strip()
                 resolution = (query.get("resolution", ["MINUTE_5"])[0] or "MINUTE_5").strip().upper()
                 model_version_id = (query.get("model_version_id", [""])[0] or "").strip() or None
                 try:
@@ -1197,7 +1965,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _predict(self, payload: dict) -> None:
         request_id = getattr(self, "_request_id", None)
-        market = str(payload.get("market", "ETHUSD")).strip()
+        market = str(payload.get("market", DEFAULT_SYMBOL)).strip()
         symbol = str(payload.get("symbol") or market).strip()
         resolution = str(payload.get("resolution", "MINUTE_5")).strip().upper()
         feature_set = str(payload.get("feature_set", "auto")).strip()
@@ -1386,7 +2154,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
         stamp = _metadata_stamp(metadata_path)
-        epic = metadata.get("epic", "ETHUSD")
+        epic = metadata.get("epic", DEFAULT_SYMBOL)
         resolution = metadata.get("resolution", "MINUTE_5")
         actual = OUTPUT_DIR / f"actual_for_forecast_{epic}_{resolution}_{stamp}.csv"
         if not actual.exists():
@@ -1462,7 +2230,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             )
             return
         stamp = _metadata_stamp(metadata_path)
-        epic = metadata.get("epic", "ETHUSD")
+        epic = metadata.get("epic", DEFAULT_SYMBOL)
         resolution = metadata.get("resolution", "MINUTE_5")
         actual = OUTPUT_DIR / f"actual_for_forecast_{epic}_{resolution}_{stamp}.csv"
         methods = ["naive", "moving_average", "drift", "last_direction"]
