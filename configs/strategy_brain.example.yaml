@@ -1,5 +1,6 @@
 strategy_brain:
-  enabled: true
+  enabled: false
+  dry_run: true
   symbol: GOLD
   main_timeframe: "5m"
 
@@ -66,7 +67,7 @@ strategy_brain:
     runner_close_tp2: 0.40
 
   ai_support:
-    enabled: true
+    enabled: false
     ai_cannot_generate_signal: true
     missing_model_support_value: 0.0
     weights:

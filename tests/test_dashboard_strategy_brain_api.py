@@ -49,6 +49,35 @@ class _StrategyPerformanceRepo:
         return {"rows": [{"symbol": symbol, "timeframe": timeframe, "limit": limit, "profit_factor": 1.4}]}
 
 
+class _EmptyStrategyPerformanceRepo:
+    saved_summary = None
+
+    def list_latest(self, *, symbol, timeframe, limit):
+        if self.saved_summary:
+            return {"rows": [{**self.saved_summary, "id": 123, "details_json": self.saved_summary.get("details")}]}
+        return {"rows": []}
+
+    def executed_trade_summary(self, *, symbol, timeframe):
+        return {
+            "symbol": symbol,
+            "timeframe": timeframe,
+            "strategy_type": "executed_trade_proxy",
+            "lookback_trades": 4,
+            "win_rate": 0.25,
+            "profit_factor": 0.5,
+            "expectancy": -0.1,
+            "details": {
+                "source": "executed_trades",
+                "approved_for_paper": False,
+                "approval_gates": [{"gate_name": "minimum_profit_factor", "status": "FAIL"}],
+            },
+        }
+
+    def save_summary(self, summary):
+        type(self).saved_summary = dict(summary)
+        return 123
+
+
 def test_strategy_brain_latest_and_history_payloads_use_query_context(monkeypatch) -> None:
     monkeypatch.setattr(repositories, "StrategyDecisionRepository", _StrategyDecisionRepo)
 
@@ -76,6 +105,18 @@ def test_strategy_brain_performance_payload_uses_query_context(monkeypatch) -> N
     payload = dashboard_server._strategy_brain_performance_payload({"epic": ["XAUUSD"], "tf": ["1h"], "limit": ["2"]})
 
     assert payload["rows"] == [{"symbol": "XAUUSD", "timeframe": "1h", "limit": 2, "profit_factor": 1.4}]
+
+
+def test_strategy_brain_performance_bootstraps_from_executed_trades_when_empty(monkeypatch) -> None:
+    _EmptyStrategyPerformanceRepo.saved_summary = None
+    monkeypatch.setattr(repositories, "StrategyPerformanceRepository", _EmptyStrategyPerformanceRepo)
+
+    payload = dashboard_server._strategy_brain_performance_payload({"epic": ["XAUUSD"], "tf": ["5m"], "limit": ["2"]})
+
+    assert payload["source"] == "executed_trades_bootstrap"
+    assert payload["rows"][0]["strategy_type"] == "executed_trade_proxy"
+    assert payload["rows"][0]["details_json"]["source"] == "executed_trades"
+    assert payload["rows"][0]["details_json"]["approval_gates"][0]["status"] == "FAIL"
 
 
 def test_strategy_brain_regime_and_risk_state_payloads_use_latest_decision(monkeypatch) -> None:

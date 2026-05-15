@@ -42,16 +42,17 @@ models:
 
   foundation:
     kronos:
-      enabled: true
-      model_path: "./KRONOS-MODEL/model/Kronos-base"
-      tokenizer_path: "./KRONOS-MODEL/model/Kronos-Tokenizer-base"
+      enabled: false
+      model_path: "models/kronos"
+      tokenizer_path: "models/kronos-tokenizer"
+      status_on_missing: SKIPPED
       device: auto
       context_bars: 512
       horizon_bars: 12
       batch_size: 8
 
     chronos2:
-      enabled: true
+      enabled: false
       model_path: "./models/chronos2"
       device: auto
       context_bars: 512
@@ -59,7 +60,7 @@ models:
       batch_size: 8
 
     timesfm:
-      enabled: true
+      enabled: false
       model_path: "./models/timesfm"
       device: auto
       context_bars: 512
@@ -67,7 +68,7 @@ models:
       batch_size: 8
 
     moirai:
-      enabled: true
+      enabled: false
       model_path: "./models/moirai"
       device: auto
       context_bars: 512
@@ -77,14 +78,14 @@ models:
 
   local:
     patchtst:
-      enabled: true
+      enabled: false
       artifact_path: "./models/patchtst/patchtst_gold.pt"
       context_bars: 512
       horizon_bars: 12
       batch_size: 8
 
     itransformer:
-      enabled: true
+      enabled: false
       artifact_path: "./models/itransformer/itransformer_gold.pt"
       context_bars: 512
       horizon_bars: 12
@@ -92,7 +93,8 @@ models:
 
   volatility:
     garch:
-      enabled: true
+      enabled: false
+      status_on_missing: SKIPPED
       window_bars: 1000
       horizon_bars: 12
       risk_thresholds:

@@ -1416,6 +1416,11 @@ def dashboard_html() -> str:
       background: radial-gradient(circle, rgba(67, 176, 216, 0.15), transparent 70%);
     }
 
+    body::before,
+    body::after {
+      display: none;
+    }
+
     .ambient {
       background-image:
         linear-gradient(rgba(255, 255, 255, 0.018) 1px, transparent 1px),
@@ -2432,6 +2437,252 @@ def dashboard_html() -> str:
       grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     }
 
+    /* Final dashboard layout polish: spacing, alignment, and responsive safeguards. */
+    .shell {
+      width: min(calc(100vw - 28px), 1680px);
+      padding: 18px 0 38px;
+    }
+
+    .shell,
+    .panel,
+    .topbar-main,
+    .command-ribbon,
+    .control-board,
+    .details-panel {
+      max-width: 100%;
+    }
+
+    .topbar,
+    .control-board,
+    .model-status-panel,
+    .chart-panel,
+    .details-panel {
+      padding: clamp(16px, 1.5vw, 22px);
+    }
+
+    .panel,
+    .section-card,
+    .hero-decision,
+    .hero-side,
+    .meta-card,
+    .kpi,
+    .mini-stat,
+    .risk-item,
+    .health-item,
+    .model-support-card,
+    .signal-history-card,
+    .quote-cell,
+    .decision-level,
+    .score-ring,
+    .score-bar,
+    .field,
+    .toggle-card,
+    .table-wrap,
+    .chart-wrap,
+    .warning-item,
+    .validation-banner,
+    details,
+    pre,
+    iframe {
+      border-radius: 10px;
+    }
+
+    .section-card,
+    .hero-decision,
+    .hero-side {
+      padding: clamp(14px, 1.3vw, 18px);
+    }
+
+    .topbar-main,
+    .hero-terminal,
+    .overview-primary,
+    .overview-secondary,
+    .chart-grid,
+    .model-status-grid {
+      gap: 14px;
+    }
+
+    .control-head,
+    .panel-head,
+    .section-titlebar {
+      flex-wrap: wrap;
+      align-items: flex-start;
+      margin-bottom: 12px;
+    }
+
+    .section-titlebar > div,
+    .panel-head > div,
+    .control-head > div {
+      min-width: min(100%, 260px);
+    }
+
+    .brand h1 {
+      gap: 8px 12px;
+      max-width: 100%;
+    }
+
+    .title-price {
+      margin-left: 0;
+      white-space: normal;
+    }
+
+    .brand p {
+      max-width: 920px;
+      margin: 0;
+    }
+
+    .command-ribbon,
+    .control-grid,
+    .filter-grid--signals {
+      align-items: stretch;
+    }
+
+    .field {
+      min-width: 0;
+      align-content: start;
+    }
+
+    .field input,
+    .field select,
+    input,
+    select {
+      min-width: 0;
+    }
+
+    .command-actions,
+    .actions,
+    .filter-actions--signals {
+      align-items: stretch;
+    }
+
+    button,
+    .tab,
+    .mini-copy {
+      display: inline-grid;
+      place-items: center;
+      text-align: center;
+      line-height: 1.2;
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    .tabs {
+      align-items: stretch;
+    }
+
+    .tab {
+      flex: 1 1 132px;
+      min-width: 0;
+    }
+
+    .kpi,
+    .mini-stat,
+    .risk-item,
+    .health-item,
+    .quote-cell,
+    .decision-level,
+    .model-support-card,
+    .signal-history-card {
+      min-width: 0;
+      overflow-wrap: anywhere;
+    }
+
+    .kpi-value,
+    .mini-stat-value,
+    .risk-value,
+    .health-state,
+    .quote-value,
+    .decision-value,
+    .model-version-title,
+    .meta-value {
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+
+    .model-support-head,
+    .signal-history-head,
+    .score-bar-head,
+    .progress-row {
+      flex-wrap: wrap;
+    }
+
+    .score-ring-body {
+      inline-size: clamp(88px, 8vw, 108px);
+      block-size: clamp(88px, 8vw, 108px);
+    }
+
+    .chart-panel {
+      min-height: auto;
+    }
+
+    .chart-wrap {
+      min-height: 320px;
+      padding: 8px;
+    }
+
+    canvas {
+      height: 320px;
+    }
+
+    .table-wrap {
+      max-width: 100%;
+    }
+
+    table {
+      min-width: 720px;
+    }
+
+    th,
+    td {
+      padding: 10px 12px;
+    }
+
+    .signal-table-footer {
+      margin-top: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+    }
+
+    .signal-pagination-left,
+    .signal-pagination-right {
+      min-width: 0;
+      flex: 1 1 320px;
+      align-items: center;
+    }
+
+    .signal-pagination-right {
+      justify-content: flex-end;
+      text-align: right;
+    }
+
+    .signal-pagination-pages {
+      max-width: 100%;
+    }
+
+    .signal-pagination-left button,
+    .signal-pagination-right button,
+    .filter-actions--signals button {
+      min-height: 36px !important;
+      padding: 8px 10px !important;
+    }
+
+    .signal-page-size-field {
+      flex: 0 1 170px;
+      max-width: 190px;
+    }
+
+    .empty {
+      min-height: 88px;
+    }
+
+    .hero-note {
+      margin-top: 12px;
+    }
+
+    .ai-stack-grid {
+      margin-bottom: 14px;
+    }
+
     .skeleton-panel {
       min-height: 148px;
       border-radius: 22px;
@@ -2587,7 +2838,8 @@ def dashboard_html() -> str:
 
     @media (max-width: 820px) {
       .shell {
-        padding: 14px 14px 28px;
+        width: calc(100vw - 20px);
+        padding: 10px 0 28px;
       }
 
       .topbar {
@@ -2625,15 +2877,72 @@ def dashboard_html() -> str:
       .signal-pagination-right {
         align-items: stretch;
         justify-content: flex-start;
+        flex-direction: column;
+        text-align: left;
+        width: 100%;
       }
 
       .field.signal-page-size-field {
         max-width: none;
+        width: 100%;
       }
 
       .skeleton-panel--hero,
       .skeleton-panel--wide {
         grid-column: auto;
+      }
+    }
+
+    @media (max-width: 480px) {
+      .topbar,
+      .control-board,
+      .model-status-panel,
+      .chart-panel,
+      .details-panel {
+        padding: 14px;
+      }
+
+      .brand h1 {
+        display: block;
+        font-size: 1.55rem;
+        line-height: 1.12;
+        letter-spacing: -0.01em;
+        max-width: calc(100vw - 72px);
+      }
+
+      .brand p {
+        max-width: min(280px, calc(100vw - 96px));
+        font-size: 13px;
+      }
+
+      .title-price {
+        display: block;
+        margin-top: 8px;
+        font-size: 1rem;
+      }
+
+      .brand-kicker,
+      .section-kicker,
+      .hero-eyebrow,
+      .chip,
+      button,
+      .tab {
+        letter-spacing: 0.07em;
+      }
+
+      .field {
+        padding: 12px;
+      }
+
+      .command-actions button,
+      button,
+      .tab {
+        min-height: 44px;
+        padding: 10px 12px;
+      }
+
+      .meta-card {
+        min-height: 92px;
       }
     }
 
@@ -2729,7 +3038,7 @@ def dashboard_html() -> str:
         <h2>Advanced Control Dock</h2>
         <div class="muted">Secondary parameters, repair toggles, and validation actions stay available without crowding the live command bar.</div>
       </div>
-      <span class="chip info">Frontend-only redesign</span>
+      <span class="chip info">Live Controls</span>
     </div>
 
     <div class="control-grid">
@@ -4048,7 +4357,7 @@ function renderOverview(options = {}) {
     kpi('Max Drawdown', execPerf.max_drawdown === null || execPerf.max_drawdown === undefined ? 'N/A' : fmtNumber(execPerf.max_drawdown, 4), 'From finalized trade sequence'),
     kpi('Directional Accuracy', latestModelPerformance?.active_model?.direction_accuracy_pct === null || latestModelPerformance?.active_model?.direction_accuracy_pct === undefined ? 'N/A' : `${fmtNumber(latestModelPerformance.active_model.direction_accuracy_pct, 2)}%`, `${fmtCount(latestModelPerformance?.active_model?.samples || 0)} active samples`),
     kpi('Buy vs Sell Load', `${fmtCount(buyCount)} / ${fmtCount(sellCount)}`, 'Recent BUY / SELL signals loaded'),
-    kpi('Signal Backlog', `${fmtCount(aggregatedPending)}`, `${fmtCount(aggregatedWins)} wins · ${fmtCount(aggregatedLosses)} losses`),
+    kpi('Signal Backlog', `${fmtCount(aggregatedPending)}`, `${fmtCount(aggregatedWins)} wins / ${fmtCount(aggregatedLosses)} losses`),
   ].join('');
 
   const healthCards = [
@@ -5246,7 +5555,7 @@ function aiValidationRows() {
 function aiTradeOutcomeRows() {
   const rows = (latestSignals.rows || []).slice(0, 8);
   if (!rows.length) {
-    return '<tr><td colspan="6">No recent signal outcomes loaded yet.</td></tr>';
+    return '<tr><td colspan="6">No recent trade outcomes loaded yet.</td></tr>';
   }
   return rows.map(row => `<tr>
     <td>${escapeHtml(row.signal_id || row.run_id || '')}</td>
@@ -5339,18 +5648,18 @@ function renderAiStack(data = latest) {
     <div class="section-kicker">AI Support</div>
     <div class="section-titlebar">
       <div>
-        <h2 class="section-title">Model Support Console</h2>
+        <h2 class="section-title">AI Forecast Stack</h2>
         <p class="section-sub">Forecast models, ensemble direction, volatility regime, and scorer outputs rendered from the existing AI endpoints.</p>
       </div>
       <span class="chip info">${escapeHtml($('resolution').value || 'MINUTE_5')}</span>
     </div>
     ${warningHtml}
     <div class="kpi-grid ai-stack-grid" style="margin-bottom: 14px;">
-      ${kpi('Current Price', price === null ? 'N/A' : fmtNumber(price, 2), spread === null ? 'Spread N/A' : `Spread ${fmtNumber(spread, 4)}`)}
+      ${kpi('Current Price + Spread', price === null ? 'N/A' : fmtNumber(price, 2), spread === null ? 'Spread N/A' : `Spread ${fmtNumber(spread, 4)}`)}
       ${kpi('Active Regime', regime.regime || 'N/A', `Risk ${regime.risk_state || 'N/A'}`)}
       ${kpi('Ensemble Direction', normalizeDecisionSignal(ensemble.ensemble_direction || 'NO_TRADE'), `Agreement ${ensemble.agreement_score === null || ensemble.agreement_score === undefined ? 'N/A' : pct01(ensemble.agreement_score)}`)}
-      ${kpi('GARCH / Realized Vol', regime.garch_volatility === null || regime.garch_volatility === undefined ? 'N/A' : fmtNumber(regime.garch_volatility, 4), regime.realized_volatility === null || regime.realized_volatility === undefined ? 'Realized N/A' : `Realized ${fmtNumber(regime.realized_volatility, 4)}`)}
-      ${kpi('Win Probability', score.probability_win === null || score.probability_win === undefined ? 'N/A' : pct01(score.probability_win), `Loss ${score.probability_loss === null || score.probability_loss === undefined ? 'N/A' : pct01(score.probability_loss)} · ${score.scorer_model || 'fallback scorer'}`)}
+      ${kpi('GARCH Volatility Risk', regime.garch_volatility === null || regime.garch_volatility === undefined ? 'N/A' : fmtNumber(regime.garch_volatility, 4), regime.realized_volatility === null || regime.realized_volatility === undefined ? 'Realized N/A' : `Realized ${fmtNumber(regime.realized_volatility, 4)}`)}
+      ${kpi('Final LightGBM / CatBoost Probability', score.probability_win === null || score.probability_win === undefined ? 'N/A' : pct01(score.probability_win), `Loss ${score.probability_loss === null || score.probability_loss === undefined ? 'N/A' : pct01(score.probability_loss)} / ${score.scorer_model || 'fallback scorer'}`)}
       ${kpi('Final Decision', normalizeDecisionSignal(score.decision || finalDecision.decision || 'NO_TRADE'), finalDecision.reason || `Expected return ${score.expected_return === null || score.expected_return === undefined ? 'N/A' : pct01(score.expected_return)}`)}
     </div>
 
@@ -5383,12 +5692,13 @@ function renderAiStack(data = latest) {
         <div class="section-kicker">Votes & Quality</div>
         <div class="section-titlebar">
           <div>
-            <h2 class="section-title">Ensemble Votes</h2>
+            <h2 class="section-title">Model Votes</h2>
             <p class="section-sub">Current model votes plus stored performance and validation quality.</p>
           </div>
           ${chip(ensemble.ensemble_direction || 'N/A')}
         </div>
         <div class="table-wrap" style="margin-bottom: 12px;"><table><thead><tr><th>Model</th><th>Vote</th><th>Return</th><th>Confidence</th></tr></thead><tbody>${aiVoteRows(ensemble)}</tbody></table></div>
+        <div class="section-kicker">Model Performance Table</div>
         <div class="table-wrap"><table><tbody>${aiPerformanceRows(latestModelPerformance || {})}</tbody></table></div>
       </section>
     </div>
@@ -5409,7 +5719,7 @@ function renderAiStack(data = latest) {
       <div class="section-kicker">Trade Outcomes</div>
       <div class="section-titlebar">
         <div>
-          <h2 class="section-title">Recent Signal Outcomes</h2>
+          <h2 class="section-title">Recent Trade Outcomes</h2>
           <p class="section-sub">Outcome snapshots remain visible beside the AI stack so you can compare model support with realized result flow.</p>
         </div>
         <span class="chip info">${fmtCount((latestSignals.rows || []).length)} rows</span>
@@ -5623,7 +5933,7 @@ function render(data, options = {}) {
   const summaryCardsHtml = `
     <div class="hero-terminal">
       <section class="hero-decision">
-        <div class="hero-eyebrow">Hero Decision Panel</div>
+        <div class="hero-eyebrow">Decision Panel</div>
         <div class="hero-header">
           <div>
             <div class="section-sub">Current live decision</div>

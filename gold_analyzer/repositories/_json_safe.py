@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from datetime import date, datetime, time
 from typing import Any
 
 import pandas as pd
@@ -43,6 +44,8 @@ def sanitize_json(value: Any) -> Any:
 def _scalar(value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(value, (datetime, date, time)):
+        return value.isoformat()
     if isinstance(value, pd.Timestamp):
         return value.isoformat()
     if hasattr(value, "item"):
