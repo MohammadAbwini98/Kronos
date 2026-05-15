@@ -130,6 +130,28 @@ def test_ai_support_service_skips_missing_models_without_crashing() -> None:
     assert all(evaluation["model_status"] == "SKIPPED" for evaluation in result.evaluations)
 
 
+def test_kronos_missing_returns_skipped() -> None:
+    result = AISupportService().evaluate(_candidate("BUY"), _context())
+
+    assert result.model_details["kronos"]["status"] == "SKIPPED"
+    assert result.kronos_support == 0.0
+
+
+def test_garch_missing_returns_skipped() -> None:
+    result = AISupportService().evaluate(_candidate("BUY"), _context())
+
+    assert result.model_details["garch"]["status"] == "SKIPPED"
+    assert result.garch_support == 0.0
+
+
+def test_ai_support_neutral_when_no_candidate() -> None:
+    result = AISupportService().evaluate(None, _context())
+
+    assert result.status == "UNAVAILABLE"
+    assert result.support_value == 0.0
+    assert result.candidate_signal is None
+
+
 def test_no_candidate_still_results_in_no_trade_even_if_kronos_implies_buy() -> None:
     context = _context(
         metadata={
@@ -148,3 +170,7 @@ def test_no_candidate_still_results_in_no_trade_even_if_kronos_implies_buy() -> 
     assert decision.signal == DECISION_NO_TRADE
     assert decision.decision_status == DECISION_NO_TRADE
     assert decision.reason == "NO_STRATEGY_SETUP"
+
+
+def test_ai_cannot_generate_signal_without_strategy_candidate() -> None:
+    test_no_candidate_still_results_in_no_trade_even_if_kronos_implies_buy()

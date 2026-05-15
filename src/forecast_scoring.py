@@ -213,10 +213,21 @@ def _signal_final_move_pct(signal: str, entry_price: float, close: float) -> flo
     move_pct = move_pct_from_prices(entry_price, close)
     if move_pct is None:
         return None
-    signal_text = str(signal or "HOLD").upper()
-    if signal_text == "SHORT":
+    signal_text = _trade_direction(signal)
+    if signal_text is None:
+        return None
+    if signal_text == "SELL":
         return -move_pct
     return move_pct
+
+
+def _trade_direction(signal: str | None) -> str | None:
+    signal_text = str(signal or "").upper().strip()
+    if signal_text in {"BUY", "LONG"}:
+        return "BUY"
+    if signal_text in {"SELL", "SHORT"}:
+        return "SELL"
+    return None
 
 
 def score_trade_signal_outcome(
@@ -237,8 +248,9 @@ def score_trade_signal_outcome(
     HOLD signals are not counted as WIN/LOSS, and ambiguous same-candle TP/SL
     touches are excluded from win-rate by returning AMBIGUOUS.
     """
-    signal_text = str(signal or "HOLD").upper()
-    actionable = signal_text in {"LONG", "SHORT"}
+    signal_text = str(signal or "HOLD").upper().strip()
+    trade_direction = _trade_direction(signal_text)
+    actionable = trade_direction is not None
     actual = _clean_ohlc_frame(actual_df, "actual")
     result = {
         "policy_version": policy_version,
@@ -299,7 +311,7 @@ def score_trade_signal_outcome(
         high = float(row["high"])
         low = float(row["low"])
         timestamp = pd.Timestamp(row["timestamps"]).isoformat()
-        if signal_text == "LONG":
+        if trade_direction == "BUY":
             tp_hit = high >= tp
             sl_hit = low <= sl
             win_price = tp
@@ -385,8 +397,8 @@ def score_signal_quality(
     scoring_summary: dict[str, Any],
     trade_outcome: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    signal_text = str(signal or "HOLD").upper()
-    actionable = signal_text in {"LONG", "SHORT"}
+    signal_text = str(signal or "HOLD").upper().strip()
+    actionable = _trade_direction(signal_text) is not None
     realized_move_pct = scoring_summary.get("realized_movement_pct")
     status = str((trade_outcome or {}).get("status") or scoring_summary.get("status") or "PENDING").upper()
     movement_after_cost_pct = scoring_summary.get("average_movement_after_cost_pct")

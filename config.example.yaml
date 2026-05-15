@@ -23,6 +23,10 @@ runtime:
   output_dir: output
   log_dir: logs
 
+dashboard:
+  auto_kill_port_process: false
+  auto_port_fallback: true
+
 signal_validation:
   main_signal_timeframe: MINUTE_5
   entry_confirmation_timeframe: MINUTE

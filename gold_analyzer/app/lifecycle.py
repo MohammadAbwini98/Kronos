@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+import os
 from pathlib import Path
 from typing import Any
 
@@ -24,10 +25,11 @@ def load_default_models(models_config: ModelsConfig | None = None) -> list[Forec
         models_root = {}
 
     loaded: list[ForecastModel] = []
+    env_enabled_override = str(os.getenv("AI_MODELS_ENABLED", "")).strip().lower() in {"1", "true", "yes", "on"}
 
     foundation = models_root.get("foundation") if isinstance(models_root.get("foundation"), dict) else {}
     kronos_cfg = foundation.get("kronos") if isinstance(foundation.get("kronos"), dict) else {}
-    if bool(kronos_cfg.get("enabled", False)):
+    if _model_enabled(kronos_cfg, env_enabled_override):
         loaded.append(
             KronosAdapter(
                 model_path=_resolve_project_path(kronos_cfg.get("model_path")),
@@ -36,7 +38,7 @@ def load_default_models(models_config: ModelsConfig | None = None) -> list[Forec
             )
         )
     chronos_cfg = foundation.get("chronos2") if isinstance(foundation.get("chronos2"), dict) else {}
-    if bool(chronos_cfg.get("enabled", False)):
+    if _model_enabled(chronos_cfg, env_enabled_override):
         loaded.append(
             Chronos2Adapter(
                 model_path=_resolve_project_path(chronos_cfg.get("model_path")),
@@ -44,7 +46,7 @@ def load_default_models(models_config: ModelsConfig | None = None) -> list[Forec
             )
         )
     timesfm_cfg = foundation.get("timesfm") if isinstance(foundation.get("timesfm"), dict) else {}
-    if bool(timesfm_cfg.get("enabled", False)):
+    if _model_enabled(timesfm_cfg, env_enabled_override):
         loaded.append(
             TimesFMAdapter(
                 model_path=_resolve_project_path(timesfm_cfg.get("model_path")),
@@ -52,7 +54,7 @@ def load_default_models(models_config: ModelsConfig | None = None) -> list[Forec
             )
         )
     moirai_cfg = foundation.get("moirai") if isinstance(foundation.get("moirai"), dict) else {}
-    if bool(moirai_cfg.get("enabled", False)):
+    if _model_enabled(moirai_cfg, env_enabled_override):
         loaded.append(
             MoiraiAdapter(
                 model_path=_resolve_project_path(moirai_cfg.get("model_path")),
@@ -62,18 +64,24 @@ def load_default_models(models_config: ModelsConfig | None = None) -> list[Forec
 
     volatility = models_root.get("volatility") if isinstance(models_root.get("volatility"), dict) else {}
     garch_cfg = volatility.get("garch") if isinstance(volatility.get("garch"), dict) else {}
-    if bool(garch_cfg.get("enabled", False)):
+    if _model_enabled(garch_cfg, env_enabled_override):
         loaded.append(GarchAdapter(window_bars=int(garch_cfg.get("window_bars", 1000))))
 
     local = models_root.get("local") if isinstance(models_root.get("local"), dict) else {}
     patchtst_cfg = local.get("patchtst") if isinstance(local.get("patchtst"), dict) else {}
-    if bool(patchtst_cfg.get("enabled", False)):
+    if _model_enabled(patchtst_cfg, env_enabled_override):
         loaded.append(PatchTSTAdapter(artifact_path=_resolve_project_path(patchtst_cfg.get("artifact_path"))))
     itransformer_cfg = local.get("itransformer") if isinstance(local.get("itransformer"), dict) else {}
-    if bool(itransformer_cfg.get("enabled", False)):
+    if _model_enabled(itransformer_cfg, env_enabled_override):
         loaded.append(ITransformerAdapter(artifact_path=_resolve_project_path(itransformer_cfg.get("artifact_path"))))
 
     return loaded
+
+
+def _model_enabled(config: dict[str, Any], env_enabled_override: bool) -> bool:
+    if env_enabled_override:
+        return True
+    return bool(config.get("enabled", False))
 
 
 def create_pipeline(

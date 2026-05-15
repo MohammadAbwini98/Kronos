@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import logging
 import os
@@ -913,6 +914,79 @@ def _ai_context(query: dict) -> tuple[str | None, str | None, int]:
     return epic, timeframe, _ai_limit(query)
 
 
+LEGACY_GET_ENDPOINTS = {
+    "/api/snapshot",
+    "/api/corr",
+    "/api/lagcorr",
+    "/api/rolling",
+    "/api/signals/history",
+    "/api/calibration",
+    "/api/equity",
+    "/api/candles",
+    "/api/price",
+    "/api/meta",
+    "/api/health",
+    "/api/notify/test",
+}
+
+
+def _legacy_dashboard_payload(path: str, query: dict) -> dict:
+    symbol = (_query_first(query, "symbol", "epic") or DEFAULT_SYMBOL).strip()
+    resolution = (_normalize_ai_timeframe(_query_first(query, "resolution", "timeframe", "tf")) or "MINUTE_5").strip().upper()
+    if path == "/api/health":
+        return {"ok": True, "status": "OK", "service": "dashboard_server"}
+    if path == "/api/notify/test":
+        return {
+            "ok": True,
+            "sent": False,
+            "reason": "DRY_RUN_ENDPOINT_COMPATIBILITY",
+            "message": "Notification test endpoint is available; no trade alert was sent.",
+        }
+    try:
+        snapshot = _postgres_snapshot(symbol, resolution)
+    except Exception as exc:  # noqa: BLE001
+        snapshot = {"error": str(exc), "signals": [], "candles": [], "outcomes": [], "prediction_db": {}}
+
+    if path == "/api/snapshot":
+        return {"snapshot": snapshot, "selected_symbol": symbol, "selected_resolution": resolution}
+    if path == "/api/signals/history":
+        try:
+            page = int(_query_first(query, "page") or 1)
+            page_size = int(_query_first(query, "page_size", "limit") or 50)
+        except ValueError:
+            page, page_size = 1, 50
+        return query_signals(symbol=symbol, resolution=resolution, page=page, page_size=max(1, min(page_size, 200)))
+    if path == "/api/candles":
+        return {"rows": list(snapshot.get("candles") or []), "symbol": symbol, "resolution": resolution}
+    if path == "/api/price":
+        return {
+            "row": snapshot.get("live_quote") or {},
+            "live_health": snapshot.get("live_health") or {},
+            "symbol": symbol,
+            "resolution": resolution,
+        }
+    if path == "/api/meta":
+        metadata_path, metadata = _latest_metadata(symbol, resolution)
+        return {"metadata": metadata, "path": str(metadata_path) if metadata_path else None}
+    if path == "/api/equity":
+        return {
+            "rows": (snapshot.get("trade_execution") or {}).get("equity") or [],
+            "performance": (snapshot.get("trade_execution") or {}).get("performance") or {},
+        }
+    if path == "/api/calibration":
+        return {
+            "rows": snapshot.get("horizon_metrics") or [],
+            "timeframe_validations": snapshot.get("timeframe_validations") or [],
+        }
+    return {
+        "rows": [],
+        "source": "compatibility_empty_state",
+        "endpoint": path,
+        "selected_symbol": symbol,
+        "selected_resolution": resolution,
+    }
+
+
 def _ai_empty_payload(exc: Exception) -> dict:
     return {
         "rows": [],
@@ -1631,6 +1705,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(body)
                 return
+            if parsed.path in LEGACY_GET_ENDPOINTS:
+                if not _require_auth(self):
+                    return
+                _json_response(self, 200, _legacy_dashboard_payload(parsed.path, query))
+                return
             if parsed.path == "/api/status":
                 if not _require_auth(self):
                     return
@@ -1956,6 +2035,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/trade-execution/transaction-history":
                 self._fetch_trade_transaction(payload)
+                return
+            if parsed.path == "/api/notify/test":
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "sent": False,
+                        "reason": "DRY_RUN_ENDPOINT_COMPATIBILITY",
+                        "message": "Notification test endpoint is available; no trade alert was sent.",
+                    },
+                )
                 return
             self._response_status = 404
             self.send_error(404)
@@ -2456,20 +2547,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--no-open", action="store_true", help="Do not open the dashboard in the default browser.")
+    parser.add_argument(
+        "--auto-port-fallback",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("DASHBOARD_AUTO_PORT_FALLBACK", "true").strip().lower() not in {"0", "false", "no"},
+        help="If the requested port is busy, bind the next available local port instead of killing any process.",
+    )
     return parser.parse_args()
+
+
+def _make_server(host: str, port: int, *, auto_port_fallback: bool) -> tuple[ThreadingHTTPServer, int]:
+    attempts = range(port, port + 20) if auto_port_fallback else (port,)
+    last_error: OSError | None = None
+    for candidate_port in attempts:
+        try:
+            return ThreadingHTTPServer((host, candidate_port), DashboardHandler), candidate_port
+        except OSError as exc:
+            last_error = exc
+            if getattr(exc, "errno", None) not in {errno.EADDRINUSE, 10048}:
+                raise
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "dashboard.port.busy",
+                host=host,
+                port=candidate_port,
+                auto_port_fallback=auto_port_fallback,
+                suggestion="Change --port/dashboard.port or enable auto port fallback.",
+            )
+            if not auto_port_fallback:
+                break
+    raise RuntimeError(f"Dashboard port {port} is busy. Change --port or set DASHBOARD_AUTO_PORT_FALLBACK=true.") from last_error
 
 
 def main() -> None:
     configure_logging(service_name="dashboard_server")
     args = parse_args()
-    server = ThreadingHTTPServer((args.host, args.port), DashboardHandler)
-    url = f"http://{args.host}:{args.port}"
+    server, bound_port = _make_server(args.host, args.port, auto_port_fallback=bool(args.auto_port_fallback))
+    url = f"http://{args.host}:{bound_port}"
     log_event(
         LOGGER,
         logging.INFO,
         "dashboard.server.start",
         host=args.host,
-        port=args.port,
+        port=bound_port,
+        requested_port=args.port,
         url=url,
         auto_open=not args.no_open,
     )
