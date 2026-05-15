@@ -22,7 +22,7 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stream Capital.com OHLC candles into a Kronos-ready rolling CSV.")
-    parser.add_argument("--market", default=None, help="Search term such as ETHUSD, ETH/USD, or Ethereum.")
+    parser.add_argument("--market", default=None, help="Search term such as XAUUSD, XAU/USD, or Gold.")
     parser.add_argument("--epic", default=None, help="Explicit Capital.com epic. Skips market search.")
     parser.add_argument("--resolution", default=None, help="MINUTE, MINUTE_5, MINUTE_15, MINUTE_30, HOUR, HOUR_4, DAY, WEEK.")
     parser.add_argument("--price-side", default=None, choices=["bid", "ask", "mid"], help="Accepted for CLI symmetry; stream payload is used as delivered.")

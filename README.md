@@ -1,13 +1,13 @@
-# Capital.com Kronos Data Bridge
+# Gold Analyzer Kronos Data Bridge
 
-Safe local Python bridge for fetching Capital.com ETH/USD market data and preparing Kronos-compatible pandas/CSV input.
+Safe local Python bridge for fetching Capital.com Gold/XAU/USD market data and preparing Kronos-compatible pandas/CSV input.
 
 This project is data only. It does not place trades, open positions, close positions, manage working orders, or call trading endpoints.
 
 ## Setup
 
 ```powershell
-cd C:\AI\capital_kronos_data_bridge
+cd path\to\Gold-Analyzer
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
@@ -18,9 +18,9 @@ Edit `.env` and set:
 
 ```text
 CAPITAL_ENV=demo
-CAPITAL_API_KEY=your_api_key
-CAPITAL_IDENTIFIER=your_login_identifier
-CAPITAL_PASSWORD=your_api_password
+CAPITAL_API_KEY=<set in .env>
+CAPITAL_IDENTIFIER=<set in .env>
+CAPITAL_PASSWORD=<set in .env>
 CAPITAL_DISPLAY_TIMEZONE=Asia/Amman
 ```
 
@@ -38,7 +38,7 @@ WORKER_RESTART_MAX_ATTEMPTS=20
 WORKER_MONITOR_INTERVAL_SECONDS=5
 
 KRONOS_FINETUNE_COMMAND=
-KRONOS_AUTO_MODEL_DIR=C:\AI\Models\Kronos\Kronos-auto-finetuned
+KRONOS_AUTO_MODEL_DIR=.\KRONOS-MODEL\model\Kronos-auto-finetuned
 AUTO_FINETUNE_DATASET_LIMIT=50000
 AUTO_FINETUNE_MIN_ROWS=2000
 AUTO_FINETUNE_MIN_NEW_ROWS=1000
@@ -70,7 +70,7 @@ Auto-finetune command safety:
 Example command template:
 
 ```text
-KRONOS_FINETUNE_COMMAND=C:\AI\capital_kronos_data_bridge\.venv\Scripts\python.exe C:\AI\capital_kronos_data_bridge\src\main_bootstrap_auto_model.py --dataset {dataset} --model-dir {model_dir} --symbol {symbol} --resolution {resolution}
+KRONOS_FINETUNE_COMMAND=.\.venv\Scripts\python.exe .\src\main_bootstrap_auto_model.py --dataset {dataset} --model-dir {model_dir} --symbol {symbol} --resolution {resolution}
 ```
 
 ## Demo vs Live
@@ -348,11 +348,9 @@ The status is directional and data-only:
 - `LOSS` means the direction did not match.
 - No BUY/SELL execution logic is created or called.
 
-Create/use a local PostgreSQL database. The default DSN (matching the provided docker-compose credentials) is:
+Create/use a local PostgreSQL database and set `POSTGRES_DSN` in `.env`:
 
-```text
-postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos
-```
+Use a PostgreSQL DSN with credentials supplied only from your local environment file.
 
 Apply migrations:
 
@@ -423,11 +421,15 @@ Enable or disable:
 ```text
 SIGNAL_VALIDATION_ENABLED=true
 SIGNAL_VALIDATION_STRICT=false
-SIGNAL_VALIDATION_TIMEFRAMES=MINUTE_15,MINUTE_30,HOUR,HOUR_4
+SIGNAL_VALIDATION_TIMEFRAMES=MINUTE_15,MINUTE_30,HOUR
+SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT=true
 ```
 
 - Set `SIGNAL_VALIDATION_ENABLED=false` to disable the feature cleanly.
 - Keep `SIGNAL_VALIDATION_STRICT=false` to preserve forecast artifacts when validation context is temporarily unavailable.
+- The 5m forecast remains the main scalp signal. 15m confirms direction, 30m confirms regime, and 1h acts as the macro trend filter.
+- 1m can be added to `SIGNAL_VALIDATION_TIMEFRAMES` for entry timing only; it gives a small momentum boost but cannot decide direction alone.
+- 4h can be added as an optional higher trend filter when you want a slower context check.
 
 Run manually for a run id:
 

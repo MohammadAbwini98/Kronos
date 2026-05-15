@@ -116,6 +116,26 @@ class ClosedInputFilterTests(unittest.TestCase):
 
 
 class HigherTimeframeFetchGateTests(unittest.TestCase):
+    def test_entry_timeframe_is_not_treated_as_required_higher_timeframe(self):
+        with patch("higher_timeframe_fetcher._timeframe_snapshot") as snapshot, patch(
+            "higher_timeframe_fetcher._write_fetcher_heartbeat"
+        ):
+            out = higher_timeframe_fetcher.ensure_higher_timeframe_candles(
+                symbol="ETHUSD",
+                price_side="mid",
+                epic="ETHUSD",
+                required_timeframes=["MINUTE"],
+                min_rows_per_timeframe=240,
+                env_name="demo",
+                dsn=None,
+                now_utc=pd.Timestamp("2026-05-05T20:15:00Z"),
+            )
+
+        self.assertTrue(out["ok"])
+        self.assertEqual([], out["required_timeframes"])
+        self.assertEqual([], out["missing_timeframes"])
+        snapshot.assert_not_called()
+
     def test_single_open_candle_buffer_is_not_marked_missing(self):
         with patch(
             "higher_timeframe_fetcher._timeframe_snapshot",

@@ -51,7 +51,8 @@ class ValidationCycleTests(unittest.TestCase):
             main_validation_worker._due_runs(None, limit=5)
 
         self.assertIn("ORDER BY updated_at ASC, forecast_end_timestamp_utc ASC", fake.sql)
-        self.assertEqual((5,), fake.params)
+        self.assertIn("symbol = %s::text OR epic = %s::text", fake.sql)
+        self.assertEqual((None, None, None, 5), fake.params)
 
     def test_due_runs_waits_for_candle_close(self):
         """_due_runs must not fire until forecast_timestamp_utc + resolution_duration <= now().
@@ -120,6 +121,24 @@ class ValidationCycleTests(unittest.TestCase):
         self.assertEqual(1, details["errors"])
         self.assertFalse(details["rate_limited"])
         self.assertIn("actual CSV contains null OHLC values", details["last_error"])
+
+    def test_validate_run_uses_stable_report_output_path(self):
+        args = argparse.Namespace(postgres_dsn=None, batch_size=5, env="demo", symbol="ETHUSD", all_symbols=False)
+        run = _run("ETHUSD_MINUTE_5_20260511T200000Z")
+        run["resolution"] = "MINUTE_5"
+        with patch("main_validation_worker.run_logged_subprocess") as subprocess_mock:
+            subprocess_mock.return_value.returncode = 0
+            subprocess_mock.return_value.stdout = ""
+            subprocess_mock.return_value.stderr = ""
+            code, _tail = main_validation_worker._validate_run(run, args, "val_test_cycle")
+
+        self.assertEqual(0, code)
+        validate_cmd = subprocess_mock.call_args_list[1].args[0]
+        self.assertIn("--output", validate_cmd)
+        self.assertIn(
+            "output\\forecast_quality_report_ETHUSD_MINUTE_5_20260511T200000Z.json",
+            validate_cmd,
+        )
 
 
 if __name__ == "__main__":

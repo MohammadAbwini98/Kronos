@@ -13,10 +13,19 @@ import pandas as pd
 
 from candle_context import resolution_to_timedelta
 from capital_rest_client import CapitalRestClient
-from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
+from config import configure_logging, load_instrument_settings, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
 from data_quality import analyze_ohlcv_quality, grade_meets_minimum, persist_prediction_run_quality
+from db import connect
 from logging_utils import log_event, new_correlation_id, output_tail, safe_command_for_log
-from prediction_store import run_id_from_metadata_path, save_shadow_prediction, upsert_instrument, upsert_ohlcv_df
+from prediction_input_quality import evaluate_strict_input_policy, resolve_feature_experiment
+from prediction_store import (
+    PREDICTION_COLUMNS,
+    persist_prediction_input_rejection,
+    run_id_from_metadata_path,
+    save_shadow_prediction,
+    upsert_instrument,
+    upsert_ohlcv_df,
+)
 from subprocess_utils import run_logged_subprocess
 from time_utils import format_local_timestamp
 
@@ -31,22 +40,37 @@ SIGNAL_VALIDATION_LINE_RE = re.compile(
 
 
 def parse_args() -> argparse.Namespace:
+    instrument = load_instrument_settings()
     parser = argparse.ArgumentParser(description="Fetch latest Capital.com candles and generate a current/future Kronos forecast.")
-    parser.add_argument("--market", default="ETHUSD")
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", instrument.provider_symbol))
     parser.add_argument("--epic", default=None)
-    parser.add_argument("--resolution", default="MINUTE_5")
+    parser.add_argument("--resolution", default=os.getenv("SIGNAL_RESOLUTION", instrument.candle_interval))
     parser.add_argument("--max", type=int, default=512, dest="max_points")
     parser.add_argument("--lookback", type=int, default=512)
     parser.add_argument("--pred-len", type=int, default=12)
     parser.add_argument("--price-side", default="mid", choices=["bid", "ask", "mid"])
     parser.add_argument("--env", default="demo", choices=["demo", "live"])
-    parser.add_argument("--feature-set", default="auto", choices=["auto", "ohlc", "ohlcv", "ohlcva"])
+    parser.add_argument(
+        "--feature-set",
+        default="ohlcv_only",
+        choices=[
+            "auto",
+            "ohlc",
+            "ohlcv",
+            "ohlcva",
+            "ohlcv_only",
+            "ohlcva_derived_amount",
+            "ohlcv_with_regime_context",
+            "multi_timeframe_validation_only",
+        ],
+    )
     parser.add_argument("--repair-ohlc", action="store_true", help="Repair forecast high/low if raw Kronos output violates OHLC envelope.")
     parser.add_argument("--kronos-python", default=sys.executable)
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--symbol", default=None, help="Configured dashboard/signal symbol. Defaults to market.")
     parser.add_argument("--postgres-dsn", default=None, help="PostgreSQL DSN. Defaults to POSTGRES_DSN.")
     parser.add_argument("--disable-shadow-model", action="store_true", help="Skip candidate-model shadow prediction.")
+    parser.add_argument("--skip-ai-model-stack", action="store_true", help="Skip the optional multi-model AI forecast stack even when AI_MODELS_ENABLED=true.")
     return parser.parse_args()
 
 
@@ -195,6 +219,206 @@ def _run_shadow_prediction(
     return True
 
 
+def _run_optional_ai_model_stack(
+    *,
+    dsn: str | None,
+    prediction_request_id: str,
+    epic: str,
+    symbol: str,
+    resolution: str,
+    context_bars: int,
+    horizon_bars: int,
+    kronos_forecast_csv: Path | None = None,
+    kronos_model_version: str | None = None,
+) -> dict[str, object]:
+    try:
+        from gold_analyzer.app import create_pipeline, load_default_models
+        from gold_analyzer.config import load_models_config
+        from gold_analyzer.models.base import ForecastModel, ForecastPoint, ForecastRequest, ForecastResult
+    except Exception as exc:  # noqa: BLE001
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "forecast_latest.ai_model_stack.unavailable",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            error=str(exc),
+        )
+        return {"status": "unavailable", "error": str(exc)}
+
+    models_config = load_models_config()
+    if not models_config.enabled:
+        log_event(
+            LOGGER,
+            logging.INFO,
+            "forecast_latest.ai_model_stack.skipped",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            reason="disabled",
+            config_path=str(models_config.path) if models_config.path else None,
+        )
+        return {"status": "skipped", "reason": "disabled"}
+
+    models = load_default_models(models_config)
+    if kronos_forecast_csv is not None:
+        models = [
+            _PersistedKronosForecastAdapter(
+                forecast_csv=kronos_forecast_csv,
+                model_version=kronos_model_version or "kronos-live",
+                forecast_model_cls=ForecastModel,
+                forecast_point_cls=ForecastPoint,
+                forecast_request_cls=ForecastRequest,
+                forecast_result_cls=ForecastResult,
+            )
+            if model.model_key == "kronos"
+            else model
+            for model in models
+        ]
+    if not models:
+        log_event(
+            LOGGER,
+            logging.WARNING,
+            "forecast_latest.ai_model_stack.skipped",
+            prediction_request_id=prediction_request_id,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            reason="no_enabled_models",
+            config_path=str(models_config.path) if models_config.path else None,
+        )
+        return {"status": "skipped", "reason": "no_enabled_models"}
+
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.ai_model_stack.start",
+        prediction_request_id=prediction_request_id,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        context_bars=context_bars,
+        horizon_bars=horizon_bars,
+        models=[model.model_key for model in models],
+    )
+    pipeline = create_pipeline(dsn=dsn, models=models, models_config=models_config, persist=True)
+    result = pipeline.run_cycle(epic=epic, timeframe=resolution, context_bars=context_bars, horizon_bars=horizon_bars)
+    model_statuses = [
+        {"model_key": row.model_key, "status": row.status, "error_message": row.error_message}
+        for row in result.model_results
+    ]
+    log_event(
+        LOGGER,
+        logging.INFO,
+        "forecast_latest.ai_model_stack.completed",
+        prediction_request_id=prediction_request_id,
+        symbol=symbol,
+        epic=epic,
+        resolution=resolution,
+        quality_ok=result.quality.ok,
+        model_statuses=model_statuses,
+        ensemble_points=len(result.ensemble),
+        decision=(result.decision or {}).get("decision") if result.decision else None,
+    )
+    return {
+        "status": "completed",
+        "quality_ok": result.quality.ok,
+        "model_statuses": model_statuses,
+        "ensemble_points": len(result.ensemble),
+    }
+
+
+def _direction_from_return(value: float | None, flat_threshold: float = 0.0) -> str:
+    if value is None:
+        return "UNKNOWN"
+    if value > flat_threshold:
+        return "UP"
+    if value < -flat_threshold:
+        return "DOWN"
+    return "FLAT"
+
+
+def _PersistedKronosForecastAdapter(
+    *,
+    forecast_csv: Path,
+    model_version: str,
+    forecast_model_cls,
+    forecast_point_cls,
+    forecast_request_cls,
+    forecast_result_cls,
+):
+    class PersistedKronosForecastAdapter(forecast_model_cls):
+        model_key = "kronos"
+
+        def __init__(self) -> None:
+            self.model_version = model_version
+
+        def predict(self, request) -> object:
+            started = time.perf_counter()
+            try:
+                forecast = pd.read_csv(forecast_csv)
+                if forecast.empty:
+                    return forecast_result_cls.skipped(
+                        model_key=self.model_key,
+                        model_version=self.model_version,
+                        epic=request.epic,
+                        timeframe=request.timeframe,
+                        reason=f"Persisted Kronos forecast CSV is empty: {forecast_csv}",
+                    )
+                forecast["timestamps"] = pd.to_datetime(forecast["timestamps"], utc=True)
+                forecast["close"] = pd.to_numeric(forecast["close"], errors="coerce")
+                forecast = forecast.dropna(subset=["timestamps", "close"]).head(int(request.horizon_bars))
+                if forecast.empty:
+                    return forecast_result_cls.skipped(
+                        model_key=self.model_key,
+                        model_version=self.model_version,
+                        epic=request.epic,
+                        timeframe=request.timeframe,
+                        reason=f"Persisted Kronos forecast CSV has no valid forecast rows: {forecast_csv}",
+                    )
+                last_close = float(pd.to_numeric(request.candles["close"], errors="coerce").dropna().iloc[-1])
+                points = []
+                for index, row in enumerate(forecast.itertuples(index=False), start=1):
+                    predicted_close = float(row.close)
+                    predicted_return = None if last_close == 0 else (predicted_close / last_close) - 1.0
+                    points.append(
+                        forecast_point_cls(
+                            forecast_for_ts=getattr(row, "timestamps"),
+                            horizon_bar=index,
+                            predicted_close=predicted_close,
+                            predicted_return=predicted_return,
+                            predicted_direction=_direction_from_return(predicted_return),
+                            confidence=None,
+                            raw={"source": "persisted_kronos_subprocess", "forecast_csv": str(forecast_csv)},
+                        )
+                    )
+                return forecast_result_cls(
+                    model_key=self.model_key,
+                    model_version=self.model_version,
+                    epic=request.epic,
+                    timeframe=request.timeframe,
+                    status="OK",
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    points=points,
+                    raw={"source": "persisted_kronos_subprocess", "forecast_csv": str(forecast_csv)},
+                )
+            except Exception as exc:  # noqa: BLE001
+                return forecast_result_cls.failed(
+                    model_key=self.model_key,
+                    model_version=self.model_version,
+                    epic=request.epic,
+                    timeframe=request.timeframe,
+                    error=str(exc),
+                    latency_ms=int((time.perf_counter() - started) * 1000),
+                    raw={"source": "persisted_kronos_subprocess", "forecast_csv": str(forecast_csv)},
+                )
+
+    return PersistedKronosForecastAdapter()
+
+
 def _extract_signal_validation_summary(output_text: str) -> dict[str, object] | None:
     if not output_text:
         return None
@@ -228,6 +452,88 @@ def _closed_candles_only(df: pd.DataFrame, resolution: str, now_utc: pd.Timestam
     if closed.empty:
         return df
     return closed.reset_index(drop=True)
+
+
+def _latest_websocket_candle_timestamp(*, symbol: str, resolution: str, dsn: str | None) -> pd.Timestamp | None:
+    try:
+        with connect(dsn) as conn:
+            row = conn.execute(
+                """
+                SELECT timestamp_utc
+                FROM ohlcv_candles
+                WHERE symbol = %s AND resolution = %s AND source = 'websocket_ohlc'
+                ORDER BY timestamp_utc DESC, updated_at DESC
+                LIMIT 1
+                """,
+                (symbol, resolution),
+            ).fetchone()
+    except Exception:  # noqa: BLE001
+        return None
+    if not row or row.get("timestamp_utc") is None:
+        return None
+    return pd.to_datetime(row["timestamp_utc"], utc=True)
+
+
+def _complete_input_from_stored_candles(
+    df: pd.DataFrame,
+    *,
+    symbol: str,
+    epic: str,
+    resolution: str,
+    price_side: str,
+    lookback: int,
+    dsn: str | None,
+) -> tuple[pd.DataFrame, int]:
+    if df.empty or not dsn:
+        return df, 0
+
+    clean = df.copy()
+    clean["timestamps"] = pd.to_datetime(clean["timestamps"], utc=True)
+    if "source" not in clean.columns:
+        clean["source"] = "latest_fetch"
+    clean = clean.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+    minutes = max(1, int(resolution_to_timedelta(resolution).total_seconds() // 60))
+    expected = pd.date_range(
+        start=clean["timestamps"].iloc[0],
+        end=clean["timestamps"].iloc[-1],
+        freq=f"{minutes}min",
+    )
+    existing = set(clean["timestamps"])
+    missing = [timestamp for timestamp in expected if timestamp not in existing]
+    if not missing:
+        return clean.tail(int(lookback)).reset_index(drop=True), 0
+
+    with connect(dsn) as conn:
+        rows = conn.execute(
+            """
+            SELECT timestamp_utc AS timestamps, open, high, low, close, volume, amount, source
+            FROM ohlcv_candles
+            WHERE symbol = %s
+              AND epic = %s
+              AND resolution = %s
+              AND price_side = %s
+              AND timestamp_utc >= %s
+              AND timestamp_utc <= %s
+            ORDER BY timestamp_utc
+            """,
+            (symbol, epic, resolution, price_side, missing[0].isoformat(), missing[-1].isoformat()),
+        ).fetchall()
+
+    stored = pd.DataFrame(rows)
+    if stored.empty:
+        return clean.tail(int(lookback)).reset_index(drop=True), 0
+    stored["timestamps"] = pd.to_datetime(stored["timestamps"], utc=True)
+    if "source" not in stored.columns:
+        stored["source"] = "stored_gap_fill"
+    else:
+        stored["source"] = stored["source"].fillna("stored_gap_fill")
+    stored = stored[stored["timestamps"].isin(missing)]
+    if stored.empty:
+        return clean.tail(int(lookback)).reset_index(drop=True), 0
+    combined = pd.concat([stored, clean], ignore_index=True)
+    combined["timestamps"] = pd.to_datetime(combined["timestamps"], utc=True)
+    combined = combined.sort_values("timestamps").drop_duplicates("timestamps", keep="last").reset_index(drop=True)
+    return combined.tail(int(lookback)).reset_index(drop=True), int(len(stored))
 
 
 def main() -> None:
@@ -330,6 +636,31 @@ def main() -> None:
             )
         if df.empty:
             raise SystemExit("No closed candles available after filtering in-progress data.")
+        df, stored_gap_rows = _complete_input_from_stored_candles(
+            df,
+            symbol=symbol,
+            epic=epic,
+            resolution=resolution,
+            price_side=price_side,
+            lookback=args.lookback,
+            dsn=args.postgres_dsn,
+        )
+        if stored_gap_rows:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.input.completed_from_stored_candles",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                stored_gap_rows=stored_gap_rows,
+                rows=len(df),
+                window_start=str(df["timestamps"].iloc[0]) if not df.empty else None,
+                window_end=str(df["timestamps"].iloc[-1]) if not df.empty else None,
+            )
+        feature_selection = resolve_feature_experiment(df, args.feature_set)
+        df = feature_selection.dataframe
         # Keep the model input artifact aligned with what is validated and stored.
         df.to_csv(input_path, index=False)
         log_event(
@@ -350,6 +681,44 @@ def main() -> None:
             resolution=resolution,
             expected_rows=args.lookback,
         )
+        selected_feature_columns = feature_selection.feature_columns
+        feature_mode = feature_selection.feature_mode
+        websocket_terminal_ts = _latest_websocket_candle_timestamp(symbol=symbol, resolution=resolution, dsn=args.postgres_dsn)
+        rest_terminal_ts = pd.to_datetime(df["timestamps"].iloc[-1], utc=True)
+        if websocket_terminal_ts is not None and websocket_terminal_ts != rest_terminal_ts:
+            log_event(
+                LOGGER,
+                logging.WARNING,
+                "forecast_latest.input.websocket_rest_timestamp_mismatch",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                rest_last_input_timestamp_utc=rest_terminal_ts.isoformat(),
+                websocket_latest_candle_timestamp_utc=websocket_terminal_ts.isoformat(),
+            )
+        strict_decision = evaluate_strict_input_policy(
+            df,
+            resolution=resolution,
+            requested_lookback=args.lookback,
+            selected_feature_columns=selected_feature_columns,
+            source_label="latest_fetch",
+            symbol=symbol,
+            price_side=price_side,
+            allow_short_lookback=str(os.getenv("PREDICTION_ALLOW_SHORT_LOOKBACK", "")).strip().lower() in {"1", "true", "yes", "on"},
+            max_stale_intervals=int(os.getenv("PREDICTION_MAX_STALE_INPUT_INTERVALS", "1")),
+        )
+        data_quality_dict = {
+            **data_quality.to_dict(),
+            **strict_decision.checks,
+            "selected_feature_columns": selected_feature_columns,
+            "feature_mode": feature_mode,
+            "amount_derivation_method": feature_selection.amount_derivation_method,
+            "regime_context_used": feature_selection.regime_context_used,
+            "feature_experiment_notes": feature_selection.notes,
+            "strict_policy_passed": strict_decision.allow,
+            "strict_policy_rejection_reason": None if strict_decision.allow else strict_decision.reason,
+        }
         log_event(
             LOGGER,
             logging.INFO,
@@ -360,7 +729,39 @@ def main() -> None:
             resolution=resolution,
             quality_grade=data_quality.quality_grade,
             expected_rows=args.lookback,
+            feature_mode=feature_mode,
+            amount_derivation_method=feature_selection.amount_derivation_method,
+            regime_context_used=feature_selection.regime_context_used,
+            strict_policy_passed=strict_decision.allow,
+            strict_policy_rejection_reason=None if strict_decision.allow else strict_decision.reason,
         )
+        if not strict_decision.allow:
+            persist_prediction_input_rejection(
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                price_side=price_side,
+                requested_lookback=args.lookback,
+                actual_lookback=int(strict_decision.checks.get("actual_lookback") or len(df)),
+                reason=strict_decision.reason,
+                rejection_reasons=strict_decision.rejection_reasons,
+                quality_snapshot=data_quality_dict,
+                input_csv_path=input_path,
+                dsn=args.postgres_dsn,
+            )
+            log_event(
+                LOGGER,
+                logging.ERROR,
+                "forecast_latest.input_quality_rejected",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                rejection_reason=strict_decision.reason,
+                rejection_reasons=strict_decision.rejection_reasons,
+            )
+            raise SystemExit(f"Prediction input rejected: {strict_decision.reason}")
 
         min_quality_grade = os.getenv("MIN_PREDICTION_QUALITY_GRADE")
         quality_action = os.getenv("PREDICTION_QUALITY_ACTION", "downgrade").strip().lower()
@@ -442,6 +843,8 @@ def main() -> None:
             str(args.lookback),
             "--pred-len",
             str(args.pred_len),
+            "--symbol",
+            symbol,
             "--epic",
             epic,
             "--market-name",
@@ -572,7 +975,24 @@ def main() -> None:
             epic=epic,
             resolution=resolution,
         )
-        metadata["data_quality"] = data_quality.to_dict()
+        metadata["data_quality"] = data_quality_dict
+        metadata["input_quality_snapshot"] = data_quality_dict
+        metadata["selected_feature_columns"] = selected_feature_columns
+        metadata["input_feature_columns"] = selected_feature_columns
+        metadata["feature_mode"] = feature_mode
+        metadata["amount_mode"] = (
+            "DERIVED"
+            if feature_selection.amount_derivation_method
+            else ("AVAILABLE" if data_quality_dict.get("amount_available") else "UNAVAILABLE")
+        )
+        metadata["amount_available"] = bool(data_quality_dict.get("amount_available"))
+        metadata["volume_available"] = bool(data_quality_dict.get("volume_available"))
+        metadata["input_missing_candle_count"] = data_quality_dict.get("missing_candle_count")
+        metadata["input_largest_gap_minutes"] = data_quality_dict.get("largest_gap_minutes")
+        metadata["input_gap_list"] = data_quality_dict.get("gap_list") or []
+        metadata["input_source_counts"] = data_quality_dict.get("source_counts") or {}
+        metadata["input_closed_candle_verified"] = bool(strict_decision.allow)
+        metadata["forecast_timestamp_verified"] = metadata.get("forecast_timestamp_check_status") == "PASS" and not metadata.get("forecast_timestamp_mismatches")
         if min_quality_grade and not grade_meets_minimum(data_quality.quality_grade, min_quality_grade):
             metadata["data_quality"]["quality_gate_action"] = quality_action
             metadata["data_quality"]["minimum_grade"] = min_quality_grade
@@ -580,7 +1000,7 @@ def main() -> None:
         try:
             persist_prediction_run_quality(
                 run_id_from_metadata_path(latest_metadata),
-                data_quality,
+                data_quality_dict,
                 dsn=args.postgres_dsn,
             )
             log_event(
@@ -606,6 +1026,47 @@ def main() -> None:
                 quality_grade=data_quality.quality_grade,
                 error=str(exc),
             )
+
+        ai_model_stack_summary: dict[str, object] | None = None
+        if args.skip_ai_model_stack:
+            log_event(
+                LOGGER,
+                logging.INFO,
+                "forecast_latest.ai_model_stack.skipped",
+                prediction_request_id=prediction_request_id,
+                symbol=symbol,
+                epic=epic,
+                resolution=resolution,
+                reason="cli_skip",
+            )
+            ai_model_stack_summary = {"status": "skipped", "reason": "cli_skip"}
+        else:
+            try:
+                ai_model_stack_summary = _run_optional_ai_model_stack(
+                    dsn=args.postgres_dsn,
+                    prediction_request_id=prediction_request_id,
+                    epic=epic,
+                    symbol=symbol,
+                    resolution=resolution,
+                    context_bars=args.lookback,
+                    horizon_bars=args.pred_len,
+                    kronos_forecast_csv=Path(str(metadata["forecast_csv_path"])),
+                    kronos_model_version=str(metadata.get("model_name") or "kronos-live"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                ai_model_stack_summary = {"status": "failed", "error": str(exc)}
+                print(f"WARNING: optional AI model stack could not be recorded: {exc}")
+                log_event(
+                    LOGGER,
+                    logging.ERROR,
+                    "forecast_latest.ai_model_stack.failed",
+                    prediction_request_id=prediction_request_id,
+                    symbol=symbol,
+                    epic=epic,
+                    resolution=resolution,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
 
         shadow_model = None if args.disable_shadow_model else _shadow_candidate_model(settings.output_dir)
         if shadow_model is not None and _shadow_model_enabled():
@@ -669,6 +1130,7 @@ def main() -> None:
             validation_final_signal=(signal_validation_summary or {}).get("final_signal"),
             validation_total_score=(signal_validation_summary or {}).get("total_score"),
             validation_blocked=(signal_validation_summary or {}).get("blocked"),
+            ai_model_stack_status=(ai_model_stack_summary or {}).get("status"),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
 

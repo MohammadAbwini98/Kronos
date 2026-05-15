@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import psycopg
 from psycopg.rows import dict_row
@@ -17,6 +18,7 @@ LOGGER = get_logger(__name__)
 
 
 DEFAULT_POSTGRES_DSN = "postgresql://capital_kronos:capital_kronos@localhost:5432/capital_kronos"
+DEFAULT_POSTGRES_SCHEMA = "gold_manual"
 
 
 class DatabaseError(RuntimeError):
@@ -37,7 +39,35 @@ def load_dotenv_if_present(path: str | Path = ".env") -> None:
 
 def postgres_dsn(override: str | None = None) -> str:
     load_dotenv_if_present()
-    return override or os.getenv("POSTGRES_DSN", DEFAULT_POSTGRES_DSN)
+    if override:
+        return override
+    configured = os.getenv("POSTGRES_DSN", "").strip()
+    if configured:
+        return configured
+    component_dsn = _postgres_dsn_from_components()
+    return component_dsn or DEFAULT_POSTGRES_DSN
+
+
+def _postgres_dsn_from_components() -> str | None:
+    name = os.getenv("DB_NAME", "").strip()
+    user = os.getenv("DB_USER", "").strip()
+    password = os.getenv("DB_PASSWORD", "").strip()
+    host = os.getenv("DB_HOST", "localhost").strip() or "localhost"
+    port = os.getenv("DB_PORT", "5432").strip() or "5432"
+    if not name or not user:
+        return None
+    credentials = quote(user, safe="")
+    if password:
+        credentials = f"{credentials}:{quote(password, safe='')}"
+    return f"postgresql://{credentials}@{host}:{port}/{quote(name, safe='')}"
+
+
+def postgres_schema() -> str:
+    load_dotenv_if_present()
+    schema = os.getenv("TRADING_DATABASE_SCHEMA", os.getenv("POSTGRES_SCHEMA", DEFAULT_POSTGRES_SCHEMA)).strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", schema):
+        raise DatabaseError(f"Invalid PostgreSQL schema name: {schema!r}")
+    return schema
 
 
 def masked_postgres_dsn(override: str | None = None) -> str:
@@ -56,17 +86,22 @@ def masked_postgres_dsn(override: str | None = None) -> str:
 @contextmanager
 def connect(dsn: str | None = None) -> Iterator[psycopg.Connection]:
     resolved_dsn = postgres_dsn(dsn)
+    schema = postgres_schema()
     dsn_masked = mask_dsn(resolved_dsn)
     started = time.perf_counter()
-    log_event(LOGGER, 20, "db.connect.start", dsn_masked=dsn_masked)
+    log_event(LOGGER, 20, "db.connect.start", dsn_masked=dsn_masked, database_schema=schema)
     try:
         with psycopg.connect(resolved_dsn, row_factory=dict_row, connect_timeout=5) as conn:
             conn.execute("SET TIME ZONE 'UTC'")
+            with conn.cursor() as cur:
+                cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{schema}"')
+                cur.execute(f'SET search_path TO "{schema}", public')
             log_event(
                 LOGGER,
                 20,
                 "db.connect.success",
                 dsn_masked=dsn_masked,
+                database_schema=schema,
                 duration_ms=int((time.perf_counter() - started) * 1000),
             )
             yield conn
@@ -76,6 +111,7 @@ def connect(dsn: str | None = None) -> Iterator[psycopg.Connection]:
             40,
             "db.connect.error",
             dsn_masked=dsn_masked,
+            database_schema=schema,
             duration_ms=int((time.perf_counter() - started) * 1000),
             error_type=type(exc).__name__,
             error=str(exc),
@@ -90,6 +126,7 @@ def run_migrations(dsn: str | None = None, migrations_dir: str | Path = "migrati
         raise DatabaseError(f"Migrations directory does not exist: {directory}")
     migration_run_id = new_correlation_id("migration")
     dsn_masked = mask_dsn(postgres_dsn(dsn))
+    schema = postgres_schema()
     started = time.perf_counter()
     log_event(
         LOGGER,
@@ -97,6 +134,7 @@ def run_migrations(dsn: str | None = None, migrations_dir: str | Path = "migrati
         "db.migration.start",
         migration_run_id=migration_run_id,
         dsn_masked=dsn_masked,
+        database_schema=schema,
         migrations_dir=str(directory),
     )
     try:
@@ -141,6 +179,7 @@ def run_migrations(dsn: str | None = None, migrations_dir: str | Path = "migrati
             "db.migration.completed",
             migration_run_id=migration_run_id,
             dsn_masked=dsn_masked,
+            database_schema=schema,
             applied_count=len(applied),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
@@ -151,6 +190,7 @@ def run_migrations(dsn: str | None = None, migrations_dir: str | Path = "migrati
             "db.migration.error",
             migration_run_id=migration_run_id,
             dsn_masked=dsn_masked,
+            database_schema=schema,
             duration_ms=int((time.perf_counter() - started) * 1000),
             error_type=type(exc).__name__,
             error=str(exc),
@@ -162,18 +202,20 @@ def run_migrations(dsn: str | None = None, migrations_dir: str | Path = "migrati
 def healthcheck(dsn: str | None = None) -> dict[str, object]:
     started = time.perf_counter()
     dsn_masked = mask_dsn(postgres_dsn(dsn))
-    log_event(LOGGER, 20, "db.healthcheck.start", dsn_masked=dsn_masked)
+    schema = postgres_schema()
+    log_event(LOGGER, 20, "db.healthcheck.start", dsn_masked=dsn_masked, database_schema=schema)
     try:
         with connect(dsn) as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT now() AS server_time_utc")
                 row = cur.fetchone()
-        payload = {"ok": True, "server_time_utc": row["server_time_utc"].isoformat() if row else None}
+        payload = {"ok": True, "server_time_utc": row["server_time_utc"].isoformat() if row else None, "schema": schema}
         log_event(
             LOGGER,
             20,
             "db.healthcheck.completed",
             dsn_masked=dsn_masked,
+            database_schema=schema,
             duration_ms=int((time.perf_counter() - started) * 1000),
             ok=True,
         )
@@ -184,6 +226,7 @@ def healthcheck(dsn: str | None = None) -> dict[str, object]:
             40,
             "db.healthcheck.completed",
             dsn_masked=dsn_masked,
+            database_schema=schema,
             duration_ms=int((time.perf_counter() - started) * 1000),
             ok=False,
             error_type=type(exc).__name__,

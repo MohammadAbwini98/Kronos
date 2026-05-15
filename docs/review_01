@@ -111,14 +111,14 @@ If training jobs become too slow with the new dataset size, I can tune batch siz
 
 
 Dashboard and workers stopped.
-Another active dashboard supervisor lease exists (host=MohammadAbwini, pid=9992, 
-expires_at=2026-05-08 16:49:35.968261+00:00). Set ALLOW_DUPLICATE_WORKERS=true to 
+Another active dashboard supervisor lease exists (host=LOCAL_HOST, pid=9992,
+expires_at=2026-05-08 16:49:35.968261+00:00). Set ALLOW_DUPLICATE_WORKERS=true to
 override intentionally.
-At C:\Users\moham\Desktop\Kronos\start_dashboard.ps1:494 char:9
+At <PROJECT_ROOT>\start_dashboard.ps1:494 char:9
 +         throw "Another active dashboard supervisor lease exists$detai ...
 +         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     + CategoryInfo          : OperationStopped: (Another active ... intentionally 
    .:String) [], RuntimeException
     + FullyQualifiedErrorId : Another active dashboard supervisor lease exists (h 
-   ost=MohammadAbwini, pid=9992, expires_at=2026-05-08 16:49:35.968261+00:00). S  
+   ost=LOCAL_HOST, pid=9992, expires_at=2026-05-08 16:49:35.968261+00:00). S
   et ALLOW_DUPLICATE_WORKERS=true to override intentionally.

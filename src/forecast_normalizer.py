@@ -133,7 +133,7 @@ def normalize_forecast(
     if input_frame.empty:
         raise ValueError("Input data is required for normalization.")
 
-    symbol = str(md.get("symbol") or md.get("epic") or "ETHUSD")
+    symbol = str(md.get("symbol") or md.get("epic") or "XAUUSD")
     epic = str(md.get("epic") or symbol)
     resolution = str(md.get("resolution") or "MINUTE_5").upper()
 

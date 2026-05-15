@@ -7,6 +7,8 @@ import re
 import time
 from typing import Any
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
+
 from db import connect, healthcheck
 from logging_utils import log_event, new_correlation_id
 from rate_limit_state import list_rate_limit_states
@@ -466,11 +468,31 @@ def horizon_metric_summary(*, symbol: str, resolution: str, dsn: str | None = No
                 """
                 SELECT
                     hm.horizon_index,
-                    COUNT(*) FILTER (WHERE hm.status IN ('WIN','LOSS'))::int AS samples,
-                    COALESCE(SUM(CASE WHEN hm.status = 'WIN' THEN 1 ELSE 0 END), 0)::int AS wins,
-                    COALESCE(SUM(CASE WHEN hm.status = 'LOSS' THEN 1 ELSE 0 END), 0)::int AS losses,
-                    AVG(ABS(hm.close_error)) FILTER (WHERE hm.status IN ('WIN','LOSS'))::double precision AS mae,
-                    AVG(ABS(hm.close_error_pct)) FILTER (WHERE hm.status IN ('WIN','LOSS'))::double precision AS mape_pct
+                    COUNT(*) FILTER (
+                        WHERE hm.status IN ('WIN','LOSS')
+                          AND hm.validation_state = 'FINAL'
+                          AND hm.actual_window_complete = true
+                    )::int AS samples,
+                    COALESCE(SUM(CASE
+                        WHEN hm.status = 'WIN'
+                         AND hm.validation_state = 'FINAL'
+                         AND hm.actual_window_complete = true THEN 1 ELSE 0
+                    END), 0)::int AS wins,
+                    COALESCE(SUM(CASE
+                        WHEN hm.status = 'LOSS'
+                         AND hm.validation_state = 'FINAL'
+                         AND hm.actual_window_complete = true THEN 1 ELSE 0
+                    END), 0)::int AS losses,
+                    AVG(ABS(hm.close_error)) FILTER (
+                        WHERE hm.status IN ('WIN','LOSS')
+                          AND hm.validation_state = 'FINAL'
+                          AND hm.actual_window_complete = true
+                    )::double precision AS mae,
+                    AVG(ABS(hm.close_error_pct)) FILTER (
+                        WHERE hm.status IN ('WIN','LOSS')
+                          AND hm.validation_state = 'FINAL'
+                          AND hm.actual_window_complete = true
+                    )::double precision AS mape_pct
                 FROM forecast_horizon_metrics hm
                 JOIN prediction_runs r ON r.run_id = hm.run_id
                 WHERE r.symbol = %s AND r.resolution = %s
@@ -495,7 +517,7 @@ def horizon_metric_summary(*, symbol: str, resolution: str, dsn: str | None = No
         return []
 
 
-def postgres_dashboard_snapshot(*, symbol: str = "ETHUSD", resolution: str = "MINUTE_5", dsn: str | None = None) -> dict[str, Any]:
+def postgres_dashboard_snapshot(*, symbol: str = DEFAULT_INSTRUMENT_SYMBOL, resolution: str = "MINUTE_5", dsn: str | None = None) -> dict[str, Any]:
     request_id = new_correlation_id("req")
     started = time.perf_counter()
     log_event(

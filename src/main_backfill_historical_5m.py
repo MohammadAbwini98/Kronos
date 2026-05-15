@@ -10,7 +10,7 @@ import time
 import pandas as pd
 
 from capital_rest_client import CapitalRestClient
-from config import configure_logging, load_settings, validate_price_side, validate_resolution
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging, load_settings, validate_price_side, validate_resolution
 from historical_backfill import ensure_historical_candles
 from logging_utils import log_event, new_correlation_id
 
@@ -20,9 +20,9 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backfill and gap-fill Capital.com 5-minute candles into PostgreSQL.")
-    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", "ETHUSD"))
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--epic", default=os.getenv("CAPITAL_DEFAULT_EPIC") or None)
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=os.getenv("HISTORICAL_BACKFILL_RESOLUTION", "MINUTE_5"))
     parser.add_argument("--price-side", default=os.getenv("CAPITAL_DEFAULT_PRICE_SIDE", "mid"), choices=["bid", "ask", "mid"])
     parser.add_argument("--days", type=int, default=int(os.getenv("HISTORICAL_BACKFILL_DAYS", "35")))
@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--postgres-dsn", default=None)
     parser.add_argument("--status-file", default="output/historical_5m_backfill_status.json")
     parser.add_argument("--now", default=None, help="UTC timestamp override for tests/manual replays.")
+    parser.add_argument(
+        "--no-repair-unavailable-gaps",
+        action="store_true",
+        help="Do not insert source-labeled flat candles for provider-empty historical gaps.",
+    )
     return parser.parse_args()
 
 
@@ -77,6 +82,7 @@ def main() -> None:
             source=args.source,
             dsn=args.postgres_dsn,
             now=pd.to_datetime(args.now, utc=True) if args.now else None,
+            repair_unavailable_gaps=not args.no_repair_unavailable_gaps,
         )
         status = {
             "enabled": True,
@@ -101,6 +107,7 @@ def main() -> None:
             missing_rows=summary.missing_rows,
             fetched_rows=summary.fetched_rows,
             upserted_rows=summary.upserted_rows,
+            repaired_rows=summary.repaired_rows,
             status_file=str(target),
             duration_ms=int((time.perf_counter() - started) * 1000),
         )
@@ -114,6 +121,7 @@ def main() -> None:
         print(f"Missing rows before fetch: {summary.missing_rows}")
         print(f"Missing ranges fetched: {summary.missing_ranges}")
         print(f"Fetched rows: {summary.fetched_rows}")
+        print(f"Repaired unavailable rows: {summary.repaired_rows}")
         print(f"PostgreSQL upserted rows: {summary.upserted_rows}")
         print(f"Status: {target}")
     except Exception as exc:  # noqa: BLE001

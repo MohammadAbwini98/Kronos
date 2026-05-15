@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from capital_rest_client import CapitalRestClient
-from config import configure_logging, load_settings
+from config import DEFAULT_INSTRUMENT_SYMBOL, configure_logging, load_settings
 from historical_backfill import ensure_historical_candles
 from rate_limit_state import RateLimitCooldownError
 from service_runtime import write_heartbeat
@@ -30,9 +30,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--archive-interval-minutes", type=int, default=int(os.getenv("OUTCOME_ARCHIVE_INTERVAL_MINUTES", "60")))
     parser.add_argument("--backup-hour-utc", type=int, default=int(os.getenv("NIGHTLY_BACKUP_HOUR_UTC", "2")))
     parser.add_argument("--backup-retention-days", type=int, default=int(os.getenv("BACKUP_RETENTION_DAYS", "14")))
-    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", "ETHUSD"))
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--epic", default=os.getenv("CAPITAL_DEFAULT_EPIC") or None)
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=os.getenv("HISTORICAL_BACKFILL_RESOLUTION", "MINUTE_5"))
     parser.add_argument("--price-side", default=os.getenv("CAPITAL_DEFAULT_PRICE_SIDE", "mid"), choices=["bid", "ask", "mid"])
     parser.add_argument("--historical-backfill-days", type=int, default=int(os.getenv("HISTORICAL_BACKFILL_DAYS", "35")))

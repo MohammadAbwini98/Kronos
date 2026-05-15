@@ -5,6 +5,8 @@ import os
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
+
 
 SUPPORTED_BASE_RESOLUTIONS = {
     "MINUTE",
@@ -17,12 +19,73 @@ SUPPORTED_BASE_RESOLUTIONS = {
     "WEEK",
 }
 
-SUPPORTED_VALIDATION_TIMEFRAMES = ["MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4"]
+TIMEFRAME_ROLE_RULES: dict[str, dict[str, Any]] = {
+    "MINUTE": {
+        "role": "entry_confirmation",
+        "label": "1m entry confirmation",
+        "direction_authority": False,
+        "required": False,
+    },
+    "MINUTE_5": {
+        "role": "main_scalp_signal",
+        "label": "5m main scalp signal",
+        "direction_authority": True,
+        "required": True,
+    },
+    "MINUTE_15": {
+        "role": "direction_confirmation",
+        "label": "15m direction confirmation",
+        "direction_authority": True,
+        "required": True,
+    },
+    "MINUTE_30": {
+        "role": "regime_confirmation",
+        "label": "30m regime confirmation",
+        "direction_authority": True,
+        "required": True,
+    },
+    "HOUR": {
+        "role": "macro_filter",
+        "label": "1h macro trend filter",
+        "direction_authority": True,
+        "required": True,
+    },
+    "HOUR_4": {
+        "role": "optional_higher_trend_filter",
+        "label": "4h optional higher trend filter",
+        "direction_authority": True,
+        "required": False,
+    },
+}
+
+SUPPORTED_VALIDATION_TIMEFRAMES = ["MINUTE", "MINUTE_15", "MINUTE_30", "HOUR", "HOUR_4"]
+DEFAULT_SIGNAL_VALIDATION_TIMEFRAMES = ("MINUTE_15", "MINUTE_30", "HOUR")
+TIMEFRAME_ALIASES = {
+    "1M": "MINUTE",
+    "M1": "MINUTE",
+    "1MIN": "MINUTE",
+    "1MINUTE": "MINUTE",
+    "15M": "MINUTE_15",
+    "M15": "MINUTE_15",
+    "15MIN": "MINUTE_15",
+    "15MINUTE": "MINUTE_15",
+    "30M": "MINUTE_30",
+    "M30": "MINUTE_30",
+    "30MIN": "MINUTE_30",
+    "30MINUTE": "MINUTE_30",
+    "1H": "HOUR",
+    "H1": "HOUR",
+    "60M": "HOUR",
+    "60MIN": "HOUR",
+    "4H": "HOUR_4",
+    "H4": "HOUR_4",
+    "240M": "HOUR_4",
+}
 
 
 @dataclass(frozen=True)
 class SignalConfig:
-    signal_symbol: str = "ETHUSD"
+    signal_symbol: str = DEFAULT_INSTRUMENT_SYMBOL
     signal_resolution: str = "MINUTE_5"
     signal_lookback: int = 512
     signal_pred_len: int = 12
@@ -32,8 +95,10 @@ class SignalConfig:
 
     signal_validation_enabled: bool = True
     signal_validation_strict: bool = False
-    signal_validation_timeframes: tuple[str, ...] = tuple(SUPPORTED_VALIDATION_TIMEFRAMES)
+    signal_validation_timeframes: tuple[str, ...] = DEFAULT_SIGNAL_VALIDATION_TIMEFRAMES
     signal_require_hour_confirmation: bool = False
+    signal_block_on_direction_regime_conflict: bool = True
+    signal_strong_disagreement_trend_strength: float = 20.0
 
     signal_block_on_extreme_volatility: bool = True
     signal_block_on_wide_spread: bool = True
@@ -63,6 +128,8 @@ class SignalConfig:
             "SIGNAL_VALIDATION_STRICT": self.signal_validation_strict,
             "SIGNAL_VALIDATION_TIMEFRAMES": list(self.signal_validation_timeframes),
             "SIGNAL_REQUIRE_HOUR_CONFIRMATION": self.signal_require_hour_confirmation,
+            "SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT": self.signal_block_on_direction_regime_conflict,
+            "SIGNAL_STRONG_DISAGREEMENT_TREND_STRENGTH": self.signal_strong_disagreement_trend_strength,
             "SIGNAL_BLOCK_ON_EXTREME_VOLATILITY": self.signal_block_on_extreme_volatility,
             "SIGNAL_BLOCK_ON_WIDE_SPREAD": self.signal_block_on_wide_spread,
             "SIGNAL_BLOCK_ON_LOW_VOLUME": self.signal_block_on_low_volume,
@@ -132,13 +199,18 @@ def _parse_resolution(value: Any, default: str) -> str:
     return default
 
 
+def _normalize_timeframe_token(value: Any) -> str:
+    text = str(value).strip().upper().replace("-", "_").replace(" ", "")
+    return TIMEFRAME_ALIASES.get(text, text)
+
+
 def _parse_timeframes(value: Any, default: tuple[str, ...]) -> tuple[str, ...]:
     if value is None:
         return default
     if isinstance(value, (list, tuple, set)):
-        tokens = [str(item).strip().upper() for item in value]
+        tokens = [_normalize_timeframe_token(item) for item in value]
     else:
-        tokens = [part.strip().upper() for part in str(value).split(",")]
+        tokens = [_normalize_timeframe_token(part) for part in str(value).split(",")]
     clean = [token for token in tokens if token in SUPPORTED_VALIDATION_TIMEFRAMES]
     if not clean:
         return default
@@ -167,7 +239,7 @@ def load_signal_config(
     source = _build_source(environ=environ, overrides=overrides)
 
     cfg = SignalConfig(
-        signal_symbol=_parse_symbol(source.get("SIGNAL_SYMBOL"), "ETHUSD"),
+        signal_symbol=_parse_symbol(source.get("SIGNAL_SYMBOL"), DEFAULT_INSTRUMENT_SYMBOL),
         signal_resolution=_parse_resolution(source.get("SIGNAL_RESOLUTION"), "MINUTE_5"),
         signal_lookback=_parse_int(source.get("SIGNAL_LOOKBACK"), 512, minimum=50, maximum=4096),
         signal_pred_len=_parse_int(source.get("SIGNAL_PRED_LEN"), 12, minimum=1, maximum=240),
@@ -193,9 +265,19 @@ def load_signal_config(
         signal_validation_strict=_parse_bool(source.get("SIGNAL_VALIDATION_STRICT"), False),
         signal_validation_timeframes=_parse_timeframes(
             source.get("SIGNAL_VALIDATION_TIMEFRAMES"),
-            tuple(SUPPORTED_VALIDATION_TIMEFRAMES),
+            DEFAULT_SIGNAL_VALIDATION_TIMEFRAMES,
         ),
         signal_require_hour_confirmation=_parse_bool(source.get("SIGNAL_REQUIRE_HOUR_CONFIRMATION"), False),
+        signal_block_on_direction_regime_conflict=_parse_bool(
+            source.get("SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT"),
+            True,
+        ),
+        signal_strong_disagreement_trend_strength=_parse_float(
+            source.get("SIGNAL_STRONG_DISAGREEMENT_TREND_STRENGTH"),
+            20.0,
+            minimum=0.0,
+            maximum=100.0,
+        ),
         signal_block_on_extreme_volatility=_parse_bool(source.get("SIGNAL_BLOCK_ON_EXTREME_VOLATILITY"), True),
         signal_block_on_wide_spread=_parse_bool(source.get("SIGNAL_BLOCK_ON_WIDE_SPREAD"), True),
         signal_block_on_low_volume=_parse_bool(source.get("SIGNAL_BLOCK_ON_LOW_VOLUME"), False),
@@ -283,6 +365,12 @@ def add_signal_cli_overrides(parser: argparse.ArgumentParser) -> argparse.Argume
     parser.add_argument("--signal-block-on-low-volume", default=None, help="Override SIGNAL_BLOCK_ON_LOW_VOLUME with true/false.")
     parser.add_argument("--signal-low-volume-penalty-points", type=float, default=None)
     parser.add_argument("--signal-require-hour-confirmation", default=None, help="Override SIGNAL_REQUIRE_HOUR_CONFIRMATION with true/false.")
+    parser.add_argument(
+        "--signal-block-on-direction-regime-conflict",
+        default=None,
+        help="Override SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT with true/false.",
+    )
+    parser.add_argument("--signal-strong-disagreement-trend-strength", type=float, default=None)
     return parser
 
 
@@ -300,5 +388,7 @@ def signal_overrides_from_args(args: argparse.Namespace | None) -> dict[str, Any
         "SIGNAL_BLOCK_ON_LOW_VOLUME": getattr(args, "signal_block_on_low_volume", None),
         "SIGNAL_LOW_VOLUME_PENALTY_POINTS": getattr(args, "signal_low_volume_penalty_points", None),
         "SIGNAL_REQUIRE_HOUR_CONFIRMATION": getattr(args, "signal_require_hour_confirmation", None),
+        "SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT": getattr(args, "signal_block_on_direction_regime_conflict", None),
+        "SIGNAL_STRONG_DISAGREEMENT_TREND_STRENGTH": getattr(args, "signal_strong_disagreement_trend_strength", None),
     }
     return {key: value for key, value in raw.items() if value is not None}

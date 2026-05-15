@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import logging
 from pathlib import Path
 import time
@@ -9,6 +10,7 @@ import pandas as pd
 
 from capital_rest_client import CapitalRestClient
 from config import configure_logging, load_settings, safe_epic_for_filename, validate_price_side, validate_resolution
+from config import DEFAULT_INSTRUMENT_SYMBOL
 from kronos_mapper import save_kronos_csv
 from logging_utils import log_event, new_correlation_id
 from prediction_store import upsert_instrument, upsert_ohlcv_df
@@ -32,7 +34,7 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch a longer historical Capital.com range into Kronos CSV format.")
-    parser.add_argument("--market", default="ETHUSD")
+    parser.add_argument("--market", default=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--symbol", default=None, help="Stored symbol in PostgreSQL. Defaults to --market or resolved epic.")
     parser.add_argument("--epic", default=None)
     parser.add_argument("--resolution", default="MINUTE_5")

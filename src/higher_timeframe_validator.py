@@ -16,9 +16,11 @@ from technical_indicators import (
     volume_zscore,
     vwap,
 )
+from signal_config import TIMEFRAME_ROLE_RULES
 
 
 TIMEFRAME_ALIGNMENT_WEIGHTS = {
+    "MINUTE": 0,
     "MINUTE_15": 8,
     "MINUTE_30": 6,
     "HOUR": 8,
@@ -134,7 +136,9 @@ def _score_components(
     align_max = TIMEFRAME_ALIGNMENT_WEIGHTS.get(timeframe, 0)
     confirms = _confirms_candidate(candidate_signal, trend)
 
-    if trend == "NEUTRAL":
+    if align_max <= 0:
+        trend_score = 0.0
+    elif trend == "NEUTRAL":
         trend_score = float(max(1, round(align_max * 0.30)))
     elif confirms:
         trend_score = float(align_max)
@@ -194,8 +198,13 @@ def validate_single_timeframe(
     now_utc: pd.Timestamp | None = None,
 ) -> dict[str, Any]:
     tf = str(timeframe).strip().upper()
+    role_rule = TIMEFRAME_ROLE_RULES.get(tf, {})
     result: dict[str, Any] = {
         "timeframe": tf,
+        "timeframe_role": role_rule.get("role") or "validation",
+        "timeframe_role_label": role_rule.get("label") or tf,
+        "direction_authority": bool(role_rule.get("direction_authority", True)),
+        "required_for_signal": bool(role_rule.get("required", False)),
         "timestamp_utc": None,
         "trend": "NEUTRAL",
         "confirms_candidate": False,
@@ -292,6 +301,9 @@ def validate_single_timeframe(
     result["alignment_state"] = _alignment_state(candidate_signal, trend)
     result["timestamp_utc"] = str(frame["timestamps"].iloc[-1].isoformat())
     result["indicator_snapshot"] = {
+        "timeframe_role": result["timeframe_role"],
+        "timeframe_role_label": result["timeframe_role_label"],
+        "direction_authority": result["direction_authority"],
         "close": float(last_close),
         "ema20": float(last_ema20),
         "ema50": float(last_ema50),

@@ -99,6 +99,48 @@ class HistoricalBackfillTests(unittest.TestCase):
         self.assertEqual(2, summary.missing_ranges)
         self.assertEqual(3, summary.fetched_rows)
         self.assertEqual(3, summary.upserted_rows)
+        self.assertEqual(0, summary.repaired_rows)
+
+    def test_ensure_historical_candles_repairs_provider_empty_gap(self):
+        start = pd.Timestamp("2026-05-01T00:00:00Z")
+        end = pd.Timestamp("2026-05-01T00:10:00Z")
+        selected_market = {"epic": "ETHUSD", "instrumentName": "Ethereum/USD"}
+
+        with contextlib.ExitStack() as _stack:
+            _stack.enter_context(patch("historical_backfill.history_window", return_value=(start, end)))
+            _stack.enter_context(patch(
+                "historical_backfill._load_existing_timestamps",
+                return_value=[
+                    pd.Timestamp("2026-05-01T00:00:00Z"),
+                    pd.Timestamp("2026-05-01T00:10:00Z"),
+                ],
+            ))
+            _stack.enter_context(patch("historical_backfill.upsert_instrument"))
+            _stack.enter_context(patch("historical_backfill._fetch_range", return_value=historical_backfill._empty_frame()))
+            _stack.enter_context(patch(
+                "historical_backfill._load_previous_candle",
+                return_value={"close": 100.5},
+            ))
+            upsert_ohlcv = _stack.enter_context(patch("historical_backfill.upsert_ohlcv_df", side_effect=lambda df, **_: len(df)))
+            summary = historical_backfill.ensure_historical_candles(
+                client=object(),
+                selected_market=selected_market,
+                symbol="ETHUSD",
+                resolution="MINUTE_5",
+                price_side="mid",
+                days=35,
+                chunk_points=900,
+                dsn=None,
+                cap_to_latest_available=False,
+            )
+
+        upsert_ohlcv.assert_called_once()
+        repair_df = upsert_ohlcv.call_args.args[0]
+        self.assertEqual([pd.Timestamp("2026-05-01T00:05:00Z")], list(repair_df["timestamps"]))
+        self.assertEqual([100.5], list(repair_df["close"]))
+        self.assertEqual(0, summary.fetched_rows)
+        self.assertEqual(1, summary.repaired_rows)
+        self.assertEqual(1, summary.upserted_rows)
 
 
 if __name__ == "__main__":

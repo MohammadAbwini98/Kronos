@@ -1,0 +1,46 @@
+instrument:
+  name: Gold
+  base_asset: XAU
+  quote_asset: USD
+  display_symbol: XAU/USD
+  provider_symbol_env: TRADING_PROVIDER_SYMBOL
+  database_schema_env: TRADING_DATABASE_SCHEMA
+
+secrets:
+  capital_api_key_env: CAPITAL_API_KEY
+  capital_identifier_env: CAPITAL_IDENTIFIER
+  capital_password_env: CAPITAL_PASSWORD
+  postgres_dsn_env: POSTGRES_DSN
+  telegram_bot_token_env: TELEGRAM_BOT_TOKEN
+  telegram_chat_id_env: TELEGRAM_CHAT_ID
+
+models:
+  config_path: configs/models.example.yaml
+  enabled_env: AI_MODELS_ENABLED
+
+runtime:
+  default_resolution: MINUTE_5
+  output_dir: output
+  log_dir: logs
+
+signal_validation:
+  main_signal_timeframe: MINUTE_5
+  entry_confirmation_timeframe: MINUTE
+  direction_confirmation_timeframe: MINUTE_15
+  regime_confirmation_timeframe: MINUTE_30
+  macro_filter_timeframe: HOUR
+  optional_higher_trend_timeframe: HOUR_4
+  validation_timeframes_env: SIGNAL_VALIDATION_TIMEFRAMES
+  block_on_direction_regime_conflict_env: SIGNAL_BLOCK_ON_DIRECTION_REGIME_CONFLICT
+
+final_decision:
+  outputs:
+    - BUY
+    - SELL
+    - NO_TRADE
+  rules:
+    min_model_agreement: 0.60
+    max_forecast_dispersion: 0.40
+    min_probability_win: 0.62
+    min_predicted_move_spread_multiple: 2.0
+    block_when_garch_risk: EXTREME

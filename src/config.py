@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import time
 from pathlib import Path
 from threading import Lock
@@ -12,7 +13,7 @@ from dotenv import load_dotenv
 from pydantic import BaseModel, Field, field_validator
 from rich.logging import RichHandler
 
-load_dotenv()
+load_dotenv(dotenv_path=Path.cwd() / ".env")
 
 LIVE_BASE_URL = "https://api-capital.backend-capital.com/api/v1"
 DEMO_BASE_URL = "https://demo-api-capital.backend-capital.com/api/v1"
@@ -29,6 +30,8 @@ SUPPORTED_RESOLUTIONS = {
     "WEEK",
 }
 SUPPORTED_PRICE_SIDES = {"bid", "ask", "mid"}
+DEFAULT_INSTRUMENT_SYMBOL = "XAUUSD"
+DEFAULT_DATABASE_SCHEMA = "gold_manual"
 TRADING_ENDPOINT_HINTS = (
     "/positions",
     "/workingorders",
@@ -47,8 +50,8 @@ class BridgeSettings(BaseModel):
     identifier: str = Field(default="", repr=False)
     password: str = Field(default="", repr=False)
     use_encrypted_password: bool = False
-    default_market_search: str = "ETHUSD"
-    default_epic: str = "ETHUSD"
+    default_market_search: str = DEFAULT_INSTRUMENT_SYMBOL
+    default_epic: str = DEFAULT_INSTRUMENT_SYMBOL
     default_resolution: str = "MINUTE_5"
     default_price_side: Literal["bid", "ask", "mid"] = "mid"
     output_dir: Path = Path("output")
@@ -91,10 +94,23 @@ class TradeExecutionSettings(BaseModel):
     max_daily_trades: int = 10
     max_daily_loss: float = 0.0
     min_confidence: float = 0.55
+    min_validation_score: float = 55.0
+    max_validation_age_seconds: int = 1800
+    min_expected_move_pct: float = 0.02
+    max_spread_pct: float = 0.08
+    estimated_fee_pct: float = 0.0
+    estimated_slippage_pct: float = 0.02
+    execution_safety_margin_pct: float = 0.02
+    allow_missing_spread_demo_fallback: bool = False
+    require_valid_volume_regime: bool = False
     price_tolerance: float = 0.1
     stale_signal_minutes: int = 30
-    capital_eth_epic: str = "ETHUSD"
+    provider_epic: str = DEFAULT_INSTRUMENT_SYMBOL
     queue_concurrency: int = 1
+
+    @property
+    def capital_eth_epic(self) -> str:
+        return self.provider_epic
 
     @property
     def normalized_base_url(self) -> str:
@@ -137,6 +153,33 @@ class RateLimiter:
                 time.sleep(delay)
             self._last_call = time.monotonic()
 
+
+class InstrumentSettings(BaseModel):
+    name: str = "Gold"
+    base_asset: str = "XAU"
+    quote_asset: str = "USD"
+    display_symbol: str = "XAU/USD"
+    provider_symbol: str = DEFAULT_INSTRUMENT_SYMBOL
+    database_schema: str = DEFAULT_DATABASE_SCHEMA
+    candle_interval: str = "MINUTE_5"
+    price_precision: int = 2
+    volume_precision: int = 2
+    tick_size: float = 0.01
+    pip_size: float = 0.01
+    max_candle_move_pct: float = 5.0
+    max_spread_pct: float = 0.08
+    min_confidence: float = 0.55
+    min_expected_move_pct: float = 0.02
+    take_profit_distance_pct: float = 0.10
+    stop_loss_distance_pct: float = 0.10
+
+    @field_validator("database_schema")
+    @classmethod
+    def validate_database_schema(cls, value: str) -> str:
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError("Database schema must be a simple PostgreSQL identifier")
+        return value
 
 class _JsonLineFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -281,6 +324,14 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip():
+            return value.strip()
+    return default
+
+
 def _resolve_log_level(level: int | str | None) -> int:
     if isinstance(level, int):
         return level
@@ -293,26 +344,52 @@ def _resolve_log_level(level: int | str | None) -> int:
 
 def load_settings(env_override: str | None = None) -> BridgeSettings:
     env = env_override or os.getenv("CAPITAL_ENV", "demo")
+    instrument = load_instrument_settings()
     return BridgeSettings(
         env=env.lower(),
         api_key=os.getenv("CAPITAL_API_KEY", ""),
-        identifier=os.getenv("CAPITAL_IDENTIFIER", ""),
+        identifier=_env_first("CAPITAL_IDENTIFIER", "CAPITAL_EMAIL"),
         password=os.getenv("CAPITAL_PASSWORD", ""),
         use_encrypted_password=os.getenv("CAPITAL_USE_ENCRYPTED_PASSWORD", "false").lower()
         in {"1", "true", "yes"},
-        default_market_search=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", "ETHUSD"),
-        default_epic=os.getenv("CAPITAL_DEFAULT_EPIC", ""),
-        default_resolution=os.getenv("CAPITAL_DEFAULT_RESOLUTION", "MINUTE_5"),
+        default_market_search=os.getenv("CAPITAL_DEFAULT_MARKET_SEARCH", instrument.provider_symbol),
+        default_epic=os.getenv("CAPITAL_DEFAULT_EPIC", instrument.provider_symbol),
+        default_resolution=os.getenv("CAPITAL_DEFAULT_RESOLUTION", instrument.candle_interval),
         default_price_side=os.getenv("CAPITAL_DEFAULT_PRICE_SIDE", "mid").lower(),
         output_dir=Path(os.getenv("CAPITAL_OUTPUT_DIR", "output")),
     )
 
 
+def load_instrument_settings() -> InstrumentSettings:
+    return InstrumentSettings(
+        name=os.getenv("TRADING_INSTRUMENT_NAME", "Gold").strip() or "Gold",
+        base_asset=os.getenv("TRADING_BASE_ASSET", "XAU").strip() or "XAU",
+        quote_asset=os.getenv("TRADING_QUOTE_ASSET", "USD").strip() or "USD",
+        display_symbol=os.getenv("TRADING_DISPLAY_SYMBOL", "XAU/USD").strip() or "XAU/USD",
+        provider_symbol=os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL).strip() or DEFAULT_INSTRUMENT_SYMBOL,
+        database_schema=os.getenv("TRADING_DATABASE_SCHEMA", os.getenv("POSTGRES_SCHEMA", DEFAULT_DATABASE_SCHEMA)).strip()
+        or DEFAULT_DATABASE_SCHEMA,
+        candle_interval=os.getenv("TRADING_CANDLE_INTERVAL", os.getenv("CAPITAL_DEFAULT_RESOLUTION", "MINUTE_5")).strip()
+        or "MINUTE_5",
+        price_precision=_env_int("TRADING_PRICE_PRECISION", 2),
+        volume_precision=_env_int("TRADING_VOLUME_PRECISION", 2),
+        tick_size=_env_float("TRADING_TICK_SIZE", 0.01),
+        pip_size=_env_float("TRADING_PIP_SIZE", 0.01),
+        max_candle_move_pct=_env_float("TRADING_MAX_CANDLE_MOVE_PCT", 5.0),
+        max_spread_pct=_env_float("SIGNAL_MAX_SPREAD_PCT", _env_float("TRADING_MAX_SPREAD_PCT", 0.08)),
+        min_confidence=_env_float("SIGNAL_MIN_CONFIDENCE", _env_float("TRADING_MIN_CONFIDENCE", 0.55)),
+        min_expected_move_pct=_env_float("SIGNAL_FLAT_THRESHOLD_PCT", _env_float("TRADING_MIN_EXPECTED_MOVE_PCT", 0.02)),
+        take_profit_distance_pct=_env_float("TRADING_TAKE_PROFIT_DISTANCE_PCT", 0.10),
+        stop_loss_distance_pct=_env_float("TRADING_STOP_LOSS_DISTANCE_PCT", 0.10),
+    )
+
+
 def load_trade_execution_settings() -> TradeExecutionSettings:
+    instrument = load_instrument_settings()
     settings = TradeExecutionSettings(
         api_base_url=os.getenv("CAPITAL_API_BASE_URL", DEMO_BASE_URL),
         api_key=os.getenv("CAPITAL_API_KEY", ""),
-        identifier=os.getenv("CAPITAL_IDENTIFIER", ""),
+        identifier=_env_first("CAPITAL_IDENTIFIER", "CAPITAL_EMAIL"),
         password=os.getenv("CAPITAL_PASSWORD", ""),
         demo_account_name=os.getenv("CAPITAL_DEMO_ACCOUNT_NAME", "DEMOAI").strip() or "DEMOAI",
         auto_execute_signals=_env_flag("AUTO_EXECUTE_SIGNALS", False),
@@ -321,9 +398,19 @@ def load_trade_execution_settings() -> TradeExecutionSettings:
         max_daily_trades=max(0, _env_int("MAX_DAILY_TRADES", 10)),
         max_daily_loss=max(0.0, _env_float("MAX_DAILY_LOSS", 0.0)),
         min_confidence=_env_float("MIN_TRADE_CONFIDENCE", _env_float("SIGNAL_MIN_CONFIDENCE", 0.55)),
+        min_validation_score=_env_float("MIN_TRADE_VALIDATION_SCORE", _env_float("SIGNAL_SCORE_ACTIONABLE_THRESHOLD", 55.0)),
+        max_validation_age_seconds=max(1, _env_int("TRADE_VALIDATION_MAX_AGE_SECONDS", 1800)),
+        min_expected_move_pct=max(0.0, _env_float("TRADE_MIN_EXPECTED_MOVE_PCT", _env_float("SIGNAL_FLAT_THRESHOLD_PCT", 0.02))),
+        max_spread_pct=max(0.0, _env_float("TRADE_MAX_SPREAD_PCT", _env_float("SIGNAL_MAX_SPREAD_PCT", 0.08))),
+        estimated_fee_pct=max(0.0, _env_float("TRADE_ESTIMATED_FEE_PCT", 0.0)),
+        estimated_slippage_pct=max(0.0, _env_float("TRADE_ESTIMATED_SLIPPAGE_PCT", 0.02)),
+        execution_safety_margin_pct=max(0.0, _env_float("TRADE_SAFETY_MARGIN_PCT", 0.02)),
+        allow_missing_spread_demo_fallback=_env_flag("TRADE_ALLOW_MISSING_SPREAD_DEMO_FALLBACK", False),
+        require_valid_volume_regime=_env_flag("TRADE_REQUIRE_VALID_VOLUME_REGIME", False),
         price_tolerance=max(0.0, _env_float("TRADE_PRICE_TOLERANCE", 0.1)),
         stale_signal_minutes=max(1, _env_int("TRADE_SIGNAL_STALE_MINUTES", 30)),
-        capital_eth_epic=os.getenv("CAPITAL_ETH_EPIC", os.getenv("CAPITAL_DEFAULT_EPIC", "ETHUSD")).strip() or "ETHUSD",
+        provider_epic=os.getenv("TRADING_PROVIDER_SYMBOL", os.getenv("CAPITAL_DEFAULT_EPIC", instrument.provider_symbol)).strip()
+        or instrument.provider_symbol,
         queue_concurrency=max(1, min(_env_int("TRADE_EXECUTION_QUEUE_CONCURRENCY", 1), 3)),
     )
     settings.ensure_demo_base_url()
@@ -335,7 +422,9 @@ def log_trade_execution_startup(settings: TradeExecutionSettings, logger: loggin
     target.info(
         "Capital demo execution config: base_url=%s demo_account=%s auto_execute=%s "
         "default_size=%s max_open=%s max_daily_trades=%s max_daily_loss=%s "
-        "min_confidence=%s price_tolerance=%s stale_minutes=%s",
+        "min_confidence=%s min_validation_score=%s max_validation_age_seconds=%s "
+        "max_spread_pct=%s estimated_fee_pct=%s estimated_slippage_pct=%s safety_margin_pct=%s "
+        "price_tolerance=%s stale_minutes=%s",
         settings.normalized_base_url,
         settings.demo_account_name,
         settings.auto_execute_signals,
@@ -344,6 +433,12 @@ def log_trade_execution_startup(settings: TradeExecutionSettings, logger: loggin
         settings.max_daily_trades,
         settings.max_daily_loss,
         settings.min_confidence,
+        settings.min_validation_score,
+        settings.max_validation_age_seconds,
+        settings.max_spread_pct,
+        settings.estimated_fee_pct,
+        settings.estimated_slippage_pct,
+        settings.execution_safety_margin_pct,
         settings.price_tolerance,
         settings.stale_signal_minutes,
     )

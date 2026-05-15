@@ -16,7 +16,7 @@ LOGGER = logging.getLogger(__name__)
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch Capital.com historical OHLC data for Kronos.")
-    parser.add_argument("--market", default=None, help="Search term such as ETHUSD, ETH/USD, or Ethereum.")
+    parser.add_argument("--market", default=None, help="Search term such as XAUUSD, XAU/USD, or Gold.")
     parser.add_argument("--epic", default=None, help="Explicit Capital.com epic. Skips market search.")
     parser.add_argument("--resolution", default=None, help="MINUTE, MINUTE_5, MINUTE_15, MINUTE_30, HOUR, HOUR_4, DAY, WEEK.")
     parser.add_argument("--max", type=int, default=512, dest="max_points", help="Maximum price points, default 512.")

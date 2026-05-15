@@ -165,9 +165,13 @@ def persist_prediction_run_quality(run_id: str, report: DataQualityReport | dict
             INSERT INTO prediction_run_quality(
                 run_id, quality_grade, quality_score, lookback_rows_expected, lookback_rows_actual,
                 missing_candle_count, duplicate_timestamp_count, largest_gap_minutes, stale_live_price_seconds,
-                ohlc_repair_count, volume_available, amount_available, source_counts, warnings, updated_at
+                ohlc_repair_count, volume_available, amount_available, source_counts, warnings,
+                first_timestamp_utc, last_timestamp_utc, requested_lookback, actual_lookback,
+                selected_feature_columns, terminal_close, price_side, resolution, symbol, gap_list,
+                feature_mode, strict_policy_passed, strict_policy_rejection_reason, updated_at
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
             ON CONFLICT(run_id) DO UPDATE SET
                 quality_grade = EXCLUDED.quality_grade,
                 quality_score = EXCLUDED.quality_score,
@@ -182,6 +186,19 @@ def persist_prediction_run_quality(run_id: str, report: DataQualityReport | dict
                 amount_available = EXCLUDED.amount_available,
                 source_counts = EXCLUDED.source_counts,
                 warnings = EXCLUDED.warnings,
+                first_timestamp_utc = EXCLUDED.first_timestamp_utc,
+                last_timestamp_utc = EXCLUDED.last_timestamp_utc,
+                requested_lookback = EXCLUDED.requested_lookback,
+                actual_lookback = EXCLUDED.actual_lookback,
+                selected_feature_columns = EXCLUDED.selected_feature_columns,
+                terminal_close = EXCLUDED.terminal_close,
+                price_side = EXCLUDED.price_side,
+                resolution = EXCLUDED.resolution,
+                symbol = EXCLUDED.symbol,
+                gap_list = EXCLUDED.gap_list,
+                feature_mode = EXCLUDED.feature_mode,
+                strict_policy_passed = EXCLUDED.strict_policy_passed,
+                strict_policy_rejection_reason = EXCLUDED.strict_policy_rejection_reason,
                 updated_at = now()
             """,
             (
@@ -199,6 +216,19 @@ def persist_prediction_run_quality(run_id: str, report: DataQualityReport | dict
                 bool(data.get("amount_available")),
                 Jsonb(data.get("source_counts") or {}),
                 Jsonb(data.get("warnings") or []),
+                data.get("first_timestamp_utc"),
+                data.get("last_timestamp_utc"),
+                data.get("requested_lookback"),
+                data.get("actual_lookback"),
+                Jsonb(data.get("selected_feature_columns") or []),
+                data.get("terminal_close"),
+                data.get("price_side"),
+                data.get("resolution"),
+                data.get("symbol"),
+                Jsonb(data.get("gap_list") or []),
+                data.get("feature_mode"),
+                data.get("strict_policy_passed"),
+                data.get("strict_policy_rejection_reason"),
             ),
         )
         conn.execute(

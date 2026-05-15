@@ -1,0 +1,146 @@
+# Optional AI model stack configuration.
+# Safe default: models.enabled=false keeps the current strategy/runtime unchanged.
+
+models:
+  enabled: false
+
+  global:
+    instrument: XAUUSD
+    default_device: auto
+    default_context_bars: 512
+    default_horizon_bars: 12
+    default_batch_size: 8
+    fail_fast: false
+    save_raw_outputs: true
+
+  schedule:
+    "1m":
+      resolution: MINUTE
+      role: entry_confirmation
+      run_models: false
+      use_for_execution_confirmation: true
+    "5m":
+      resolution: MINUTE_5
+      role: main_scalp_signal
+      run_models: true
+      models: ["kronos", "patchtst", "itransformer", "garch"]
+    "15m":
+      resolution: MINUTE_15
+      role: direction_confirmation
+      run_models: true
+      models: ["kronos", "chronos2", "timesfm", "moirai", "garch"]
+    "30m":
+      resolution: MINUTE_30
+      role: regime_confirmation
+      run_models: true
+      models: ["kronos", "chronos2", "timesfm", "moirai", "patchtst", "itransformer", "garch"]
+    "1h":
+      resolution: HOUR
+      role: macro_filter
+      run_models: true
+      models: ["kronos", "garch"]
+
+  foundation:
+    kronos:
+      enabled: true
+      model_path: "./KRONOS-MODEL/model/Kronos-base"
+      tokenizer_path: "./KRONOS-MODEL/model/Kronos-Tokenizer-base"
+      device: auto
+      context_bars: 512
+      horizon_bars: 12
+      batch_size: 8
+
+    chronos2:
+      enabled: true
+      model_path: "./models/chronos2"
+      device: auto
+      context_bars: 512
+      horizon_bars: 12
+      batch_size: 8
+
+    timesfm:
+      enabled: true
+      model_path: "./models/timesfm"
+      device: auto
+      context_bars: 512
+      horizon_bars: 12
+      batch_size: 8
+
+    moirai:
+      enabled: true
+      model_path: "./models/moirai"
+      device: auto
+      context_bars: 512
+      horizon_bars: 12
+      batch_size: 8
+      use_uncertainty_bands: true
+
+  local:
+    patchtst:
+      enabled: true
+      artifact_path: "./models/patchtst/patchtst_gold.pt"
+      context_bars: 512
+      horizon_bars: 12
+      batch_size: 8
+
+    itransformer:
+      enabled: true
+      artifact_path: "./models/itransformer/itransformer_gold.pt"
+      context_bars: 512
+      horizon_bars: 12
+      batch_size: 8
+
+  volatility:
+    garch:
+      enabled: true
+      window_bars: 1000
+      horizon_bars: 12
+      risk_thresholds:
+        low_percentile: 25
+        high_percentile: 80
+        extreme_percentile: 95
+
+  thresholds:
+    min_confidence: 0.55
+    min_expected_move_pct: 0.02
+    max_spread_pct: 0.12
+    max_dispersion_score: 0.40
+    min_agreement_score: 0.60
+    block_extreme_volatility: true
+
+  ensemble:
+    enabled: true
+    min_agreement_score: 0.60
+    max_dispersion_score: 0.40
+    weights:
+      kronos: 0.30
+      chronos2: 0.15
+      timesfm: 0.15
+      moirai: 0.15
+      patchtst: 0.10
+      itransformer: 0.10
+      garch: 0.05
+
+  scorer:
+    enabled: true
+    primary: lightgbm
+    fallback: logistic_regression
+    probability_threshold: 0.62
+    artifact_dir: "./models/scorers"
+    retrain_min_samples: 1000
+    retrain_min_new_samples: 200
+    thresholds:
+      strong_signal_probability: 0.70
+      weak_signal_probability: 0.58
+      hold_below_probability: 0.55
+
+  final_decision:
+    outputs: ["BUY", "SELL", "NO_TRADE"]
+    min_model_agreement: 0.60
+    max_forecast_dispersion: 0.40
+    min_probability_win: 0.62
+    min_predicted_move_spread_multiple: 2.0
+    max_spread_pct: 0.12
+    max_moirai_uncertainty_width: 0.40
+    block_when_garch_risk: EXTREME
+    min_supporting_model_agreements: 2

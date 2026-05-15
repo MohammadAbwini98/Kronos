@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from config import DEFAULT_INSTRUMENT_SYMBOL
 
 REQUIRED_MODEL_FILES = ("config.json", "model.safetensors")
 
@@ -22,9 +23,9 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", required=True, help="Training dataset CSV exported by the auto-finetune worker.")
     parser.add_argument("--model-dir", required=True, help="Destination auto model directory.")
-    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", "ETHUSD"))
+    parser.add_argument("--symbol", default=os.getenv("SIGNAL_SYMBOL", os.getenv("TRADING_PROVIDER_SYMBOL", DEFAULT_INSTRUMENT_SYMBOL)))
     parser.add_argument("--resolution", default=os.getenv("AUTO_FINETUNE_RESOLUTION", "MINUTE_5"))
-    parser.add_argument("--base-model-dir", default=os.getenv("KRONOS_MODEL_DIR", r"C:\AI\Models\Kronos\Kronos-base"))
+    parser.add_argument("--base-model-dir", default=os.getenv("KRONOS_MODEL_DIR", r".\KRONOS-MODEL\model\Kronos-base"))
     return parser.parse_args()
 
 

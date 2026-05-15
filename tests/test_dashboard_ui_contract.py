@@ -55,6 +55,7 @@ class DashboardUiContractTests(unittest.TestCase):
             "overview",
             "validation",
             "modelPerformance",
+            "aiStack",
             "risk",
             "trades",
             "baselines",
@@ -97,10 +98,41 @@ class DashboardUiContractTests(unittest.TestCase):
         self.assertIn("fetch(`/api/status?${currentStatusQuery()}`", html)
         self.assertIn("fetch(`/api/model-performance?${currentStatusQuery()}`", html)
         self.assertIn("fetch(`/api/signals?${getSignalQuery(page)}`", html)
+        self.assertIn("fetchAiEndpoint('/api/forecasts'", html)
+        self.assertIn("fetchAiEndpoint('/api/ensemble'", html)
+        self.assertIn("fetchAiEndpoint('/api/regime'", html)
+        self.assertIn("fetchAiEndpoint('/api/scorer'", html)
+        self.assertIn("fetchAiEndpoint('/api/forecast-validation'", html)
         self.assertIn("postJson('/api/predict'", html)
         self.assertIn("postJson('/api/fetch-actual'", html)
         self.assertIn("postJson('/api/validate-actual'", html)
         self.assertIn("postJson('/api/baselines'", html)
+
+    def test_ai_stack_tab_covers_forecast_plan_panels(self):
+        html = dashboard_ui.dashboard_html()
+
+        for expected in (
+            "AI Forecast Stack",
+            "Current Price + Spread",
+            "Active Regime",
+            "Ensemble Direction",
+            "Model Votes",
+            "Kronos Forecast",
+            "Chronos-2 Forecast",
+            "TimesFM Forecast",
+            "Moirai Uncertainty Band",
+            "PatchTST Local Forecast",
+            "iTransformer Local Forecast",
+            "GARCH Volatility Risk",
+            "Final LightGBM / CatBoost Probability",
+            "Final Decision",
+            "Model Performance Table",
+            "Recent Forecast Validation",
+            "Recent Trade Outcomes",
+            "currentAiQuery",
+            "tf",
+        ):
+            self.assertIn(expected, html)
 
     def test_baselines_button_id_is_unique_and_not_shared_with_panel(self):
         html = dashboard_ui.dashboard_html()
@@ -113,7 +145,7 @@ class DashboardUiContractTests(unittest.TestCase):
         html = dashboard_ui.dashboard_html()
 
         self.assertIn("function actionContextPayload(extra = {})", html)
-        self.assertIn("symbol: $('market').value || 'ETHUSD'", html)
+        self.assertIn("symbol: $('market').value || 'XAUUSD'", html)
         self.assertIn("resolution: $('resolution').value || 'MINUTE_5'", html)
         self.assertIn("postJson('/api/fetch-actual', actionContextPayload()", html)
         self.assertIn("postJson('/api/validate-actual', actionContextPayload({ scoring_version: 'v1' })", html)
@@ -152,6 +184,8 @@ class DashboardUiContractTests(unittest.TestCase):
 
         for hook in (
             "tradeLifecycleFilter",
+            "tradeDateFromFilter",
+            "tradeDateToFilter",
             "tradeStatusFilter",
             "tradeOutcomeFilter",
             "tradeSideFilter",
@@ -179,22 +213,33 @@ class DashboardUiContractTests(unittest.TestCase):
         self.assertIn("<th>Broker / Queue Ref</th>", html)
         self.assertIn("<th>Transaction ID</th>", html)
         self.assertIn("<th>Outcome</th>", html)
-        self.assertIn("Outcome Wins", html)
-        self.assertIn("Outcome Losses", html)
-        self.assertIn("Outcome PNL", html)
-        self.assertIn("filteredOutcomePnl", html)
-        self.assertIn("allOutcomePnl", html)
-        self.assertIn("(filteredOutcomeCounts.WIN || 0) - (filteredOutcomeCounts.LOSS || 0)", html)
-        self.assertIn("Unknown Outcomes", html)
-        self.assertIn("Open Outcomes", html)
+        self.assertIn("Executed Win Rate", html)
+        self.assertIn("Closed finalized executed trades only", html)
+        self.assertIn("Total Net P/L", html)
+        self.assertIn("Expectancy", html)
+        self.assertIn("Average Win", html)
+        self.assertIn("Average Loss", html)
+        self.assertIn("Drawdown", html)
+        self.assertIn("Spread Impact", html)
+        self.assertIn("Slippage Impact", html)
+        self.assertIn("Finalization Pending", html)
+        self.assertIn("Execution Decision Reasons", html)
+        self.assertIn("<th>Date / Time</th>", html)
+        self.assertIn("Dates are interpreted in Asia/Amman timezone.", html)
+        self.assertIn("net_expected_edge_pct", html)
         self.assertIn("TRADE_EXECUTION_PAGE_SIZE = 10", html)
         self.assertIn("row.trade_outcome", html)
         self.assertIn("tradeExecutionFilters.outcome", html)
+        self.assertIn("tradeExecutionFilters.dateFrom", html)
+        self.assertIn("tradeExecutionFilters.dateTo", html)
         self.assertIn("All outcomes", html)
         self.assertIn("row.transaction_id", html)
         self.assertIn("tradeExecutionFilters.transactionId", html)
         self.assertIn("transaction_lookup_error", html)
-        self.assertIn("row.signal_status || 'n/a'", html)
+        self.assertIn("row.signal_status || 'UNKNOWN'", html)
+        self.assertIn("Broker lookup blocked", html)
+        self.assertIn("Awaiting broker outcome", html)
+        self.assertIn("not evaluated", html)
         self.assertIn("not filled", html)
         self.assertIn("MarketNotTradeableError", html)
         self.assertIn("Retry scheduled", html)

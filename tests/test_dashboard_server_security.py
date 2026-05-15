@@ -107,7 +107,7 @@ class MetadataContextTests(unittest.TestCase):
 class ActionContextValidationTests(unittest.TestCase):
     def test_action_context_defaults(self):
         symbol, resolution = dashboard_server._action_context({})
-        self.assertEqual("ETHUSD", symbol)
+        self.assertEqual("XAUUSD", symbol)
         self.assertEqual("MINUTE_5", resolution)
 
     def test_action_context_rejects_invalid_resolution(self):

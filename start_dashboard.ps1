@@ -42,8 +42,9 @@ function Get-ResolutionMinutes {
 Import-DotEnv
 
 $python = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
-$symbol = if ($env:SIGNAL_SYMBOL) { $env:SIGNAL_SYMBOL } else { "ETHUSD" }
-$market = if ($env:CAPITAL_DEFAULT_MARKET_SEARCH) { $env:CAPITAL_DEFAULT_MARKET_SEARCH } else { "ETHUSD" }
+$defaultInstrumentSymbol = if ($env:TRADING_PROVIDER_SYMBOL) { $env:TRADING_PROVIDER_SYMBOL } else { "XAUUSD" }
+$symbol = if ($env:SIGNAL_SYMBOL) { $env:SIGNAL_SYMBOL } else { $defaultInstrumentSymbol }
+$market = if ($env:CAPITAL_DEFAULT_MARKET_SEARCH) { $env:CAPITAL_DEFAULT_MARKET_SEARCH } else { $defaultInstrumentSymbol }
 $resolution = if ($env:SIGNAL_RESOLUTION) { $env:SIGNAL_RESOLUTION } elseif ($env:CAPITAL_DEFAULT_RESOLUTION) { $env:CAPITAL_DEFAULT_RESOLUTION } else { "MINUTE_5" }
 $streamResolution = if ($env:LIVE_PRICE_RESOLUTION) { $env:LIVE_PRICE_RESOLUTION } else { $resolution }
 $autoFinetuneResolution = if ($env:AUTO_FINETUNE_RESOLUTION) { $env:AUTO_FINETUNE_RESOLUTION } else { "MINUTE_5" }
@@ -53,7 +54,7 @@ $autoFinetuneIntervalMinutes = if ($env:AUTO_FINETUNE_INTERVAL_MINUTES) { $env:A
 $historicalBackfillEnabled = if ($env:ENABLE_HISTORICAL_5M_BACKFILL) { $env:ENABLE_HISTORICAL_5M_BACKFILL } else { "true" }
 $historicalBackfillDays = if ($env:HISTORICAL_BACKFILL_DAYS) { $env:HISTORICAL_BACKFILL_DAYS } else { "35" }
 $historicalBackfillIntervalMinutes = if ($env:HISTORICAL_BACKFILL_INTERVAL_MINUTES) { $env:HISTORICAL_BACKFILL_INTERVAL_MINUTES } else { "5" }
-$autoFinetuneEnabled = if ($env:ENABLE_AUTO_FINETUNE) { $env:ENABLE_AUTO_FINETUNE } else { "true" }
+$autoFinetuneEnabled = if ($env:ENABLE_AUTO_FINETUNE) { $env:ENABLE_AUTO_FINETUNE } else { "false" }
 $maintenanceEnabled = if ($env:ENABLE_MAINTENANCE_WORKER) { $env:ENABLE_MAINTENANCE_WORKER } else { "true" }
 $tradeExecutionEnabled = if ($env:ENABLE_TRADE_EXECUTION_WORKER) { $env:ENABLE_TRADE_EXECUTION_WORKER } elseif ($env:AUTO_EXECUTE_SIGNALS) { $env:AUTO_EXECUTE_SIGNALS } else { "false" }
 $envName = if ($env:CAPITAL_ENV) { $env:CAPITAL_ENV } else { "demo" }
@@ -389,6 +390,16 @@ function Get-LocalHostNames {
     return @($hosts | ForEach-Object { $_.ToLowerInvariant() } | Select-Object -Unique)
 }
 
+function Test-DashboardApiHealthy {
+    try {
+        $response = Invoke-WebRequest -UseBasicParsing "http://127.0.0.1:8765/api/status?symbol=XAUUSD&resolution=MINUTE_5" -TimeoutSec 3
+        return ($null -ne $response -and $response.StatusCode -eq 200)
+    }
+    catch {
+        return $false
+    }
+}
+
 function Invoke-SupervisorLeaseAcquire {
     param(
         [string]$InstanceId,
@@ -419,7 +430,7 @@ function Invoke-SupervisorLeaseAcquire {
         Write-Host $leaseText
     }
     if ($leaseExitCode -eq 0) {
-        return
+        return $true
     }
 
     $leasePayload = $null
@@ -474,10 +485,17 @@ function Invoke-SupervisorLeaseAcquire {
                     Write-Host $retryText
                 }
                 if ($retryExitCode -eq 0) {
-                    return
+                    return $true
                 }
             }
             throw "Failed to reacquire supervisor lease after releasing stale local lease."
+        }
+
+        if ($isLocalLease -and $null -ne $existingProcess) {
+            $healthText = if (Test-DashboardApiHealthy) { "healthy dashboard API" } else { "active local supervisor process" }
+            Write-Host "Detected $healthText under an existing local lease. Skipping duplicate start."
+            $global:LASTEXITCODE = 0
+            return $false
         }
 
         $details = @()
@@ -602,6 +620,40 @@ function Stop-TrackedProcess {
     }
 }
 
+function Invoke-SupervisorLeaseReleaseQuietly {
+    param(
+        [string]$InstanceId
+    )
+
+    $releaseArgs = @(
+        "src\main_supervisor_lease.py",
+        "release",
+        "--instance-id", $InstanceId
+    )
+    if ($env:POSTGRES_DSN) {
+        $releaseArgs += @("--dsn", $env:POSTGRES_DSN)
+    }
+
+    $releaseStdOutLog = Join-Path $logsDir "supervisor_lease_release_stdout.log"
+    $releaseStdErrLog = Join-Path $logsDir "supervisor_lease_release_stderr.log"
+    try {
+        $argumentLine = Join-ProcessArguments -Arguments $releaseArgs
+        $releaseProc = Start-Process -FilePath $python -ArgumentList $argumentLine -WorkingDirectory $PSScriptRoot -WindowStyle Hidden -PassThru -RedirectStandardOutput $releaseStdOutLog -RedirectStandardError $releaseStdErrLog
+        $exited = $releaseProc.WaitForExit(5000)
+        if (-not $exited) {
+            Stop-Process -Id $releaseProc.Id -Force -ErrorAction SilentlyContinue
+            Write-Warning "Supervisor lease release timed out; stale lease cleanup will run on the next startup."
+            return
+        }
+        if ($releaseProc.ExitCode -ne 0) {
+            Write-Warning "Supervisor lease release exited with code $($releaseProc.ExitCode); see $releaseStdErrLog."
+        }
+    }
+    catch {
+        Write-Warning "Supervisor lease release failed during shutdown: $($_.Exception.Message)"
+    }
+}
+
 $schedulerArgs = @(
     "src\main_prediction_scheduler.py",
     "--symbol", $symbol,
@@ -688,7 +740,10 @@ try {
     Invoke-DatabaseMigrations
 
     Write-Host "Acquiring supervisor lease"
-    Invoke-SupervisorLeaseAcquire -InstanceId $supervisorInstanceId -ProcessId $PID -TtlSeconds $supervisorLeaseTtlSeconds -AllowDuplicate (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)
+    $leaseAcquired = Invoke-SupervisorLeaseAcquire -InstanceId $supervisorInstanceId -ProcessId $PID -TtlSeconds $supervisorLeaseTtlSeconds -AllowDuplicate (Test-FlagEnabled -Value $allowDuplicateWorkers -Default $false)
+    if ($leaseAcquired -eq $false) {
+        return
+    }
 
     if (Test-FlagEnabled -Value $historicalBackfillEnabled -Default $true) {
         Write-Host "Backfilling and gap-filling $historicalBackfillDays day(s) of 5-minute Capital.com candles"
@@ -776,14 +831,6 @@ finally {
     foreach ($worker in $workers) {
         Stop-TrackedProcess -Process $worker.Process -Name $worker.Name
     }
-    $releaseArgs = @(
-        "src\main_supervisor_lease.py",
-        "release",
-        "--instance-id", $supervisorInstanceId
-    )
-    if ($env:POSTGRES_DSN) {
-        $releaseArgs += @("--dsn", $env:POSTGRES_DSN)
-    }
-    & $python @releaseArgs | Out-Null
+    Invoke-SupervisorLeaseReleaseQuietly -InstanceId $supervisorInstanceId
     Write-Host "Dashboard and workers stopped."
 }
