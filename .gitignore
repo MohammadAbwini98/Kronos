@@ -1,9 +1,5 @@
-.env
-__pycache__/
-*.pyc
-.venv/
-venv/
-data/*
-!data/.gitkeep
-output/*
-!output/.gitkeep
+```
+# Logs and temp files
+*.log
+logs/
+```
